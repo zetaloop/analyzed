@@ -2,12 +2,13 @@ use std::{
     fs,
     os::unix::net::UnixStream,
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use analyzed_ipc::{
-    DaemonSnapshot, HelloRequest, HelloResponse, RuntimePaths, StartupLock, bind_listener,
-    read_json_line, write_json_line,
+    ClientInfo, DaemonRequest, DaemonResponse, DaemonSnapshot, Hello, ProtocolError, RuntimePaths,
+    StartupLock, Stop, bind_listener, read_json_line, write_json_line,
 };
 use analyzed_ra::AnalysisStore;
 use serde::Serialize;
@@ -21,7 +22,7 @@ pub struct DaemonStatus {
     workspaces: usize,
     paths: RuntimePaths,
     command: Option<PendingCommand>,
-    hello: Option<HelloResponse>,
+    hello: Option<Hello>,
     connection_error: Option<String>,
 }
 
@@ -55,7 +56,7 @@ pub fn status(paths: RuntimePaths) -> DaemonStatus {
     }
 }
 
-pub fn online_status(paths: RuntimePaths, hello: HelloResponse) -> DaemonStatus {
+pub fn online_status(paths: RuntimePaths, hello: Hello) -> DaemonStatus {
     let snapshot = hello.state.as_ref();
 
     DaemonStatus {
@@ -81,14 +82,8 @@ pub fn pending_daemon_status(paths: RuntimePaths, foreground: bool) -> DaemonSta
     }
 }
 
-pub fn pending_stop_status(paths: RuntimePaths) -> DaemonStatus {
-    DaemonStatus {
-        command: Some(PendingCommand {
-            name: "stop",
-            foreground: None,
-        }),
-        ..offline_status(paths)
-    }
+pub fn stop(paths: RuntimePaths) -> analyzed_ipc::Result<Stop> {
+    analyzed_ipc::request_stop(&paths)
 }
 
 pub fn run_foreground(paths: RuntimePaths, workspace_root: impl AsRef<Path>) -> anyhow::Result<()> {
@@ -97,17 +92,22 @@ pub fn run_foreground(paths: RuntimePaths, workspace_root: impl AsRef<Path>) -> 
     let listener = bind_listener(&paths)?;
     let workspace_root = workspace_root.as_ref();
     let mut state = ServiceState::load(&[workspace_root])?;
+    let stopping = AtomicBool::new(false);
 
     write_state_file(&paths, &state.snapshot())?;
 
     for stream in listener.incoming() {
         let stream = stream?;
         state.client_sessions += 1;
-        let result = handle_client(stream, &state);
+        let result = handle_client(stream, &state, &stopping);
         state.client_sessions -= 1;
 
         if let Err(error) = result {
             eprintln!("{error}");
+        }
+
+        if stopping.load(Ordering::SeqCst) {
+            break;
         }
     }
 
@@ -162,11 +162,47 @@ impl ServiceState {
     }
 }
 
-fn handle_client(mut stream: UnixStream, state: &ServiceState) -> analyzed_ipc::Result<()> {
-    let _request: HelloRequest = read_json_line(&mut stream)?;
-    write_json_line(&mut stream, &HelloResponse::with_state(state.snapshot()))?;
+fn handle_client(
+    mut stream: UnixStream,
+    state: &ServiceState,
+    stopping: &AtomicBool,
+) -> analyzed_ipc::Result<()> {
+    let request: DaemonRequest = read_json_line(&mut stream)?;
+    let response = handle_request(request, state, stopping);
+    write_json_line(&mut stream, &response)?;
 
     Ok(())
+}
+
+fn handle_request(
+    request: DaemonRequest,
+    state: &ServiceState,
+    stopping: &AtomicBool,
+) -> DaemonResponse {
+    if let Some(error) = validate_client(request.client_info()) {
+        return DaemonResponse::Error(error);
+    }
+
+    match request {
+        DaemonRequest::Hello(_) => DaemonResponse::Hello(Hello::with_state(state.snapshot())),
+        DaemonRequest::Stop(_) => {
+            stopping.store(true, Ordering::SeqCst);
+            DaemonResponse::Stop(Stop {
+                accepted: true,
+                pid: state.pid,
+            })
+        }
+    }
+}
+
+fn validate_client(client: &ClientInfo) -> Option<ProtocolError> {
+    (client.protocol_version != analyzed_ipc::PROTOCOL_VERSION).then(|| ProtocolError {
+        message: format!(
+            "unsupported protocol version {}, expected {}",
+            client.protocol_version,
+            analyzed_ipc::PROTOCOL_VERSION
+        ),
+    })
 }
 
 fn write_state_file(paths: &RuntimePaths, snapshot: &DaemonSnapshot) -> anyhow::Result<()> {

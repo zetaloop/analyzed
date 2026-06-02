@@ -36,9 +36,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Stop) => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&analyzed_daemon::pending_stop_status(
-                    RuntimePaths::discover(),
-                ))?
+                serde_json::to_string_pretty(&analyzed_daemon::stop(RuntimePaths::discover())?)?
             );
         }
         None => println!("analyzed {}", env!("CARGO_PKG_VERSION")),

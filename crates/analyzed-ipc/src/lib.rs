@@ -25,6 +25,8 @@ pub enum IpcError {
     Json(#[from] serde_json::Error),
     #[error("socket path is occupied by a non-socket file: {0}")]
     OccupiedSocketPath(PathBuf),
+    #[error("{0}")]
+    Protocol(String),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -68,16 +70,39 @@ impl RuntimePaths {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct HelloRequest {
+pub struct ClientInfo {
     pub protocol_version: u32,
     pub client_version: String,
 }
 
-impl HelloRequest {
+impl ClientInfo {
     pub fn current() -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
             client_version: env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum DaemonRequest {
+    Hello(ClientInfo),
+    Stop(ClientInfo),
+}
+
+impl DaemonRequest {
+    pub fn hello() -> Self {
+        Self::Hello(ClientInfo::current())
+    }
+
+    pub fn stop() -> Self {
+        Self::Stop(ClientInfo::current())
+    }
+
+    pub fn client_info(&self) -> &ClientInfo {
+        match self {
+            Self::Hello(client) | Self::Stop(client) => client,
         }
     }
 }
@@ -101,7 +126,7 @@ pub struct DaemonSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HelloResponse {
+pub struct Hello {
     pub ok: bool,
     pub pid: u32,
     pub protocol_version: u32,
@@ -111,7 +136,7 @@ pub struct HelloResponse {
     pub state: Option<DaemonSnapshot>,
 }
 
-impl HelloResponse {
+impl Hello {
     pub fn current(pid: u32) -> Self {
         Self {
             ok: true,
@@ -133,6 +158,25 @@ impl HelloResponse {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Stop {
+    pub accepted: bool,
+    pub pid: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProtocolError {
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum DaemonResponse {
+    Hello(Hello),
+    Stop(Stop),
+    Error(ProtocolError),
+}
+
 pub struct StartupLock {
     _file: File,
 }
@@ -152,9 +196,29 @@ impl StartupLock {
     }
 }
 
-pub fn connect_hello(paths: &RuntimePaths) -> Result<HelloResponse> {
+pub fn connect_hello(paths: &RuntimePaths) -> Result<Hello> {
+    match request(paths, &DaemonRequest::hello())? {
+        DaemonResponse::Hello(hello) => Ok(hello),
+        DaemonResponse::Error(error) => Err(IpcError::Protocol(error.message)),
+        response => Err(IpcError::Protocol(format!(
+            "unexpected daemon response: {response:?}"
+        ))),
+    }
+}
+
+pub fn request_stop(paths: &RuntimePaths) -> Result<Stop> {
+    match request(paths, &DaemonRequest::stop())? {
+        DaemonResponse::Stop(stop) => Ok(stop),
+        DaemonResponse::Error(error) => Err(IpcError::Protocol(error.message)),
+        response => Err(IpcError::Protocol(format!(
+            "unexpected daemon response: {response:?}"
+        ))),
+    }
+}
+
+pub fn request(paths: &RuntimePaths, request: &DaemonRequest) -> Result<DaemonResponse> {
     let mut stream = UnixStream::connect(&paths.socket_path)?;
-    write_json_line(&mut stream, &HelloRequest::current())?;
+    write_json_line(&mut stream, request)?;
     read_json_line(&mut stream)
 }
 
