@@ -2,6 +2,11 @@ use std::path::PathBuf;
 
 use analyzed_ipc::RuntimePaths;
 use clap::{Parser, Subcommand};
+use lsp_server::{Connection, ErrorCode, Message, Response};
+use lsp_types::{
+    InitializeParams, InitializeResult, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind,
+};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Rust analysis daemon")]
@@ -42,8 +47,52 @@ fn main() -> anyhow::Result<()> {
                 serde_json::to_string_pretty(&analyzed_daemon::stop(RuntimePaths::discover()?)?)?
             );
         }
-        None => println!("analyzed {}", env!("CARGO_PKG_VERSION")),
+        None => run_stdio()?,
     }
+
+    Ok(())
+}
+
+fn run_stdio() -> anyhow::Result<()> {
+    let paths = RuntimePaths::discover()?;
+    let hello = analyzed_daemon::ensure_daemon(paths, PathBuf::from("."))?;
+    let _boundary = analyzed_ra::rust_analyzer_lsp_boundary();
+    let (connection, io_threads) = Connection::stdio();
+    let capabilities = ServerCapabilities {
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(
+            TextDocumentSyncKind::INCREMENTAL,
+        )),
+        ..ServerCapabilities::default()
+    };
+    let initialize_result = InitializeResult {
+        capabilities,
+        server_info: Some(ServerInfo {
+            name: "analyzed".to_owned(),
+            version: Some(hello.rust_analyzer_version),
+        }),
+        offset_encoding: None,
+    };
+    let initialize_params = connection.initialize(serde_json::to_value(initialize_result)?)?;
+    let _params: InitializeParams = serde_json::from_value(initialize_params)?;
+
+    for message in &connection.receiver {
+        match message {
+            Message::Request(request) => {
+                if connection.handle_shutdown(&request)? {
+                    break;
+                }
+
+                connection.sender.send(Message::Response(Response::new_err(
+                    request.id,
+                    ErrorCode::MethodNotFound as i32,
+                    "method is not implemented by analyzed shim yet".to_owned(),
+                )))?;
+            }
+            Message::Response(_) | Message::Notification(_) => {}
+        }
+    }
+
+    io_threads.join()?;
 
     Ok(())
 }

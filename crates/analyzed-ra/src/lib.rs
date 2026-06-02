@@ -8,6 +8,19 @@ use ra_ap_vfs::{AbsPathBuf, Vfs};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
+pub struct RustAnalyzerLspBoundary {
+    pub main_loop: &'static str,
+}
+
+pub fn rust_analyzer_lsp_boundary() -> RustAnalyzerLspBoundary {
+    let _main_loop = ra_ap_rust_analyzer::main_loop;
+
+    RustAnalyzerLspBoundary {
+        main_loop: "ra_ap_rust_analyzer::main_loop",
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct WorkspaceSummary {
     pub root: String,
     pub manifest: String,
