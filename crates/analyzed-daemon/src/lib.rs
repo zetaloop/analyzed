@@ -1,17 +1,21 @@
 use std::{
     env, fs,
+    io::ErrorKind,
     os::unix::net::UnixStream,
     path::Path,
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
-    thread,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use analyzed_ipc::{
     ClientInfo, DaemonRequest, DaemonResponse, DaemonSnapshot, Hello, ProtocolError,
-    RUST_ANALYZER_VERSION, RuntimePaths, StartupLock, Stop, bind_listener, read_json_line,
-    write_json_line,
+    RUST_ANALYZER_VERSION, RuntimePaths, StartupLock, Stop, WorkspaceSnapshot, bind_listener,
+    read_json_line, write_json_line,
 };
 use analyzed_ra::AnalysisStore;
 use serde::Serialize;
@@ -104,7 +108,7 @@ pub fn ensure_daemon(
             anyhow::bail!("daemon exited before accepting connections: {status}");
         }
 
-        thread::sleep(std::time::Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(100));
     }
 
     anyhow::bail!("daemon did not accept connections before the startup timeout")
@@ -116,8 +120,8 @@ pub fn run_foreground(
     startup_lock_owned: bool,
 ) -> anyhow::Result<()> {
     let workspace_root = workspace_root.as_ref();
-    let mut state = ServiceState::load(&[workspace_root])?;
-    let stopping = AtomicBool::new(false);
+    let runtime = DaemonRuntime::load(&[workspace_root])?;
+    let state = Arc::clone(&runtime.state);
     let listener = {
         let _lock = (!startup_lock_owned)
             .then(|| StartupLock::acquire(&paths))
@@ -127,33 +131,45 @@ pub fn run_foreground(
         write_state_file(&paths, &state.discovery(&paths))?;
         listener
     };
+    listener.set_nonblocking(true)?;
 
-    for stream in listener.incoming() {
-        let stream = stream?;
-        state.client_sessions += 1;
-        let result = handle_client(stream, &state, &stopping);
-        state.client_sessions -= 1;
+    let mut sessions = Vec::new();
 
-        if let Err(error) = result {
-            eprintln!("{error}");
-        }
+    while !state.stopping.load(Ordering::SeqCst) {
+        reap_finished_sessions(&mut sessions);
 
-        if stopping.load(Ordering::SeqCst) {
-            break;
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let state = Arc::clone(&state);
+                sessions.push(thread::spawn(move || {
+                    state.client_sessions.fetch_add(1, Ordering::SeqCst);
+                    let result = handle_client(stream, &state);
+                    state.client_sessions.fetch_sub(1, Ordering::SeqCst);
+
+                    if let Err(error) = result {
+                        eprintln!("{error}");
+                    }
+                }));
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error.into()),
         }
     }
+
+    join_client_sessions(sessions);
+    drop(runtime);
 
     Ok(())
 }
 
-struct ServiceState {
-    pid: u32,
-    started_at_unix_seconds: u64,
-    client_sessions: usize,
-    analysis: AnalysisStore,
+struct DaemonRuntime {
+    _analysis: AnalysisStore,
+    state: Arc<ServiceState>,
 }
 
-impl ServiceState {
+impl DaemonRuntime {
     fn load(workspace_roots: &[&Path]) -> anyhow::Result<Self> {
         let mut analysis = AnalysisStore::new();
 
@@ -161,21 +177,9 @@ impl ServiceState {
             analysis.load_cargo_workspace(root)?;
         }
 
-        Ok(Self {
-            pid: std::process::id(),
-            started_at_unix_seconds: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_secs()),
-            client_sessions: 0,
-            analysis,
-        })
-    }
-
-    fn snapshot(&self) -> DaemonSnapshot {
-        let workspace_loads: Vec<_> = self
-            .analysis
+        let workspace_loads = analysis
             .workspace_summaries()
-            .map(|summary| analyzed_ipc::WorkspaceSnapshot {
+            .map(|summary| WorkspaceSnapshot {
                 root: summary.root.clone(),
                 manifest: summary.manifest.clone(),
                 packages: summary.packages,
@@ -184,10 +188,37 @@ impl ServiceState {
             })
             .collect();
 
+        Ok(Self {
+            _analysis: analysis,
+            state: Arc::new(ServiceState {
+                pid: std::process::id(),
+                started_at_unix_seconds: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_secs()),
+                client_sessions: AtomicUsize::new(0),
+                workspace_loads,
+                stopping: AtomicBool::new(false),
+            }),
+        })
+    }
+}
+
+struct ServiceState {
+    pid: u32,
+    started_at_unix_seconds: u64,
+    client_sessions: AtomicUsize,
+    workspace_loads: Vec<WorkspaceSnapshot>,
+    stopping: AtomicBool,
+}
+
+impl ServiceState {
+    fn snapshot(&self) -> DaemonSnapshot {
+        let workspace_loads = self.workspace_loads.clone();
+
         DaemonSnapshot {
             pid: self.pid,
             started_at_unix_seconds: self.started_at_unix_seconds,
-            client_sessions: self.client_sessions,
+            client_sessions: self.client_sessions.load(Ordering::SeqCst),
             workspaces: workspace_loads.len(),
             workspace_loads,
         }
@@ -205,23 +236,15 @@ impl ServiceState {
     }
 }
 
-fn handle_client(
-    mut stream: UnixStream,
-    state: &ServiceState,
-    stopping: &AtomicBool,
-) -> analyzed_ipc::Result<()> {
+fn handle_client(mut stream: UnixStream, state: &ServiceState) -> analyzed_ipc::Result<()> {
     let request: DaemonRequest = read_json_line(&mut stream)?;
-    let response = handle_request(request, state, stopping);
+    let response = handle_request(request, state);
     write_json_line(&mut stream, &response)?;
 
     Ok(())
 }
 
-fn handle_request(
-    request: DaemonRequest,
-    state: &ServiceState,
-    stopping: &AtomicBool,
-) -> DaemonResponse {
+fn handle_request(request: DaemonRequest, state: &ServiceState) -> DaemonResponse {
     if let Some(error) = validate_client(request.client_info()) {
         return DaemonResponse::Error(error);
     }
@@ -229,7 +252,7 @@ fn handle_request(
     match request {
         DaemonRequest::Hello(_) => DaemonResponse::Hello(Hello::with_state(state.snapshot())),
         DaemonRequest::Stop(_) => {
-            stopping.store(true, Ordering::SeqCst);
+            state.stopping.store(true, Ordering::SeqCst);
             DaemonResponse::Stop(Stop {
                 accepted: true,
                 pid: state.pid,
@@ -246,6 +269,25 @@ fn validate_client(client: &ClientInfo) -> Option<ProtocolError> {
             analyzed_ipc::PROTOCOL_VERSION
         ),
     })
+}
+
+fn reap_finished_sessions(sessions: &mut Vec<JoinHandle<()>>) {
+    let mut index = 0;
+
+    while index < sessions.len() {
+        if sessions[index].is_finished() {
+            let session = sessions.swap_remove(index);
+            let _ = session.join();
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn join_client_sessions(sessions: Vec<JoinHandle<()>>) {
+    for session in sessions {
+        let _ = session.join();
+    }
 }
 
 #[derive(Serialize)]
