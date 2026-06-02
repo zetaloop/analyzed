@@ -1,10 +1,7 @@
 use std::{
     fs,
     os::unix::net::UnixStream,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -12,6 +9,7 @@ use analyzed_ipc::{
     DaemonSnapshot, HelloRequest, HelloResponse, RuntimePaths, StartupLock, bind_listener,
     read_json_line, write_json_line,
 };
+use analyzed_ra::LoadedWorkspace;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -93,20 +91,20 @@ pub fn pending_stop_status(paths: RuntimePaths) -> DaemonStatus {
     }
 }
 
-pub fn run_foreground(paths: RuntimePaths) -> analyzed_ipc::Result<()> {
+pub fn run_foreground(paths: RuntimePaths, workspace_root: impl AsRef<Path>) -> anyhow::Result<()> {
     let _lock = StartupLock::acquire(&paths)?;
     paths.ensure_state_dir()?;
     let listener = bind_listener(&paths)?;
-    let state = Arc::new(ServiceState::new());
+    let workspace_root = workspace_root.as_ref();
+    let mut state = ServiceState::load(&[workspace_root])?;
 
     write_state_file(&paths, &state.snapshot())?;
 
     for stream in listener.incoming() {
         let stream = stream?;
-        let state = Arc::clone(&state);
-        state.client_sessions.fetch_add(1, Ordering::SeqCst);
+        state.client_sessions += 1;
         let result = handle_client(stream, &state);
-        state.client_sessions.fetch_sub(1, Ordering::SeqCst);
+        state.client_sessions -= 1;
 
         if let Err(error) = result {
             eprintln!("{error}");
@@ -119,28 +117,47 @@ pub fn run_foreground(paths: RuntimePaths) -> analyzed_ipc::Result<()> {
 struct ServiceState {
     pid: u32,
     started_at_unix_seconds: u64,
-    client_sessions: AtomicUsize,
-    workspaces: AtomicUsize,
+    client_sessions: usize,
+    loaded_workspaces: Vec<LoadedWorkspace>,
 }
 
 impl ServiceState {
-    fn new() -> Self {
-        Self {
+    fn load(workspace_roots: &[&Path]) -> anyhow::Result<Self> {
+        let loaded_workspaces = workspace_roots
+            .iter()
+            .map(analyzed_ra::load_cargo_workspace)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(Self {
             pid: std::process::id(),
             started_at_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_secs()),
-            client_sessions: AtomicUsize::new(0),
-            workspaces: AtomicUsize::new(0),
-        }
+            client_sessions: 0,
+            loaded_workspaces,
+        })
     }
 
     fn snapshot(&self) -> DaemonSnapshot {
         DaemonSnapshot {
             pid: self.pid,
             started_at_unix_seconds: self.started_at_unix_seconds,
-            client_sessions: self.client_sessions.load(Ordering::SeqCst),
-            workspaces: self.workspaces.load(Ordering::SeqCst),
+            client_sessions: self.client_sessions,
+            workspaces: self.loaded_workspaces.len(),
+            workspace_loads: self
+                .loaded_workspaces
+                .iter()
+                .map(|workspace| {
+                    let summary = workspace.summary();
+                    analyzed_ipc::WorkspaceSnapshot {
+                        root: summary.root.clone(),
+                        manifest: summary.manifest.clone(),
+                        packages: summary.packages,
+                        files: summary.files,
+                        proc_macro_server: summary.proc_macro_server,
+                    }
+                })
+                .collect(),
         }
     }
 }
@@ -152,7 +169,7 @@ fn handle_client(mut stream: UnixStream, state: &ServiceState) -> analyzed_ipc::
     Ok(())
 }
 
-fn write_state_file(paths: &RuntimePaths, snapshot: &DaemonSnapshot) -> analyzed_ipc::Result<()> {
+fn write_state_file(paths: &RuntimePaths, snapshot: &DaemonSnapshot) -> anyhow::Result<()> {
     fs::write(&paths.state_path, serde_json::to_vec_pretty(snapshot)?)?;
     Ok(())
 }

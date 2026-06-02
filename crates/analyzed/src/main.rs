@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use analyzed_ipc::RuntimePaths;
 use clap::{Parser, Subcommand};
 
@@ -13,6 +15,8 @@ enum Command {
     Daemon {
         #[arg(long)]
         foreground: bool,
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
     },
     Status,
     Stop,
@@ -23,8 +27,11 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Status) => print_status()?,
-        Some(Command::Daemon { foreground }) => {
-            run_daemon(foreground)?;
+        Some(Command::Daemon {
+            foreground,
+            workspace,
+        }) => {
+            run_daemon(foreground, workspace)?;
         }
         Some(Command::Stop) => {
             println!(
@@ -49,11 +56,11 @@ fn print_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_daemon(foreground: bool) -> anyhow::Result<()> {
+fn run_daemon(foreground: bool, workspace: PathBuf) -> anyhow::Result<()> {
     let paths = RuntimePaths::discover();
 
     if foreground {
-        analyzed_daemon::run_foreground(paths)?;
+        analyzed_daemon::run_foreground(paths, workspace)?;
     } else {
         println!(
             "{}",

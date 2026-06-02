@@ -83,11 +83,21 @@ impl HelloRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceSnapshot {
+    pub root: String,
+    pub manifest: String,
+    pub packages: usize,
+    pub files: usize,
+    pub proc_macro_server: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DaemonSnapshot {
     pub pid: u32,
     pub started_at_unix_seconds: u64,
     pub client_sessions: usize,
     pub workspaces: usize,
+    pub workspace_loads: Vec<WorkspaceSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

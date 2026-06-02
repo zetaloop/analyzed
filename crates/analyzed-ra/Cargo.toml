@@ -6,3 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+ra_ap_ide.workspace = true
+ra_ap_load-cargo.workspace = true
+ra_ap_proc_macro_api.workspace = true
+ra_ap_project_model.workspace = true
+ra_ap_vfs.workspace = true
+serde.workspace = true
