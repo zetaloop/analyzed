@@ -17,6 +17,8 @@ enum Command {
         foreground: bool,
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
+        #[arg(long, hide = true)]
+        startup_lock_owned: bool,
     },
     Status,
     Stop,
@@ -30,8 +32,9 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Daemon {
             foreground,
             workspace,
+            startup_lock_owned,
         }) => {
-            run_daemon(foreground, workspace)?;
+            run_daemon(foreground, workspace, startup_lock_owned)?;
         }
         Some(Command::Stop) => {
             println!(
@@ -54,15 +57,19 @@ fn print_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_daemon(foreground: bool, workspace: PathBuf) -> anyhow::Result<()> {
+fn run_daemon(
+    foreground: bool,
+    workspace: PathBuf,
+    startup_lock_owned: bool,
+) -> anyhow::Result<()> {
     let paths = RuntimePaths::discover()?;
 
     if foreground {
-        analyzed_daemon::run_foreground(paths, workspace)?;
+        analyzed_daemon::run_foreground(paths, workspace, startup_lock_owned)?;
     } else {
         println!(
             "{}",
-            serde_json::to_string_pretty(&analyzed_daemon::pending_daemon_status(paths, false))?
+            serde_json::to_string_pretty(&analyzed_daemon::ensure_daemon(paths, workspace)?)?
         );
     }
 
