@@ -1,0 +1,10 @@
+[package]
+name = "analyzed-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+analyzed-ipc.workspace = true
+analyzed-ra.workspace = true
