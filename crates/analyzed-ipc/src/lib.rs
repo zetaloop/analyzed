@@ -114,6 +114,12 @@ impl DaemonRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackendKey {
+    pub rust_analyzer_version: String,
+    pub workspace_roots: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
     pub root: String,
     pub manifest: String,

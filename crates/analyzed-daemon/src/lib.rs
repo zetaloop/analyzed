@@ -13,14 +13,15 @@ use std::{
 };
 
 use analyzed_ipc::{
-    ClientInfo, DaemonRequest, DaemonResponse, DaemonSnapshot, Hello, LspSession, ProtocolError,
-    RUST_ANALYZER_VERSION, RuntimePaths, StartupLock, Stop, WorkspaceSnapshot, bind_listener,
-    read_json_line, write_json_line,
+    BackendKey, ClientInfo, DaemonRequest, DaemonResponse, DaemonSnapshot, Hello, LspSession,
+    ProtocolError, RUST_ANALYZER_VERSION, RuntimePaths, StartupLock, Stop, WorkspaceSnapshot,
+    bind_listener, read_json_line, write_json_line,
 };
 use analyzed_ra::WorkspaceStore;
 use crossbeam_channel::unbounded;
 use daemonize::Daemonize;
 use lsp_server::{Connection, Message};
+use lsp_types::InitializeParams;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -328,7 +329,10 @@ fn handle_lsp_session(
     _state: &ServiceState,
     _session_id: usize,
 ) -> anyhow::Result<()> {
-    let (connection, threads) = lsp_stream_connection(stream)?;
+    let (connection, threads, context) = lsp_stream_connection(stream)?;
+    let LspSessionContext {
+        backend_key: _backend_key,
+    } = context;
     let result = analyzed_ra::run_rust_analyzer_lsp_session(connection);
     let join_result = threads.join();
 
@@ -339,13 +343,24 @@ fn handle_lsp_session(
     }
 }
 
-fn lsp_stream_connection(stream: UnixStream) -> anyhow::Result<(Connection, LspStreamThreads)> {
+struct LspSessionContext {
+    backend_key: BackendKey,
+}
+
+fn lsp_stream_connection(
+    stream: UnixStream,
+) -> anyhow::Result<(Connection, LspStreamThreads, LspSessionContext)> {
     let reader_stream = stream.try_clone()?;
+    let mut reader = BufReader::new(reader_stream);
+    let initialize = Message::read(&mut reader)?.ok_or_else(|| {
+        anyhow::anyhow!("lsp client disconnected before sending initialize request")
+    })?;
+    let context = lsp_session_context(&initialize)?;
     let (writer_sender, writer_receiver) = unbounded::<Message>();
     let (reader_sender, reader_receiver) = unbounded::<Message>();
+    reader_sender.send(initialize)?;
 
     let reader = thread::spawn(move || {
-        let mut reader = BufReader::new(reader_stream);
         while let Some(message) = Message::read(&mut reader)? {
             if reader_sender.send(message).is_err() {
                 break;
@@ -369,7 +384,60 @@ fn lsp_stream_connection(stream: UnixStream) -> anyhow::Result<(Connection, LspS
             receiver: reader_receiver,
         },
         LspStreamThreads { reader, writer },
+        context,
     ))
+}
+
+fn lsp_session_context(message: &Message) -> anyhow::Result<LspSessionContext> {
+    let Message::Request(request) = message else {
+        anyhow::bail!("lsp client sent a non-request message before initialize");
+    };
+    if request.method != "initialize" {
+        anyhow::bail!(
+            "lsp client sent {} before initialize request",
+            request.method
+        );
+    }
+
+    let params = serde_json::from_value::<InitializeParams>(request.params.clone())?;
+    let workspace_roots = workspace_roots_from_initialize(&params)?;
+
+    Ok(LspSessionContext {
+        backend_key: BackendKey {
+            rust_analyzer_version: RUST_ANALYZER_VERSION.to_owned(),
+            workspace_roots,
+        },
+    })
+}
+
+fn workspace_roots_from_initialize(params: &InitializeParams) -> anyhow::Result<Vec<String>> {
+    let mut roots = Vec::new();
+
+    if let Some(workspace_folders) = &params.workspace_folders {
+        for workspace in workspace_folders {
+            roots.push(canonical_uri_path(&workspace.uri)?);
+        }
+    }
+    if roots.is_empty()
+        && let Some(root_uri) = &params.root_uri
+    {
+        roots.push(canonical_uri_path(root_uri)?);
+    }
+    if roots.is_empty() {
+        roots.push(env::current_dir()?.to_string_lossy().into_owned());
+    }
+
+    roots.sort();
+    roots.dedup();
+
+    Ok(roots)
+}
+
+fn canonical_uri_path(uri: &lsp_types::Url) -> anyhow::Result<String> {
+    let path = uri
+        .to_file_path()
+        .map_err(|()| anyhow::anyhow!("workspace uri is not a file path: {uri}"))?;
+    Ok(fs::canonicalize(path)?.to_string_lossy().into_owned())
 }
 
 fn validate_client(client: &ClientInfo) -> Option<ProtocolError> {
