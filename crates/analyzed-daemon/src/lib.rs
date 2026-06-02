@@ -1,4 +1,4 @@
-use analyzed_ipc::RuntimePaths;
+use analyzed_ipc::{HelloResponse, RuntimePaths};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -9,6 +9,8 @@ pub struct DaemonStatus {
     workspaces: usize,
     paths: RuntimePaths,
     command: Option<PendingCommand>,
+    hello: Option<HelloResponse>,
+    connection_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -25,6 +27,31 @@ pub fn offline_status(paths: RuntimePaths) -> DaemonStatus {
         workspaces: 0,
         paths,
         command: None,
+        hello: None,
+        connection_error: None,
+    }
+}
+
+pub fn status(paths: RuntimePaths) -> DaemonStatus {
+    match analyzed_ipc::connect_hello(&paths) {
+        Ok(hello) => online_status(paths, hello),
+        Err(error) => DaemonStatus {
+            connection_error: Some(error.to_string()),
+            ..offline_status(paths)
+        },
+    }
+}
+
+pub fn online_status(paths: RuntimePaths, hello: HelloResponse) -> DaemonStatus {
+    DaemonStatus {
+        running: true,
+        pid: Some(hello.pid),
+        client_sessions: 0,
+        workspaces: 0,
+        paths,
+        command: None,
+        hello: Some(hello),
+        connection_error: None,
     }
 }
 

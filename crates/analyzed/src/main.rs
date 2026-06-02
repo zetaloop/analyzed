@@ -49,7 +49,7 @@ fn main() -> anyhow::Result<()> {
 fn print_status() -> anyhow::Result<()> {
     println!(
         "{}",
-        serde_json::to_string_pretty(&analyzed_daemon::offline_status(RuntimePaths::discover()))?
+        serde_json::to_string_pretty(&analyzed_daemon::status(RuntimePaths::discover()))?
     );
 
     Ok(())
