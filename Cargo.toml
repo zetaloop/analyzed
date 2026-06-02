@@ -30,7 +30,6 @@ ra_ap_ide = "0.0.334"
 ra_ap_load-cargo = "0.0.334"
 ra_ap_proc_macro_api = "0.0.334"
 ra_ap_project_model = "0.0.334"
-ra_ap_rust-analyzer = "0.0.334"
 ra_ap_vfs = "0.0.334"
 ra_ap_vfs-notify = "0.0.334"
 serde = { version = "1.0.228", features = ["derive"] }
