@@ -2,7 +2,7 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
-    os::unix::fs::FileTypeExt,
+    os::unix::fs::{FileTypeExt, PermissionsExt},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
 };
@@ -25,6 +25,8 @@ pub enum IpcError {
     Json(#[from] serde_json::Error),
     #[error("socket path is occupied by a non-socket file: {0}")]
     OccupiedSocketPath(PathBuf),
+    #[error("runtime directory is unavailable")]
+    RuntimeDirUnavailable,
     #[error("{0}")]
     Protocol(String),
 }
@@ -38,31 +40,30 @@ pub struct RuntimePaths {
 }
 
 impl RuntimePaths {
-    pub fn discover() -> Self {
-        let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir)
-            .join("analyzed");
+    pub fn discover() -> Result<Self> {
+        let runtime_dir = runtime_dir()?.join("analyzed");
         let state_dir = ProjectDirs::from("dev", "zetaloop", "analyzed")
             .map(|dirs| dirs.data_local_dir().to_path_buf())
-            .unwrap_or_else(|| runtime_dir.clone());
+            .ok_or(IpcError::RuntimeDirUnavailable)?;
 
-        Self {
+        Ok(Self {
             socket_path: runtime_dir.join("daemon.sock"),
             lock_path: runtime_dir.join("daemon.lock"),
             state_path: state_dir.join("daemon.json"),
             runtime_dir,
-        }
+        })
     }
 
     pub fn ensure_runtime_dir(&self) -> Result<()> {
         fs::create_dir_all(&self.runtime_dir)?;
+        fs::set_permissions(&self.runtime_dir, fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
 
     pub fn ensure_state_dir(&self) -> Result<()> {
         if let Some(parent) = self.state_path.parent() {
             fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
 
         Ok(())
@@ -262,4 +263,27 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn runtime_dir() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+        return Ok(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(env::temp_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return ProjectDirs::from("dev", "zetaloop", "analyzed")
+            .map(|dirs| dirs.cache_dir().join("run"))
+            .ok_or(IpcError::RuntimeDirUnavailable);
+    }
+
+    #[allow(unreachable_code)]
+    ProjectDirs::from("dev", "zetaloop", "analyzed")
+        .map(|dirs| dirs.cache_dir().join("run"))
+        .ok_or(IpcError::RuntimeDirUnavailable)
 }

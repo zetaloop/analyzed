@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Stop) => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&analyzed_daemon::stop(RuntimePaths::discover())?)?
+                serde_json::to_string_pretty(&analyzed_daemon::stop(RuntimePaths::discover()?)?)?
             );
         }
         None => println!("analyzed {}", env!("CARGO_PKG_VERSION")),
@@ -48,14 +48,14 @@ fn main() -> anyhow::Result<()> {
 fn print_status() -> anyhow::Result<()> {
     println!(
         "{}",
-        serde_json::to_string_pretty(&analyzed_daemon::status(RuntimePaths::discover()))?
+        serde_json::to_string_pretty(&analyzed_daemon::status(RuntimePaths::discover()?))?
     );
 
     Ok(())
 }
 
 fn run_daemon(foreground: bool, workspace: PathBuf) -> anyhow::Result<()> {
-    let paths = RuntimePaths::discover();
+    let paths = RuntimePaths::discover()?;
 
     if foreground {
         analyzed_daemon::run_foreground(paths, workspace)?;

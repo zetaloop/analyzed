@@ -7,8 +7,9 @@ use std::{
 };
 
 use analyzed_ipc::{
-    ClientInfo, DaemonRequest, DaemonResponse, DaemonSnapshot, Hello, ProtocolError, RuntimePaths,
-    StartupLock, Stop, bind_listener, read_json_line, write_json_line,
+    ClientInfo, DaemonRequest, DaemonResponse, DaemonSnapshot, Hello, ProtocolError,
+    RUST_ANALYZER_VERSION, RuntimePaths, StartupLock, Stop, bind_listener, read_json_line,
+    write_json_line,
 };
 use analyzed_ra::AnalysisStore;
 use serde::Serialize;
@@ -87,14 +88,16 @@ pub fn stop(paths: RuntimePaths) -> analyzed_ipc::Result<Stop> {
 }
 
 pub fn run_foreground(paths: RuntimePaths, workspace_root: impl AsRef<Path>) -> anyhow::Result<()> {
-    let _lock = StartupLock::acquire(&paths)?;
-    paths.ensure_state_dir()?;
-    let listener = bind_listener(&paths)?;
     let workspace_root = workspace_root.as_ref();
     let mut state = ServiceState::load(&[workspace_root])?;
     let stopping = AtomicBool::new(false);
-
-    write_state_file(&paths, &state.snapshot())?;
+    let listener = {
+        let _lock = StartupLock::acquire(&paths)?;
+        paths.ensure_state_dir()?;
+        let listener = bind_listener(&paths)?;
+        write_state_file(&paths, &state.discovery(&paths))?;
+        listener
+    };
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -160,6 +163,17 @@ impl ServiceState {
             workspace_loads,
         }
     }
+
+    fn discovery(&self, paths: &RuntimePaths) -> DaemonDiscovery {
+        DaemonDiscovery {
+            pid: self.pid,
+            started_at_unix_seconds: self.started_at_unix_seconds,
+            protocol_version: analyzed_ipc::PROTOCOL_VERSION,
+            daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+            rust_analyzer_version: RUST_ANALYZER_VERSION.to_owned(),
+            socket_path: paths.socket_path.to_string_lossy().into_owned(),
+        }
+    }
 }
 
 fn handle_client(
@@ -205,7 +219,17 @@ fn validate_client(client: &ClientInfo) -> Option<ProtocolError> {
     })
 }
 
-fn write_state_file(paths: &RuntimePaths, snapshot: &DaemonSnapshot) -> anyhow::Result<()> {
-    fs::write(&paths.state_path, serde_json::to_vec_pretty(snapshot)?)?;
+#[derive(Serialize)]
+struct DaemonDiscovery {
+    pid: u32,
+    started_at_unix_seconds: u64,
+    protocol_version: u32,
+    daemon_version: String,
+    rust_analyzer_version: String,
+    socket_path: String,
+}
+
+fn write_state_file(paths: &RuntimePaths, discovery: &DaemonDiscovery) -> anyhow::Result<()> {
+    fs::write(&paths.state_path, serde_json::to_vec_pretty(discovery)?)?;
     Ok(())
 }
