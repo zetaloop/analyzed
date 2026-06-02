@@ -95,6 +95,7 @@ fn run_stdio() -> anyhow::Result<()> {
         }
     }
 
+    drop(connection);
     io_threads.join()?;
 
     Ok(())
