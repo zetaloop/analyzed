@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use ra_ap_ide::AnalysisHost;
-use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace};
+use ra_ap_ide::{AnalysisHost, RootDatabase};
+use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_into_db};
 use ra_ap_proc_macro_api::ProcMacroClient;
 use ra_ap_project_model::{CargoConfig, ProjectManifest, ProjectWorkspace};
 use ra_ap_vfs::{AbsPathBuf, Vfs};
@@ -18,7 +18,6 @@ pub struct WorkspaceSummary {
 
 pub struct LoadedWorkspace {
     summary: WorkspaceSummary,
-    _host: AnalysisHost,
     _vfs: Vfs,
     _proc_macro_client: Option<ProcMacroClient>,
 }
@@ -29,7 +28,48 @@ impl LoadedWorkspace {
     }
 }
 
-pub fn load_cargo_workspace(root: impl AsRef<Path>) -> anyhow::Result<LoadedWorkspace> {
+pub struct AnalysisStore {
+    host: AnalysisHost,
+    loaded_workspaces: Vec<LoadedWorkspace>,
+}
+
+impl AnalysisStore {
+    pub fn new() -> Self {
+        Self {
+            host: AnalysisHost::with_database(RootDatabase::new(None)),
+            loaded_workspaces: Vec::new(),
+        }
+    }
+
+    pub fn load_cargo_workspace(
+        &mut self,
+        root: impl AsRef<Path>,
+    ) -> anyhow::Result<&WorkspaceSummary> {
+        let loaded = load_cargo_workspace_into_host(&mut self.host, root)?;
+        self.loaded_workspaces.push(loaded);
+
+        Ok(self
+            .loaded_workspaces
+            .last()
+            .expect("workspace was just inserted")
+            .summary())
+    }
+
+    pub fn workspace_summaries(&self) -> impl Iterator<Item = &WorkspaceSummary> {
+        self.loaded_workspaces.iter().map(LoadedWorkspace::summary)
+    }
+}
+
+impl Default for AnalysisStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn load_cargo_workspace_into_host(
+    host: &mut AnalysisHost,
+    root: impl AsRef<Path>,
+) -> anyhow::Result<LoadedWorkspace> {
     let cargo_config = CargoConfig::default();
     let load_config = LoadCargoConfig {
         load_out_dirs_from_check: false,
@@ -44,10 +84,10 @@ pub fn load_cargo_workspace(root: impl AsRef<Path>) -> anyhow::Result<LoadedWork
     let workspace = ProjectWorkspace::load(manifest, &cargo_config, &|_| {})?;
     let root = workspace.workspace_root().to_string();
     let packages = workspace.n_packages();
-    let (db, vfs, proc_macro_client) =
-        load_workspace(workspace, &cargo_config.extra_env, &load_config)?;
+    let db = host.raw_database_mut();
+    let (vfs, proc_macro_client) =
+        load_workspace_into_db(workspace, &cargo_config.extra_env, &load_config, db)?;
     let files = vfs.iter().count();
-    let host = AnalysisHost::with_database(db);
 
     Ok(LoadedWorkspace {
         summary: WorkspaceSummary {
@@ -57,7 +97,6 @@ pub fn load_cargo_workspace(root: impl AsRef<Path>) -> anyhow::Result<LoadedWork
             files,
             proc_macro_server: proc_macro_client.is_some(),
         },
-        _host: host,
         _vfs: vfs,
         _proc_macro_client: proc_macro_client,
     })

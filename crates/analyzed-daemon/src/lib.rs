@@ -9,7 +9,7 @@ use analyzed_ipc::{
     DaemonSnapshot, HelloRequest, HelloResponse, RuntimePaths, StartupLock, bind_listener,
     read_json_line, write_json_line,
 };
-use analyzed_ra::LoadedWorkspace;
+use analyzed_ra::AnalysisStore;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -118,15 +118,16 @@ struct ServiceState {
     pid: u32,
     started_at_unix_seconds: u64,
     client_sessions: usize,
-    loaded_workspaces: Vec<LoadedWorkspace>,
+    analysis: AnalysisStore,
 }
 
 impl ServiceState {
     fn load(workspace_roots: &[&Path]) -> anyhow::Result<Self> {
-        let loaded_workspaces = workspace_roots
-            .iter()
-            .map(analyzed_ra::load_cargo_workspace)
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut analysis = AnalysisStore::new();
+
+        for root in workspace_roots {
+            analysis.load_cargo_workspace(root)?;
+        }
 
         Ok(Self {
             pid: std::process::id(),
@@ -134,30 +135,29 @@ impl ServiceState {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_secs()),
             client_sessions: 0,
-            loaded_workspaces,
+            analysis,
         })
     }
 
     fn snapshot(&self) -> DaemonSnapshot {
+        let workspace_loads: Vec<_> = self
+            .analysis
+            .workspace_summaries()
+            .map(|summary| analyzed_ipc::WorkspaceSnapshot {
+                root: summary.root.clone(),
+                manifest: summary.manifest.clone(),
+                packages: summary.packages,
+                files: summary.files,
+                proc_macro_server: summary.proc_macro_server,
+            })
+            .collect();
+
         DaemonSnapshot {
             pid: self.pid,
             started_at_unix_seconds: self.started_at_unix_seconds,
             client_sessions: self.client_sessions,
-            workspaces: self.loaded_workspaces.len(),
-            workspace_loads: self
-                .loaded_workspaces
-                .iter()
-                .map(|workspace| {
-                    let summary = workspace.summary();
-                    analyzed_ipc::WorkspaceSnapshot {
-                        root: summary.root.clone(),
-                        manifest: summary.manifest.clone(),
-                        packages: summary.packages,
-                        files: summary.files,
-                        proc_macro_server: summary.proc_macro_server,
-                    }
-                })
-                .collect(),
+            workspaces: workspace_loads.len(),
+            workspace_loads,
         }
     }
 }
