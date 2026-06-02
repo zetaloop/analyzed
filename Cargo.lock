@@ -45,6 +45,7 @@ dependencies = [
  "crossbeam-channel",
  "daemonize",
  "lsp-server",
+ "lsp-types",
  "serde",
  "serde_json",
 ]

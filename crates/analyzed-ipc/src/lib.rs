@@ -118,8 +118,6 @@ pub struct WorkspaceSnapshot {
     pub root: String,
     pub manifest: String,
     pub packages: usize,
-    pub files: usize,
-    pub proc_macro_server: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -150,7 +148,7 @@ impl Hello {
             protocol_version: PROTOCOL_VERSION,
             daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
             rust_analyzer_version: RUST_ANALYZER_VERSION.to_owned(),
-            capabilities: vec!["lsp".to_owned(), "native_query".to_owned()],
+            capabilities: vec!["lsp".to_owned()],
             state: None,
         }
     }

@@ -17,7 +17,7 @@ use analyzed_ipc::{
     RUST_ANALYZER_VERSION, RuntimePaths, StartupLock, Stop, WorkspaceSnapshot, bind_listener,
     read_json_line, write_json_line,
 };
-use analyzed_ra::AnalysisStore;
+use analyzed_ra::WorkspaceStore;
 use crossbeam_channel::unbounded;
 use daemonize::Daemonize;
 use lsp_server::{Connection, Message};
@@ -170,7 +170,8 @@ pub fn run_foreground(
                 let state = Arc::clone(&state);
                 sessions.push(thread::spawn(move || {
                     state.client_sessions.fetch_add(1, Ordering::SeqCst);
-                    let result = handle_client(stream, &state);
+                    let session_id = state.next_session_id.fetch_add(1, Ordering::SeqCst);
+                    let result = handle_client(stream, &state, session_id);
                     state.client_sessions.fetch_sub(1, Ordering::SeqCst);
 
                     if let Err(error) = result {
@@ -192,37 +193,34 @@ pub fn run_foreground(
 }
 
 struct DaemonRuntime {
-    _analysis: AnalysisStore,
     state: Arc<ServiceState>,
 }
 
 impl DaemonRuntime {
     fn load(workspace_roots: &[&Path]) -> anyhow::Result<Self> {
-        let mut analysis = AnalysisStore::new();
+        let mut workspaces = WorkspaceStore::new();
 
         for root in workspace_roots {
-            analysis.load_cargo_workspace(root)?;
+            workspaces.discover_cargo_workspace(root)?;
         }
 
-        let workspace_loads = analysis
+        let workspace_loads = workspaces
             .workspace_summaries()
             .map(|summary| WorkspaceSnapshot {
                 root: summary.root.clone(),
                 manifest: summary.manifest.clone(),
                 packages: summary.packages,
-                files: summary.files,
-                proc_macro_server: summary.proc_macro_server,
             })
             .collect();
 
         Ok(Self {
-            _analysis: analysis,
             state: Arc::new(ServiceState {
                 pid: std::process::id(),
                 started_at_unix_seconds: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |duration| duration.as_secs()),
                 client_sessions: AtomicUsize::new(0),
+                next_session_id: AtomicUsize::new(1),
                 workspace_loads,
                 stopping: AtomicBool::new(false),
             }),
@@ -234,6 +232,7 @@ struct ServiceState {
     pid: u32,
     started_at_unix_seconds: u64,
     client_sessions: AtomicUsize,
+    next_session_id: AtomicUsize,
     workspace_loads: Vec<WorkspaceSnapshot>,
     stopping: AtomicBool,
 }
@@ -263,7 +262,11 @@ impl ServiceState {
     }
 }
 
-fn handle_client(mut stream: UnixStream, state: &ServiceState) -> analyzed_ipc::Result<()> {
+fn handle_client(
+    mut stream: UnixStream,
+    state: &ServiceState,
+    session_id: usize,
+) -> analyzed_ipc::Result<()> {
     let request: DaemonRequest = read_json_line(&mut stream)?;
     if let Some(error) = validate_client(request.client_info()) {
         write_json_line(&mut stream, &DaemonResponse::Error(error))?;
@@ -285,7 +288,7 @@ fn handle_client(mut stream: UnixStream, state: &ServiceState) -> analyzed_ipc::
                     pid: state.pid,
                 }),
             )?;
-            handle_lsp_session(stream).map_err(|error| {
+            handle_lsp_session(stream, state, session_id).map_err(|error| {
                 analyzed_ipc::IpcError::Protocol(format!("lsp session failed: {error}"))
             })?;
         }
@@ -320,7 +323,11 @@ impl LspStreamThreads {
     }
 }
 
-fn handle_lsp_session(stream: UnixStream) -> anyhow::Result<()> {
+fn handle_lsp_session(
+    stream: UnixStream,
+    _state: &ServiceState,
+    _session_id: usize,
+) -> anyhow::Result<()> {
     let (connection, threads) = lsp_stream_connection(stream)?;
     let result = analyzed_ra::run_rust_analyzer_lsp_session(connection);
     let join_result = threads.join();

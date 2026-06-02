@@ -255,10 +255,10 @@ fn append_bridge_export(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 
 pub mod analyzed_bridge;
 pub use analyzed_bridge::{
-    AnalysisStore, LoadedWorkspace, RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary,
-    RustAnalyzerSession, RustAnalyzerSessionBoundary, WorkspaceSummary,
-    run_rust_analyzer_lsp_session, rust_analyzer_lsp_boundary, rust_analyzer_private_boundary,
-    rust_analyzer_session_boundary,
+    LoadedWorkspace, RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary,
+    RustAnalyzerSession, RustAnalyzerSessionBoundary, WorkspaceSummary, run_rust_analyzer_lsp_session,
+    rust_analyzer_lsp_boundary, rust_analyzer_private_boundary, rust_analyzer_session_boundary,
+    WorkspaceStore,
 };
 "#,
     )?;
@@ -473,12 +473,9 @@ fn write_bridge_module(path: &Path) -> Result<(), Box<dyn Error>> {
 const BRIDGE_MODULE: &str = r#"
 use std::path::Path;
 
-use ide::{AnalysisHost, RootDatabase};
-use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_into_db};
-use proc_macro_api::ProcMacroClient;
 use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace};
 use serde::Serialize;
-use vfs::{AbsPathBuf, Vfs};
+use vfs::AbsPathBuf;
 
 pub use crate::main_loop::analyzed_session::RustAnalyzerSession;
 
@@ -546,14 +543,10 @@ pub struct WorkspaceSummary {
     pub root: String,
     pub manifest: String,
     pub packages: usize,
-    pub files: usize,
-    pub proc_macro_server: bool,
 }
 
 pub struct LoadedWorkspace {
     summary: WorkspaceSummary,
-    _vfs: Vfs,
-    _proc_macro_client: Option<ProcMacroClient>,
 }
 
 impl LoadedWorkspace {
@@ -562,24 +555,22 @@ impl LoadedWorkspace {
     }
 }
 
-pub struct AnalysisStore {
-    host: AnalysisHost,
+pub struct WorkspaceStore {
     loaded_workspaces: Vec<LoadedWorkspace>,
 }
 
-impl AnalysisStore {
+impl WorkspaceStore {
     pub fn new() -> Self {
         Self {
-            host: AnalysisHost::with_database(RootDatabase::new(None)),
             loaded_workspaces: Vec::new(),
         }
     }
 
-    pub fn load_cargo_workspace(
+    pub fn discover_cargo_workspace(
         &mut self,
         root: impl AsRef<Path>,
     ) -> anyhow::Result<&WorkspaceSummary> {
-        let loaded = load_cargo_workspace_into_host(&mut self.host, root)?;
+        let loaded = discover_cargo_workspace(root)?;
         self.loaded_workspaces.push(loaded);
 
         Ok(self
@@ -594,45 +585,29 @@ impl AnalysisStore {
     }
 }
 
-impl Default for AnalysisStore {
+impl Default for WorkspaceStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
-fn load_cargo_workspace_into_host(
-    host: &mut AnalysisHost,
+fn discover_cargo_workspace(
     root: impl AsRef<Path>,
 ) -> anyhow::Result<LoadedWorkspace> {
     let cargo_config = CargoConfig::default();
-    let load_config = LoadCargoConfig {
-        load_out_dirs_from_check: false,
-        with_proc_macro_server: ProcMacroServerChoice::Sysroot,
-        prefill_caches: false,
-        num_worker_threads: 1,
-        proc_macro_processes: 1,
-    };
     let root = AbsPathBuf::assert_utf8(std::fs::canonicalize(root)?);
     let manifest = ProjectManifest::discover_single(&root)?;
     let manifest_path = manifest.manifest_path().clone();
     let workspace = ProjectWorkspace::load(manifest, &cargo_config, &|_| {})?;
     let root = workspace.workspace_root().to_string();
     let packages = workspace.n_packages();
-    let db = host.raw_database_mut();
-    let (vfs, proc_macro_client) =
-        load_workspace_into_db(workspace, &cargo_config.extra_env, &load_config, db)?;
-    let files = vfs.iter().count();
 
     Ok(LoadedWorkspace {
         summary: WorkspaceSummary {
             root,
             manifest: manifest_path.to_string(),
             packages,
-            files,
-            proc_macro_server: proc_macro_client.is_some(),
         },
-        _vfs: vfs,
-        _proc_macro_client: proc_macro_client,
     })
 }
 "#;
@@ -698,7 +673,8 @@ pub(crate) mod analyzed_session {
         }
 
         initialize_rayon();
-        RustAnalyzerSession::run_connection(config, connection)
+        let Connection { sender, receiver } = connection;
+        RustAnalyzerSession::new(sender, config).run(receiver)
     }
 
     fn config_from_initialize_params(
