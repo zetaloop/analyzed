@@ -1,11 +1,12 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{BufReader, ErrorKind},
     os::unix::net::UnixStream,
     path::Path,
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -13,9 +14,9 @@ use std::{
 };
 
 use analyzed_ipc::{
-    BackendKey, ClientInfo, DaemonRequest, DaemonResponse, DaemonSnapshot, Hello, LspSession,
-    ProtocolError, RUST_ANALYZER_VERSION, RuntimePaths, StartupLock, Stop, WorkspaceSnapshot,
-    bind_listener, read_json_line, write_json_line,
+    BackendKey, BackendSnapshot, ClientInfo, DaemonRequest, DaemonResponse, DaemonSnapshot, Hello,
+    LspSession, ProtocolError, RUST_ANALYZER_VERSION, RuntimePaths, StartupLock, Stop,
+    WorkspaceSnapshot, bind_listener, read_json_line, write_json_line,
 };
 use analyzed_ra::WorkspaceStore;
 use crossbeam_channel::unbounded;
@@ -30,6 +31,7 @@ pub struct DaemonStatus {
     pid: Option<u32>,
     started_at_unix_seconds: Option<u64>,
     client_sessions: usize,
+    backend_sessions: Vec<BackendSnapshot>,
     workspaces: usize,
     paths: RuntimePaths,
     hello: Option<Hello>,
@@ -42,6 +44,7 @@ pub fn offline_status(paths: RuntimePaths) -> DaemonStatus {
         pid: None,
         started_at_unix_seconds: None,
         client_sessions: 0,
+        backend_sessions: Vec::new(),
         workspaces: 0,
         paths,
         hello: None,
@@ -67,6 +70,7 @@ pub fn online_status(paths: RuntimePaths, hello: Hello) -> DaemonStatus {
         pid: Some(snapshot.map_or(hello.pid, |state| state.pid)),
         started_at_unix_seconds: snapshot.map(|state| state.started_at_unix_seconds),
         client_sessions: snapshot.map_or(0, |state| state.client_sessions),
+        backend_sessions: snapshot.map_or_else(Vec::new, |state| state.backend_sessions.clone()),
         workspaces: snapshot.map_or(0, |state| state.workspaces),
         paths,
         hello: Some(hello),
@@ -168,11 +172,12 @@ pub fn run_foreground(
 
         match listener.accept() {
             Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
                 let state = Arc::clone(&state);
                 sessions.push(thread::spawn(move || {
                     state.client_sessions.fetch_add(1, Ordering::SeqCst);
                     let session_id = state.next_session_id.fetch_add(1, Ordering::SeqCst);
-                    let result = handle_client(stream, &state, session_id);
+                    let result = handle_client(stream, state.clone(), session_id);
                     state.client_sessions.fetch_sub(1, Ordering::SeqCst);
 
                     if let Err(error) = result {
@@ -222,6 +227,7 @@ impl DaemonRuntime {
                     .map_or(0, |duration| duration.as_secs()),
                 client_sessions: AtomicUsize::new(0),
                 next_session_id: AtomicUsize::new(1),
+                backends: Mutex::new(BackendRegistry::default()),
                 workspace_loads,
                 stopping: AtomicBool::new(false),
             }),
@@ -234,6 +240,7 @@ struct ServiceState {
     started_at_unix_seconds: u64,
     client_sessions: AtomicUsize,
     next_session_id: AtomicUsize,
+    backends: Mutex<BackendRegistry>,
     workspace_loads: Vec<WorkspaceSnapshot>,
     stopping: AtomicBool,
 }
@@ -241,11 +248,17 @@ struct ServiceState {
 impl ServiceState {
     fn snapshot(&self) -> DaemonSnapshot {
         let workspace_loads = self.workspace_loads.clone();
+        let backend_sessions = self
+            .backends
+            .lock()
+            .expect("backend registry mutex poisoned")
+            .snapshots();
 
         DaemonSnapshot {
             pid: self.pid,
             started_at_unix_seconds: self.started_at_unix_seconds,
             client_sessions: self.client_sessions.load(Ordering::SeqCst),
+            backend_sessions,
             workspaces: workspace_loads.len(),
             workspace_loads,
         }
@@ -261,11 +274,76 @@ impl ServiceState {
             socket_path: paths.socket_path.to_string_lossy().into_owned(),
         }
     }
+
+    fn register_backend_session(self: &Arc<Self>, key: BackendKey) -> BackendSession {
+        self.backends
+            .lock()
+            .expect("backend registry mutex poisoned")
+            .register(key.clone());
+
+        BackendSession {
+            state: Arc::clone(self),
+            key,
+        }
+    }
+
+    fn unregister_backend_session(&self, key: &BackendKey) {
+        self.backends
+            .lock()
+            .expect("backend registry mutex poisoned")
+            .unregister(key);
+    }
+}
+
+#[derive(Default)]
+struct BackendRegistry {
+    entries: BTreeMap<BackendKey, BackendEntry>,
+}
+
+impl BackendRegistry {
+    fn register(&mut self, key: BackendKey) {
+        self.entries.entry(key).or_default().client_sessions += 1;
+    }
+
+    fn unregister(&mut self, key: &BackendKey) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.client_sessions -= 1;
+            if entry.client_sessions == 0 {
+                self.entries.remove(key);
+            }
+        }
+    }
+
+    fn snapshots(&self) -> Vec<BackendSnapshot> {
+        self.entries
+            .iter()
+            .map(|(key, entry)| BackendSnapshot {
+                key: key.clone(),
+                client_sessions: entry.client_sessions,
+            })
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct BackendEntry {
+    client_sessions: usize,
+}
+
+struct BackendSession {
+    state: Arc<ServiceState>,
+    key: BackendKey,
+}
+
+impl Drop for BackendSession {
+    fn drop(&mut self) {
+        self.state.unregister_backend_session(&self.key);
+    }
 }
 
 fn handle_client(
     mut stream: UnixStream,
-    state: &ServiceState,
+    state: Arc<ServiceState>,
     session_id: usize,
 ) -> analyzed_ipc::Result<()> {
     let request: DaemonRequest = read_json_line(&mut stream)?;
@@ -326,13 +404,12 @@ impl LspStreamThreads {
 
 fn handle_lsp_session(
     stream: UnixStream,
-    _state: &ServiceState,
+    state: Arc<ServiceState>,
     _session_id: usize,
 ) -> anyhow::Result<()> {
     let (connection, threads, context) = lsp_stream_connection(stream)?;
-    let LspSessionContext {
-        backend_key: _backend_key,
-    } = context;
+    let LspSessionContext { backend_key } = context;
+    let _backend_session = state.register_backend_session(backend_key);
     let result = analyzed_ra::run_rust_analyzer_lsp_session(connection);
     let join_result = threads.join();
 

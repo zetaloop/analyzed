@@ -113,10 +113,16 @@ impl DaemonRequest {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct BackendKey {
     pub rust_analyzer_version: String,
     pub workspace_roots: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackendSnapshot {
+    pub key: BackendKey,
+    pub client_sessions: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,6 +137,7 @@ pub struct DaemonSnapshot {
     pub pid: u32,
     pub started_at_unix_seconds: u64,
     pub client_sessions: usize,
+    pub backend_sessions: Vec<BackendSnapshot>,
     pub workspaces: usize,
     pub workspace_loads: Vec<WorkspaceSnapshot>,
 }
