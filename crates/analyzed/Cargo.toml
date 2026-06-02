@@ -9,3 +9,6 @@ license.workspace = true
 analyzed-daemon.workspace = true
 analyzed-ipc.workspace = true
 analyzed-ra.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true

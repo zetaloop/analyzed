@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 analyzed-ipc.workspace = true
 analyzed-ra.workspace = true
+serde.workspace = true
