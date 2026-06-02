@@ -257,7 +257,8 @@ pub mod analyzed_bridge;
 pub use analyzed_bridge::{
     AnalysisStore, LoadedWorkspace, RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary,
     RustAnalyzerSession, RustAnalyzerSessionBoundary, WorkspaceSummary,
-    rust_analyzer_lsp_boundary, rust_analyzer_private_boundary, rust_analyzer_session_boundary,
+    run_rust_analyzer_lsp_session, rust_analyzer_lsp_boundary, rust_analyzer_private_boundary,
+    rust_analyzer_session_boundary,
 };
 "#,
     )?;
@@ -528,11 +529,16 @@ pub struct RustAnalyzerSessionBoundary {
 pub fn rust_analyzer_session_boundary() -> RustAnalyzerSessionBoundary {
     let _session_size = std::mem::size_of::<RustAnalyzerSession>();
     let _runner = RustAnalyzerSession::run_connection;
+    let _lsp_runner = run_rust_analyzer_lsp_session;
 
     RustAnalyzerSessionBoundary {
         session: std::any::type_name::<RustAnalyzerSession>(),
         runner: "ra_ap_rust_analyzer::main_loop::analyzed_session::RustAnalyzerSession::run_connection",
     }
+}
+
+pub fn run_rust_analyzer_lsp_session(connection: lsp_server::Connection) -> anyhow::Result<()> {
+    crate::main_loop::analyzed_session::run_lsp_session(connection)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -634,8 +640,17 @@ fn load_cargo_workspace_into_host(
 const MAIN_LOOP_SESSION_MODULE: &str = r#"
 
 pub(crate) mod analyzed_session {
+    use std::{env, path::PathBuf, sync::Once};
+
     use crossbeam_channel::{Receiver, Sender};
     use lsp_server::{Connection, Message};
+    use paths::Utf8PathBuf;
+    use vfs::AbsPathBuf;
+
+    use crate::{
+        config::{Config, ConfigChange, ConfigErrors},
+        from_json, server_capabilities, version,
+    };
 
     pub struct RustAnalyzerSession {
         state: crate::global_state::GlobalState,
@@ -657,6 +672,145 @@ pub(crate) mod analyzed_session {
             connection: Connection,
         ) -> anyhow::Result<()> {
             Self::new(connection.sender, config).run(connection.receiver)
+        }
+    }
+
+    pub(crate) fn run_lsp_session(connection: Connection) -> anyhow::Result<()> {
+        let (initialize_id, initialize_params) = connection.initialize_start()?;
+        tracing::info!("InitializeParams: {}", initialize_params);
+        let mut config = config_from_initialize_params(&connection, &initialize_params)?;
+        let initialize_result = lsp_types::InitializeResult {
+            capabilities: server_capabilities(&config),
+            server_info: Some(lsp_types::ServerInfo {
+                name: String::from("rust-analyzer"),
+                version: Some(version().to_string()),
+            }),
+            offset_encoding: None,
+        };
+
+        connection.initialize_finish(initialize_id, serde_json::to_value(initialize_result)?)?;
+
+        if config.discover_workspace_config().is_none()
+            && !config.has_linked_projects()
+            && config.detached_files().is_empty()
+        {
+            config.rediscover_workspaces();
+        }
+
+        initialize_rayon();
+        RustAnalyzerSession::run_connection(config, connection)
+    }
+
+    fn config_from_initialize_params(
+        connection: &Connection,
+        initialize_params: &serde_json::Value,
+    ) -> anyhow::Result<Config> {
+        let lsp_types::InitializeParams {
+            root_uri,
+            mut capabilities,
+            workspace_folders,
+            initialization_options,
+            client_info,
+            ..
+        } = from_json::<lsp_types::InitializeParams>("InitializeParams", initialize_params)?;
+
+        if let Some(value) = initialize_params.pointer("/capabilities/workspace/diagnostics")
+            && let Ok(diagnostics) =
+                from_json::<lsp_types::DiagnosticWorkspaceClientCapabilities>(
+                    "DiagnosticWorkspaceClientCapabilities",
+                    value,
+                )
+        {
+            capabilities.workspace.get_or_insert_default().diagnostic.get_or_insert(diagnostics);
+        }
+
+        let root_path = match root_uri
+            .and_then(|it| it.to_file_path().ok())
+            .map(patch_path_prefix)
+            .and_then(|it| Utf8PathBuf::from_path_buf(it).ok())
+            .and_then(|it| AbsPathBuf::try_from(it).ok())
+        {
+            Some(it) => it,
+            None => AbsPathBuf::assert_utf8(env::current_dir()?),
+        };
+
+        if let Some(client_info) = &client_info {
+            tracing::info!(
+                "Client '{}' {}",
+                client_info.name,
+                client_info.version.as_deref().unwrap_or_default()
+            );
+        }
+
+        let workspace_roots = workspace_folders
+            .map(|workspaces| {
+                workspaces
+                    .into_iter()
+                    .filter_map(|it| it.uri.to_file_path().ok())
+                    .map(patch_path_prefix)
+                    .filter_map(|it| Utf8PathBuf::from_path_buf(it).ok())
+                    .filter_map(|it| AbsPathBuf::try_from(it).ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|workspaces| !workspaces.is_empty())
+            .unwrap_or_else(|| vec![root_path.clone()]);
+        let mut config = Config::new(root_path, capabilities, workspace_roots, client_info);
+
+        if let Some(json) = initialization_options {
+            let mut change = ConfigChange::default();
+            change.change_client_config(json);
+
+            let errors: ConfigErrors;
+            (config, errors, _) = config.apply_change(change);
+
+            if !errors.is_empty() {
+                let notification = lsp_server::Notification::new(
+                    <lsp_types::notification::ShowMessage as lsp_types::notification::Notification>::METHOD.to_owned(),
+                    lsp_types::ShowMessageParams {
+                        typ: lsp_types::MessageType::WARNING,
+                        message: errors.to_string(),
+                    },
+                );
+                connection.sender.send(lsp_server::Message::Notification(notification))?;
+            }
+        }
+
+        Ok(config)
+    }
+
+    fn initialize_rayon() {
+        static RAYON: Once = Once::new();
+
+        RAYON.call_once(|| {
+            _ = rayon::ThreadPoolBuilder::new()
+                .thread_name(|index| format!("RayonWorker{index}"))
+                .build_global();
+        });
+    }
+
+    fn patch_path_prefix(path: PathBuf) -> PathBuf {
+        use std::path::{Component, Prefix};
+
+        if cfg!(windows) {
+            let mut components = path.components();
+            match components.next() {
+                Some(Component::Prefix(prefix)) => {
+                    let prefix = match prefix.kind() {
+                        Prefix::Disk(disk) => format!("{}:", disk.to_ascii_uppercase() as char),
+                        Prefix::VerbatimDisk(disk) => {
+                            format!(r"\\?\{}:", disk.to_ascii_uppercase() as char)
+                        }
+                        _ => return path,
+                    };
+                    let mut path = PathBuf::new();
+                    path.push(prefix);
+                    path.extend(components);
+                    path
+                }
+                _ => path,
+            }
+        } else {
+            path
         }
     }
 }

@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::ErrorKind,
+    io::{BufReader, ErrorKind},
     os::unix::net::UnixStream,
     path::Path,
     process::{Command, Stdio},
@@ -13,12 +13,14 @@ use std::{
 };
 
 use analyzed_ipc::{
-    ClientInfo, DaemonRequest, DaemonResponse, DaemonSnapshot, Hello, ProtocolError,
+    ClientInfo, DaemonRequest, DaemonResponse, DaemonSnapshot, Hello, LspSession, ProtocolError,
     RUST_ANALYZER_VERSION, RuntimePaths, StartupLock, Stop, WorkspaceSnapshot, bind_listener,
     read_json_line, write_json_line,
 };
 use analyzed_ra::AnalysisStore;
+use crossbeam_channel::unbounded;
 use daemonize::Daemonize;
+use lsp_server::{Connection, Message};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -73,6 +75,14 @@ pub fn online_status(paths: RuntimePaths, hello: Hello) -> DaemonStatus {
 
 pub fn stop(paths: RuntimePaths) -> analyzed_ipc::Result<Stop> {
     analyzed_ipc::request_stop(&paths)
+}
+
+pub fn connect_lsp_session(
+    paths: RuntimePaths,
+    workspace_root: impl AsRef<Path>,
+) -> anyhow::Result<UnixStream> {
+    ensure_daemon(paths.clone(), workspace_root)?;
+    Ok(analyzed_ipc::connect_lsp_session(&paths)?)
 }
 
 pub fn ensure_daemon(
@@ -255,27 +265,104 @@ impl ServiceState {
 
 fn handle_client(mut stream: UnixStream, state: &ServiceState) -> analyzed_ipc::Result<()> {
     let request: DaemonRequest = read_json_line(&mut stream)?;
-    let response = handle_request(request, state);
-    write_json_line(&mut stream, &response)?;
+    if let Some(error) = validate_client(request.client_info()) {
+        write_json_line(&mut stream, &DaemonResponse::Error(error))?;
+        return Ok(());
+    }
+
+    match request {
+        DaemonRequest::Hello(_) => {
+            write_json_line(
+                &mut stream,
+                &DaemonResponse::Hello(Hello::with_state(state.snapshot())),
+            )?;
+        }
+        DaemonRequest::Lsp(_) => {
+            write_json_line(
+                &mut stream,
+                &DaemonResponse::Lsp(LspSession {
+                    accepted: true,
+                    pid: state.pid,
+                }),
+            )?;
+            handle_lsp_session(stream).map_err(|error| {
+                analyzed_ipc::IpcError::Protocol(format!("lsp session failed: {error}"))
+            })?;
+        }
+        DaemonRequest::Stop(_) => {
+            state.stopping.store(true, Ordering::SeqCst);
+            write_json_line(
+                &mut stream,
+                &DaemonResponse::Stop(Stop {
+                    accepted: true,
+                    pid: state.pid,
+                }),
+            )?;
+        }
+    }
 
     Ok(())
 }
 
-fn handle_request(request: DaemonRequest, state: &ServiceState) -> DaemonResponse {
-    if let Some(error) = validate_client(request.client_info()) {
-        return DaemonResponse::Error(error);
-    }
+struct LspStreamThreads {
+    reader: JoinHandle<anyhow::Result<()>>,
+    writer: JoinHandle<anyhow::Result<()>>,
+}
 
-    match request {
-        DaemonRequest::Hello(_) => DaemonResponse::Hello(Hello::with_state(state.snapshot())),
-        DaemonRequest::Stop(_) => {
-            state.stopping.store(true, Ordering::SeqCst);
-            DaemonResponse::Stop(Stop {
-                accepted: true,
-                pid: state.pid,
-            })
+impl LspStreamThreads {
+    fn join(self) -> anyhow::Result<()> {
+        match (self.reader.join(), self.writer.join()) {
+            (Ok(Ok(())), Ok(Ok(()))) => Ok(()),
+            (Ok(Err(reader)), Ok(Err(writer))) => anyhow::bail!("{reader}\n{writer}"),
+            (Ok(Err(error)), _) | (_, Ok(Err(error))) => Err(error),
+            (Err(_), _) | (_, Err(_)) => anyhow::bail!("lsp stream thread panicked"),
         }
     }
+}
+
+fn handle_lsp_session(stream: UnixStream) -> anyhow::Result<()> {
+    let (connection, threads) = lsp_stream_connection(stream)?;
+    let result = analyzed_ra::run_rust_analyzer_lsp_session(connection);
+    let join_result = threads.join();
+
+    match (result, join_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(session), Err(threads)) => anyhow::bail!("{session}\n{threads}"),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+fn lsp_stream_connection(stream: UnixStream) -> anyhow::Result<(Connection, LspStreamThreads)> {
+    let reader_stream = stream.try_clone()?;
+    let (writer_sender, writer_receiver) = unbounded::<Message>();
+    let (reader_sender, reader_receiver) = unbounded::<Message>();
+
+    let reader = thread::spawn(move || {
+        let mut reader = BufReader::new(reader_stream);
+        while let Some(message) = Message::read(&mut reader)? {
+            if reader_sender.send(message).is_err() {
+                break;
+            }
+        }
+
+        Ok(())
+    });
+    let writer = thread::spawn(move || {
+        let mut writer = stream;
+        for message in writer_receiver {
+            message.write(&mut writer)?;
+        }
+
+        Ok(())
+    });
+
+    Ok((
+        Connection {
+            sender: writer_sender,
+            receiver: reader_receiver,
+        },
+        LspStreamThreads { reader, writer },
+    ))
 }
 
 fn validate_client(client: &ClientInfo) -> Option<ProtocolError> {

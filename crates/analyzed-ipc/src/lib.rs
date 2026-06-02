@@ -89,6 +89,7 @@ impl ClientInfo {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum DaemonRequest {
     Hello(ClientInfo),
+    Lsp(ClientInfo),
     Stop(ClientInfo),
 }
 
@@ -101,9 +102,13 @@ impl DaemonRequest {
         Self::Stop(ClientInfo::current())
     }
 
+    pub fn lsp() -> Self {
+        Self::Lsp(ClientInfo::current())
+    }
+
     pub fn client_info(&self) -> &ClientInfo {
         match self {
-            Self::Hello(client) | Self::Stop(client) => client,
+            Self::Hello(client) | Self::Lsp(client) | Self::Stop(client) => client,
         }
     }
 }
@@ -166,6 +171,12 @@ pub struct Stop {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LspSession {
+    pub accepted: bool,
+    pub pid: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProtocolError {
     pub message: String,
 }
@@ -174,6 +185,7 @@ pub struct ProtocolError {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum DaemonResponse {
     Hello(Hello),
+    Lsp(LspSession),
     Stop(Stop),
     Error(ProtocolError),
 }
@@ -210,6 +222,23 @@ pub fn connect_hello(paths: &RuntimePaths) -> Result<Hello> {
 pub fn request_stop(paths: &RuntimePaths) -> Result<Stop> {
     match request(paths, &DaemonRequest::stop())? {
         DaemonResponse::Stop(stop) => Ok(stop),
+        DaemonResponse::Error(error) => Err(IpcError::Protocol(error.message)),
+        response => Err(IpcError::Protocol(format!(
+            "unexpected daemon response: {response:?}"
+        ))),
+    }
+}
+
+pub fn connect_lsp_session(paths: &RuntimePaths) -> Result<UnixStream> {
+    let mut stream = UnixStream::connect(&paths.socket_path)?;
+    write_json_line(&mut stream, &DaemonRequest::lsp())?;
+
+    match read_json_line(&mut stream)? {
+        DaemonResponse::Lsp(session) if session.accepted => Ok(stream),
+        DaemonResponse::Lsp(session) => Err(IpcError::Protocol(format!(
+            "daemon rejected lsp session for pid {}",
+            session.pid
+        ))),
         DaemonResponse::Error(error) => Err(IpcError::Protocol(error.message)),
         response => Err(IpcError::Protocol(format!(
             "unexpected daemon response: {response:?}"

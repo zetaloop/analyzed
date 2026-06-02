@@ -32,8 +32,6 @@ dependencies = [
  "analyzed-ra",
  "anyhow",
  "clap",
- "lsp-server",
- "lsp-types",
  "serde_json",
 ]
 
@@ -44,7 +42,9 @@ dependencies = [
  "analyzed-ipc",
  "analyzed-ra",
  "anyhow",
+ "crossbeam-channel",
  "daemonize",
+ "lsp-server",
  "serde",
  "serde_json",
 ]
