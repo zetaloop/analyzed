@@ -24,6 +24,8 @@ enum Command {
         workspace: PathBuf,
         #[arg(long, hide = true)]
         startup_lock_owned: bool,
+        #[arg(long, hide = true)]
+        daemonize: bool,
     },
     Status,
     Stop,
@@ -38,8 +40,9 @@ fn main() -> anyhow::Result<()> {
             foreground,
             workspace,
             startup_lock_owned,
+            daemonize,
         }) => {
-            run_daemon(foreground, workspace, startup_lock_owned)?;
+            run_daemon(foreground, workspace, startup_lock_owned, daemonize)?;
         }
         Some(Command::Stop) => {
             println!(
@@ -110,11 +113,12 @@ fn run_daemon(
     foreground: bool,
     workspace: PathBuf,
     startup_lock_owned: bool,
+    daemonize: bool,
 ) -> anyhow::Result<()> {
     let paths = RuntimePaths::discover()?;
 
     if foreground {
-        analyzed_daemon::run_foreground(paths, workspace, startup_lock_owned)?;
+        analyzed_daemon::run_foreground(paths, workspace, startup_lock_owned, daemonize)?;
     } else {
         println!(
             "{}",

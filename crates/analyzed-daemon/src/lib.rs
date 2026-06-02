@@ -18,6 +18,7 @@ use analyzed_ipc::{
     read_json_line, write_json_line,
 };
 use analyzed_ra::AnalysisStore;
+use daemonize::Daemonize;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -88,24 +89,32 @@ pub fn ensure_daemon(
         return Ok(hello);
     }
 
-    let mut child = Command::new(env::current_exe()?)
+    let mut command = Command::new(env::current_exe()?);
+    command
         .arg("daemon")
         .arg("--foreground")
         .arg("--workspace")
         .arg(workspace_root.as_ref())
         .arg("--startup-lock-owned")
+        .arg("--daemonize")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+
+    let mut child = command.spawn()?;
+    let mut child_exited = false;
 
     for _ in 0..50 {
         if let Ok(hello) = analyzed_ipc::connect_hello(&paths) {
             return Ok(hello);
         }
 
-        if let Some(status) = child.try_wait()? {
-            anyhow::bail!("daemon exited before accepting connections: {status}");
+        if !child_exited && let Some(status) = child.try_wait()? {
+            if !status.success() {
+                anyhow::bail!("daemon exited before accepting connections: {status}");
+            }
+
+            child_exited = true;
         }
 
         thread::sleep(Duration::from_millis(100));
@@ -118,9 +127,17 @@ pub fn run_foreground(
     paths: RuntimePaths,
     workspace_root: impl AsRef<Path>,
     startup_lock_owned: bool,
+    daemonize: bool,
 ) -> anyhow::Result<()> {
-    let workspace_root = workspace_root.as_ref();
-    let runtime = DaemonRuntime::load(&[workspace_root])?;
+    let workspace_root = fs::canonicalize(workspace_root)?;
+
+    if daemonize {
+        Daemonize::new()
+            .working_directory(env::current_dir()?)
+            .start()?;
+    }
+
+    let runtime = DaemonRuntime::load(&[&workspace_root])?;
     let state = Arc::clone(&runtime.state);
     let listener = {
         let _lock = (!startup_lock_owned)
