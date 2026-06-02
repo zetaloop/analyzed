@@ -31,6 +31,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     rewrite_lib_header(&generated_src.join("lib.rs"))?;
     write_bridge_module(&generated_src.join("analyzed_bridge.rs"))?;
+    append_main_loop_session_module(&generated_src.join("main_loop.rs"))?;
     append_bridge_export(&generated_src.join("lib.rs"))?;
 
     println!("cargo:rerun-if-changed=build.rs");
@@ -255,11 +256,18 @@ fn append_bridge_export(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 pub mod analyzed_bridge;
 pub use analyzed_bridge::{
     AnalysisStore, LoadedWorkspace, RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary,
-    WorkspaceSummary, rust_analyzer_lsp_boundary, rust_analyzer_private_boundary,
+    RustAnalyzerSession, RustAnalyzerSessionBoundary, WorkspaceSummary,
+    rust_analyzer_lsp_boundary, rust_analyzer_private_boundary, rust_analyzer_session_boundary,
 };
 "#,
     )?;
 
+    Ok(())
+}
+
+fn append_main_loop_session_module(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut file = fs::OpenOptions::new().append(true).open(main_loop_rs)?;
+    file.write_all(MAIN_LOOP_SESSION_MODULE.as_bytes())?;
     Ok(())
 }
 
@@ -471,6 +479,8 @@ use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace};
 use serde::Serialize;
 use vfs::{AbsPathBuf, Vfs};
 
+pub use crate::main_loop::analyzed_session::RustAnalyzerSession;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RustAnalyzerLspBoundary {
     pub main_loop: &'static str,
@@ -506,6 +516,22 @@ pub fn rust_analyzer_private_boundary() -> RustAnalyzerPrivateBoundary {
         notification_dispatcher: std::any::type_name::<
             crate::handlers::dispatch::NotificationDispatcher<'_>,
         >(),
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RustAnalyzerSessionBoundary {
+    pub session: &'static str,
+    pub runner: &'static str,
+}
+
+pub fn rust_analyzer_session_boundary() -> RustAnalyzerSessionBoundary {
+    let _session_size = std::mem::size_of::<RustAnalyzerSession>();
+    let _runner = RustAnalyzerSession::run_connection;
+
+    RustAnalyzerSessionBoundary {
+        session: std::any::type_name::<RustAnalyzerSession>(),
+        runner: "ra_ap_rust_analyzer::main_loop::analyzed_session::RustAnalyzerSession::run_connection",
     }
 }
 
@@ -602,5 +628,36 @@ fn load_cargo_workspace_into_host(
         _vfs: vfs,
         _proc_macro_client: proc_macro_client,
     })
+}
+"#;
+
+const MAIN_LOOP_SESSION_MODULE: &str = r#"
+
+pub(crate) mod analyzed_session {
+    use crossbeam_channel::{Receiver, Sender};
+    use lsp_server::{Connection, Message};
+
+    pub struct RustAnalyzerSession {
+        state: crate::global_state::GlobalState,
+    }
+
+    impl RustAnalyzerSession {
+        pub fn new(sender: Sender<Message>, config: crate::config::Config) -> Self {
+            Self {
+                state: crate::global_state::GlobalState::new(sender, config),
+            }
+        }
+
+        pub fn run(self, receiver: Receiver<Message>) -> anyhow::Result<()> {
+            self.state.run(receiver)
+        }
+
+        pub fn run_connection(
+            config: crate::config::Config,
+            connection: Connection,
+        ) -> anyhow::Result<()> {
+            Self::new(connection.sender, config).run(connection.receiver)
+        }
+    }
 }
 "#;
