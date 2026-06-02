@@ -24,13 +24,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Status) => print_status()?,
         Some(Command::Daemon { foreground }) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&analyzed_daemon::pending_daemon_status(
-                    RuntimePaths::discover(),
-                    foreground,
-                ))?
-            );
+            run_daemon(foreground)?;
         }
         Some(Command::Stop) => {
             println!(
@@ -51,6 +45,21 @@ fn print_status() -> anyhow::Result<()> {
         "{}",
         serde_json::to_string_pretty(&analyzed_daemon::status(RuntimePaths::discover()))?
     );
+
+    Ok(())
+}
+
+fn run_daemon(foreground: bool) -> anyhow::Result<()> {
+    let paths = RuntimePaths::discover();
+
+    if foreground {
+        analyzed_daemon::run_foreground(paths)?;
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&analyzed_daemon::pending_daemon_status(paths, false))?
+        );
+    }
 
     Ok(())
 }

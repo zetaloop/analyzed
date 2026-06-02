@@ -21,6 +21,7 @@ dependencies = [
  "analyzed-ipc",
  "analyzed-ra",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

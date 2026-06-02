@@ -83,6 +83,14 @@ impl HelloRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DaemonSnapshot {
+    pub pid: u32,
+    pub started_at_unix_seconds: u64,
+    pub client_sessions: usize,
+    pub workspaces: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HelloResponse {
     pub ok: bool,
     pub pid: u32,
@@ -90,6 +98,7 @@ pub struct HelloResponse {
     pub daemon_version: String,
     pub rust_analyzer_version: String,
     pub capabilities: Vec<String>,
+    pub state: Option<DaemonSnapshot>,
 }
 
 impl HelloResponse {
@@ -101,6 +110,15 @@ impl HelloResponse {
             daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
             rust_analyzer_version: RUST_ANALYZER_VERSION.to_owned(),
             capabilities: vec!["lsp".to_owned(), "native_query".to_owned()],
+            state: None,
+        }
+    }
+
+    pub fn with_state(state: DaemonSnapshot) -> Self {
+        Self {
+            pid: state.pid,
+            state: Some(state),
+            ..Self::current(0)
         }
     }
 }
