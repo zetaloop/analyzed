@@ -614,11 +614,26 @@ impl SessionOverlay {
     }
 
     pub fn push_file(&mut self, file: SessionOverlayFile) {
-        self.files.push(file);
+        if !self.files.iter().any(|it| it.base_file == file.base_file) {
+            self.files.push(file);
+        }
     }
 
     pub fn push_crate(&mut self, krate: SessionOverlayCrate) {
-        self.crates.push(krate);
+        if !self.crates.iter().any(|it| it.base_crate == krate.base_crate) {
+            self.crates.push(krate);
+        }
+    }
+
+    pub fn materialize_files(&mut self, first_file_id: FileId) {
+        let mut next_file_id = first_file_id.index();
+
+        for file in &mut self.files {
+            if file.session_file.is_none() {
+                file.session_file = Some(FileId::from_raw(next_file_id));
+                next_file_id += 1;
+            }
+        }
     }
 }
 
@@ -792,18 +807,47 @@ impl SharedWorld {
     }
 
     pub fn workspace_file(&self, path: impl AsRef<Path>) -> anyhow::Result<(FileId, VfsPath)> {
-        let path = std::fs::canonicalize(path)?;
-        let path = path.to_string_lossy();
+        self.workspace_file_in(0..self.loaded_workspaces.len(), path)
+    }
 
-        for workspace in &self.loaded_workspaces {
+    fn workspace_file_in(
+        &self,
+        workspaces: impl IntoIterator<Item = usize>,
+        path: impl AsRef<Path>,
+    ) -> anyhow::Result<(FileId, VfsPath)> {
+        let path = VfsPath::from(AbsPathBuf::assert_utf8(std::fs::canonicalize(path)?));
+
+        for workspace in workspaces {
+            let Some(workspace) = self.loaded_workspaces.get(workspace) else {
+                continue;
+            };
             for (file_id, vfs_path) in workspace._vfs.iter() {
-                if vfs_path.to_string() == path {
+                if *vfs_path == path {
                     return Ok((file_id, vfs_path.clone()));
                 }
             }
         }
 
         anyhow::bail!("workspace file is not loaded: {path}")
+    }
+
+    pub fn crate_root_file(&self, krate: ide::Crate) -> anyhow::Result<(FileId, VfsPath)> {
+        let db = self.host.raw_database();
+        let file_id = krate.data(db).root_file_id;
+        let path = path_for_file(db, file_id)?;
+
+        Ok((file_id, VfsPath::new_real_path(path)))
+    }
+
+    pub fn next_session_file_id(&self) -> FileId {
+        let next = self
+            .loaded_workspaces
+            .iter()
+            .flat_map(|workspace| workspace._vfs.iter().map(|(file_id, _)| file_id.index()))
+            .max()
+            .map_or(0, |index| index + 1);
+
+        FileId::from_raw(next)
     }
 
     pub fn package_instances(&self) -> impl Iterator<Item = &PackageInstance> {
@@ -888,22 +932,34 @@ impl WorkspaceView {
             .filter_map(|index| world.workspace_summary(*index))
     }
 
+    pub fn workspace_file(
+        &self,
+        world: &SharedWorld,
+        path: impl AsRef<Path>,
+    ) -> anyhow::Result<(FileId, VfsPath)> {
+        world.workspace_file_in(self.workspaces.iter().copied(), path)
+    }
+
     pub fn overlay_cone(
         &self,
         world: &SharedWorld,
         path: impl AsRef<Path>,
     ) -> anyhow::Result<SessionOverlay> {
-        let (base_file, vfs_path) = world.workspace_file(path)?;
+        let (base_file, vfs_path) = self.workspace_file(world, path)?;
         let mut overlay = SessionOverlay::new();
         overlay.push_file(SessionOverlayFile::pending(base_file, vfs_path));
 
         for krate in world.crates_for_file(base_file)? {
             overlay.push_crate(SessionOverlayCrate::pending(krate));
+            let (root_file, root_path) = world.crate_root_file(krate)?;
+            overlay.push_file(SessionOverlayFile::pending(root_file, root_path));
 
             for dependency in world.shared_dependencies(krate)? {
                 overlay.push_crate(SessionOverlayCrate::shared(dependency));
             }
         }
+
+        overlay.materialize_files(world.next_session_file_id());
 
         Ok(overlay)
     }
