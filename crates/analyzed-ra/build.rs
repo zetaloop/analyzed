@@ -255,10 +255,11 @@ fn append_bridge_export(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 
 pub mod analyzed_bridge;
 pub use analyzed_bridge::{
-    BackendCore, LoadedWorkspace, RustAnalyzerLspBoundary,
-    RustAnalyzerPrivateBoundary, RustAnalyzerSession, RustAnalyzerSessionBoundary, WorkspaceSummary,
-    run_rust_analyzer_lsp_session, rust_analyzer_lsp_boundary, rust_analyzer_private_boundary,
-    rust_analyzer_session_boundary,
+    BackendCore, LoadedWorkspace, PackageInstance, PackageInstanceKey, RustAnalyzerLspBoundary,
+    RustAnalyzerPrivateBoundary, RustAnalyzerSession, RustAnalyzerSessionBoundary,
+    SessionOverlay, SessionOverlayCrate, SessionOverlayFile, SharedWorld, WorkspaceSummary,
+    WorkspaceView, run_rust_analyzer_lsp_session, rust_analyzer_lsp_boundary,
+    rust_analyzer_private_boundary, rust_analyzer_session_boundary,
 };
 "#,
     )?;
@@ -471,14 +472,15 @@ fn write_bridge_module(path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 const BRIDGE_MODULE: &str = r#"
-use std::path::Path;
+use std::{collections::{BTreeMap, btree_map::Entry}, path::Path};
 
-use ide::{AnalysisHost, RootDatabase};
+use ide::{AnalysisHost, FileId, RootDatabase};
+use ide_db::base_db::{SourceDatabase, all_crates};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_into_db};
 use proc_macro_api::ProcMacroClient;
 use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace};
 use serde::Serialize;
-use vfs::{AbsPathBuf, Vfs};
+use vfs::{AbsPathBuf, Vfs, VfsPath};
 
 pub use crate::main_loop::analyzed_session::RustAnalyzerSession;
 
@@ -550,6 +552,128 @@ pub struct WorkspaceSummary {
     pub proc_macro_server: bool,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct PackageInstanceKey {
+    pub root_file: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PackageInstance {
+    key: PackageInstanceKey,
+    crates: Vec<ide::Crate>,
+}
+
+impl PackageInstance {
+    fn new(key: PackageInstanceKey) -> Self {
+        Self {
+            key,
+            crates: Vec::new(),
+        }
+    }
+
+    fn push_crate(&mut self, krate: ide::Crate) {
+        if !self.crates.contains(&krate) {
+            self.crates.push(krate);
+        }
+    }
+
+    pub fn key(&self) -> &PackageInstanceKey {
+        &self.key
+    }
+
+    pub fn crates(&self) -> &[ide::Crate] {
+        &self.crates
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SessionOverlay {
+    files: Vec<SessionOverlayFile>,
+    crates: Vec<SessionOverlayCrate>,
+}
+
+impl SessionOverlay {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn files(&self) -> &[SessionOverlayFile] {
+        &self.files
+    }
+
+    pub fn crates(&self) -> &[SessionOverlayCrate] {
+        &self.crates
+    }
+
+    pub fn push_file(&mut self, file: SessionOverlayFile) {
+        self.files.push(file);
+    }
+
+    pub fn push_crate(&mut self, krate: SessionOverlayCrate) {
+        self.crates.push(krate);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionOverlayFile {
+    base_file: FileId,
+    session_file: FileId,
+    path: VfsPath,
+}
+
+impl SessionOverlayFile {
+    pub fn new(base_file: FileId, session_file: FileId, path: VfsPath) -> Self {
+        Self {
+            base_file,
+            session_file,
+            path,
+        }
+    }
+
+    pub fn base_file(&self) -> FileId {
+        self.base_file
+    }
+
+    pub fn session_file(&self) -> FileId {
+        self.session_file
+    }
+
+    pub fn path(&self) -> &VfsPath {
+        &self.path
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SessionOverlayCrate {
+    base_crate: ide::Crate,
+    session_crate: ide::Crate,
+}
+
+impl SessionOverlayCrate {
+    pub fn new(base_crate: ide::Crate, session_crate: ide::Crate) -> Self {
+        Self {
+            base_crate,
+            session_crate,
+        }
+    }
+
+    pub fn shared(krate: ide::Crate) -> Self {
+        Self::new(krate, krate)
+    }
+
+    pub fn base_crate(&self) -> ide::Crate {
+        self.base_crate
+    }
+
+    pub fn session_crate(&self) -> ide::Crate {
+        self.session_crate
+    }
+
+    pub fn is_shared(&self) -> bool {
+        self.base_crate == self.session_crate
+    }
+}
+
 pub struct LoadedWorkspace {
     summary: WorkspaceSummary,
     _vfs: Vfs,
@@ -563,15 +687,15 @@ impl LoadedWorkspace {
 }
 
 pub struct BackendCore {
-    _host: AnalysisHost,
-    loaded_workspaces: Vec<LoadedWorkspace>,
+    world: SharedWorld,
+    view: WorkspaceView,
 }
 
 impl BackendCore {
     pub fn new() -> Self {
         Self {
-            _host: AnalysisHost::with_database(RootDatabase::new(None)),
-            loaded_workspaces: Vec::new(),
+            world: SharedWorld::new(),
+            view: WorkspaceView::new(Vec::new()),
         }
     }
 
@@ -581,10 +705,12 @@ impl BackendCore {
         P: AsRef<Path>,
     {
         let mut core = Self::new();
+        let mut workspaces = Vec::new();
 
         for root in roots {
-            core.load_cargo_workspace(root)?;
+            workspaces.push(core.world.load_cargo_workspace(root)?);
         }
+        core.view = WorkspaceView::new(workspaces);
 
         Ok(core)
     }
@@ -593,18 +719,114 @@ impl BackendCore {
         &mut self,
         root: impl AsRef<Path>,
     ) -> anyhow::Result<&WorkspaceSummary> {
-        let loaded = load_cargo_workspace_into_host(&mut self._host, root)?;
-        self.loaded_workspaces.push(loaded);
+        let index = self.world.load_cargo_workspace(root)?;
+        self.view.push_workspace(index);
 
-        Ok(self
-            .loaded_workspaces
-            .last()
-            .expect("workspace was just inserted")
-            .summary())
+        self.world
+            .workspace_summary(index)
+            .ok_or_else(|| anyhow::format_err!("loaded workspace index is unavailable"))
     }
 
     pub fn workspace_summaries(&self) -> impl Iterator<Item = &WorkspaceSummary> {
-        self.loaded_workspaces.iter().map(LoadedWorkspace::summary)
+        self.view.workspace_summaries(&self.world)
+    }
+}
+
+pub struct SharedWorld {
+    host: AnalysisHost,
+    loaded_workspaces: Vec<LoadedWorkspace>,
+    package_instances: BTreeMap<PackageInstanceKey, PackageInstance>,
+}
+
+impl SharedWorld {
+    pub fn new() -> Self {
+        Self {
+            host: AnalysisHost::with_database(RootDatabase::new(None)),
+            loaded_workspaces: Vec::new(),
+            package_instances: BTreeMap::new(),
+        }
+    }
+
+    pub fn load_cargo_workspace(&mut self, root: impl AsRef<Path>) -> anyhow::Result<usize> {
+        let loaded = load_cargo_workspace_into_host(&mut self.host, root)?;
+        let index = self.loaded_workspaces.len();
+        self.loaded_workspaces.push(loaded);
+        self.refresh_package_instances()?;
+
+        Ok(index)
+    }
+
+    pub fn workspace_summary(&self, index: usize) -> Option<&WorkspaceSummary> {
+        self.loaded_workspaces.get(index).map(LoadedWorkspace::summary)
+    }
+
+    pub fn workspace_file(&self, path: impl AsRef<Path>) -> anyhow::Result<(FileId, VfsPath)> {
+        let path = std::fs::canonicalize(path)?;
+        let path = path.to_string_lossy();
+
+        for workspace in &self.loaded_workspaces {
+            for (file_id, vfs_path) in workspace._vfs.iter() {
+                if vfs_path.to_string() == path {
+                    return Ok((file_id, vfs_path.clone()));
+                }
+            }
+        }
+
+        anyhow::bail!("workspace file is not loaded: {path}")
+    }
+
+    pub fn package_instances(&self) -> impl Iterator<Item = &PackageInstance> {
+        self.package_instances.values()
+    }
+
+    fn refresh_package_instances(&mut self) -> anyhow::Result<()> {
+        let db = self.host.raw_database();
+
+        for krate in all_crates(db).iter().copied() {
+            let key = PackageInstanceKey {
+                root_file: path_for_file(db, krate.data(db).root_file_id)?,
+            };
+            match self.package_instances.entry(key.clone()) {
+                Entry::Occupied(mut entry) => entry.get_mut().push_crate(krate),
+                Entry::Vacant(entry) => {
+                    let mut package = PackageInstance::new(key);
+                    package.push_crate(krate);
+                    entry.insert(package);
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for SharedWorld {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceView {
+    workspaces: Vec<usize>,
+}
+
+impl WorkspaceView {
+    pub fn new(workspaces: Vec<usize>) -> Self {
+        Self { workspaces }
+    }
+
+    pub fn push_workspace(&mut self, workspace: usize) {
+        self.workspaces.push(workspace);
+    }
+
+    pub fn workspace_summaries<'a>(
+        &'a self,
+        world: &'a SharedWorld,
+    ) -> impl Iterator<Item = &'a WorkspaceSummary> {
+        self.workspaces
+            .iter()
+            .filter_map(|index| world.workspace_summary(*index))
     }
 }
 
@@ -649,6 +871,15 @@ fn load_cargo_workspace_into_host(
         _vfs: vfs,
         _proc_macro_client: proc_macro_client,
     })
+}
+
+fn path_for_file(db: &RootDatabase, file_id: FileId) -> anyhow::Result<String> {
+    let root = db.file_source_root(file_id).source_root_id(db);
+    db.source_root(root)
+        .source_root(db)
+        .path_for_file(&file_id)
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow::format_err!("file path is unavailable for {file_id:?}"))
 }
 "#;
 
