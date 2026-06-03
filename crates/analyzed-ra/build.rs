@@ -826,6 +826,7 @@ impl BackendCore {
 pub struct SharedWorld {
     host: AnalysisHost,
     loaded_workspaces: Vec<LoadedWorkspace>,
+    workspace_indexes: BTreeMap<String, usize>,
     package_instances: BTreeMap<PackageInstanceKey, PackageInstance>,
 }
 
@@ -834,14 +835,22 @@ impl SharedWorld {
         Self {
             host: AnalysisHost::with_database(RootDatabase::new(None)),
             loaded_workspaces: Vec::new(),
+            workspace_indexes: BTreeMap::new(),
             package_instances: BTreeMap::new(),
         }
     }
 
     pub fn load_cargo_workspace(&mut self, root: impl AsRef<Path>) -> anyhow::Result<usize> {
+        let root = AbsPathBuf::assert_utf8(std::fs::canonicalize(root)?);
+        let root_key = root.to_string();
+        if let Some(index) = self.workspace_indexes.get(&root_key) {
+            return Ok(*index);
+        }
+
         let loaded = load_cargo_workspace_into_host(&mut self.host, root)?;
         let index = self.loaded_workspaces.len();
         self.loaded_workspaces.push(loaded);
+        self.workspace_indexes.insert(root_key, index);
         self.refresh_package_instances()?;
 
         Ok(index)
