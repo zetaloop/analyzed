@@ -115,8 +115,38 @@ impl DaemonRequest {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct BackendKey {
+    pub shared_world: SharedWorldKey,
+    pub workspace_view: WorkspaceViewKey,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SharedWorldKey {
     pub rust_analyzer_version: String,
+    pub toolchain: Option<String>,
+    pub sysroot: Option<String>,
+    pub cargo_target: Option<String>,
+    pub load: SharedWorldLoadKey,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SharedWorldLoadKey {
+    pub load_out_dirs_from_check: bool,
+    pub with_proc_macro_server: bool,
+    pub prefill_caches: bool,
+    pub num_worker_threads: u16,
+    pub proc_macro_processes: u16,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct WorkspaceViewKey {
     pub workspace_roots: Vec<String>,
+    pub analysis: AnalysisConfigKey,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct AnalysisConfigKey {
+    pub initialization_options: Option<String>,
+    pub workspace_configuration: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

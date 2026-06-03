@@ -555,6 +555,14 @@ pub struct WorkspaceSummary {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct PackageInstanceKey {
     pub root_file: String,
+    pub edition: String,
+    pub origin: String,
+    pub display_name: String,
+    pub version: String,
+    pub cfg_options: String,
+    pub env: String,
+    pub is_proc_macro: bool,
+    pub proc_macro_cwd: String,
 }
 
 #[derive(Clone, Debug)]
@@ -819,9 +827,7 @@ impl SharedWorld {
 
     fn interned_crate(&self, krate: ide::Crate) -> anyhow::Result<ide::Crate> {
         let db = self.host.raw_database();
-        let key = PackageInstanceKey {
-            root_file: path_for_file(db, krate.data(db).root_file_id)?,
-        };
+        let key = package_instance_key(db, krate)?;
         let package = self
             .package_instances
             .get(&key)
@@ -838,9 +844,7 @@ impl SharedWorld {
         let db = self.host.raw_database();
 
         for krate in all_crates(db).iter().copied() {
-            let key = PackageInstanceKey {
-                root_file: path_for_file(db, krate.data(db).root_file_id)?,
-            };
+            let key = package_instance_key(db, krate)?;
             match self.package_instances.entry(key.clone()) {
                 Entry::Occupied(mut entry) => entry.get_mut().push_crate(krate),
                 Entry::Vacant(entry) => {
@@ -955,6 +959,22 @@ fn path_for_file(db: &RootDatabase, file_id: FileId) -> anyhow::Result<String> {
         .path_for_file(&file_id)
         .map(ToString::to_string)
         .ok_or_else(|| anyhow::format_err!("file path is unavailable for {file_id:?}"))
+}
+
+fn package_instance_key(db: &RootDatabase, krate: ide::Crate) -> anyhow::Result<PackageInstanceKey> {
+    let data = krate.data(db);
+
+    Ok(PackageInstanceKey {
+        root_file: path_for_file(db, data.root_file_id)?,
+        edition: format!("{:?}", data.edition),
+        origin: format!("{:?}", data.origin),
+        display_name: format!("{:?}", krate.extra_data(db).display_name),
+        version: format!("{:?}", krate.extra_data(db).version),
+        cfg_options: format!("{:?}", krate.cfg_options(db)),
+        env: format!("{:?}", krate.env(db)),
+        is_proc_macro: data.is_proc_macro,
+        proc_macro_cwd: format!("{:?}", data.proc_macro_cwd),
+    })
 }
 "#;
 

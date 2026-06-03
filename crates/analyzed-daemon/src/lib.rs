@@ -14,11 +14,12 @@ use std::{
 };
 
 use analyzed_ipc::{
-    BackendKey, BackendSnapshot, ClientInfo, DaemonRequest, DaemonResponse, DaemonSnapshot, Hello,
-    LspSession, ProtocolError, RUST_ANALYZER_VERSION, RuntimePaths, StartupLock, Stop,
-    WorkspaceSnapshot, bind_listener, read_json_line, write_json_line,
+    AnalysisConfigKey, BackendKey, BackendSnapshot, ClientInfo, DaemonRequest, DaemonResponse,
+    DaemonSnapshot, Hello, LspSession, ProtocolError, RUST_ANALYZER_VERSION, RuntimePaths,
+    SharedWorldKey, SharedWorldLoadKey, StartupLock, Stop, WorkspaceSnapshot, WorkspaceViewKey,
+    bind_listener, read_json_line, write_json_line,
 };
-use analyzed_ra::BackendCore;
+use analyzed_ra::{SharedWorld, WorkspaceView};
 use crossbeam_channel::unbounded;
 use daemonize::Daemonize;
 use lsp_server::{Connection, Message};
@@ -282,71 +283,126 @@ impl ServiceState {
 
 #[derive(Default)]
 struct BackendRegistry {
-    entries: BTreeMap<BackendKey, BackendEntry>,
+    worlds: BTreeMap<SharedWorldKey, SharedWorldEntry>,
+    views: BTreeMap<WorkspaceViewKey, WorkspaceViewEntry>,
 }
 
 impl BackendRegistry {
-    fn load(&mut self, key: BackendKey) -> anyhow::Result<()> {
-        if let Entry::Vacant(entry) = self.entries.entry(key) {
-            let core = BackendCore::load_workspace_roots(
-                entry.key().workspace_roots.iter().map(Path::new),
-            )?;
-            entry.insert(BackendEntry {
+    fn load(&mut self, key: &BackendKey) -> anyhow::Result<()> {
+        if let Entry::Vacant(entry) = self.worlds.entry(key.shared_world.clone()) {
+            entry.insert(SharedWorldEntry {
                 client_sessions: 0,
-                core: Arc::new(Mutex::new(core)),
+                world: Arc::new(Mutex::new(SharedWorld::new())),
             });
+        }
+
+        if !self.views.contains_key(&key.workspace_view) {
+            let view = {
+                let world = self
+                    .worlds
+                    .get(&key.shared_world)
+                    .expect("shared world was loaded");
+                let mut world = world.world.lock().map_err(|error| {
+                    anyhow::format_err!("shared world mutex is poisoned: {error}")
+                })?;
+                let mut workspaces = Vec::new();
+
+                for root in &key.workspace_view.workspace_roots {
+                    workspaces.push(world.load_cargo_workspace(Path::new(root))?);
+                }
+
+                WorkspaceView::new(workspaces)
+            };
+            self.views.insert(
+                key.workspace_view.clone(),
+                WorkspaceViewEntry {
+                    world_key: key.shared_world.clone(),
+                    client_sessions: 0,
+                    view,
+                },
+            );
         }
 
         Ok(())
     }
 
     fn register(&mut self, key: BackendKey) -> anyhow::Result<()> {
-        self.load(key.clone())?;
-        self.entries
-            .get_mut(&key)
-            .expect("backend was loaded")
+        self.load(&key)?;
+        self.worlds
+            .get_mut(&key.shared_world)
+            .expect("shared world was loaded")
+            .client_sessions += 1;
+        self.views
+            .get_mut(&key.workspace_view)
+            .expect("workspace view was loaded")
             .client_sessions += 1;
 
         Ok(())
     }
 
     fn unregister(&mut self, key: &BackendKey) {
-        if let Some(entry) = self.entries.get_mut(key) {
+        if let Some(entry) = self.views.get_mut(&key.workspace_view) {
             entry.client_sessions -= 1;
             if entry.client_sessions == 0 {
-                self.entries.remove(key);
+                self.views.remove(&key.workspace_view);
+            }
+        }
+
+        if let Some(entry) = self.worlds.get_mut(&key.shared_world) {
+            entry.client_sessions -= 1;
+            if entry.client_sessions == 0 {
+                self.worlds.remove(&key.shared_world);
             }
         }
     }
 
     fn snapshots(&self) -> Vec<BackendSnapshot> {
-        self.entries
+        self.views
             .iter()
-            .map(|(key, entry)| BackendSnapshot {
-                key: key.clone(),
-                client_sessions: entry.client_sessions,
-                workspace_loads: workspace_snapshots(&entry.core),
+            .filter_map(|(view_key, entry)| {
+                let world = self.worlds.get(&entry.world_key)?;
+                Some(BackendSnapshot {
+                    key: BackendKey {
+                        shared_world: entry.world_key.clone(),
+                        workspace_view: view_key.clone(),
+                    },
+                    client_sessions: entry.client_sessions,
+                    workspace_loads: workspace_snapshots(&world.world, &entry.view),
+                })
             })
             .collect()
     }
 
     fn workspace_loads(&self) -> Vec<WorkspaceSnapshot> {
-        self.entries
+        self.views
             .values()
-            .flat_map(|entry| workspace_snapshots(&entry.core))
+            .filter_map(|entry| {
+                let world = self.worlds.get(&entry.world_key)?;
+                Some(workspace_snapshots(&world.world, &entry.view))
+            })
+            .flatten()
             .collect()
     }
 }
 
-struct BackendEntry {
+struct SharedWorldEntry {
     client_sessions: usize,
-    core: Arc<Mutex<BackendCore>>,
+    world: Arc<Mutex<SharedWorld>>,
 }
 
-fn workspace_snapshots(core: &Arc<Mutex<BackendCore>>) -> Vec<WorkspaceSnapshot> {
-    let core = core.lock().expect("backend core mutex poisoned");
+struct WorkspaceViewEntry {
+    world_key: SharedWorldKey,
+    client_sessions: usize,
+    view: WorkspaceView,
+}
 
-    core.workspace_summaries()
+fn workspace_snapshots(
+    world: &Arc<Mutex<SharedWorld>>,
+    view: &WorkspaceView,
+) -> Vec<WorkspaceSnapshot> {
+    let world = world.lock().expect("shared world mutex poisoned");
+
+    view.workspace_summaries(&world)
         .map(|summary| WorkspaceSnapshot {
             root: summary.root.clone(),
             manifest: summary.manifest.clone(),
@@ -505,11 +561,34 @@ fn lsp_session_context(message: &Message) -> anyhow::Result<LspSessionContext> {
 
     let params = serde_json::from_value::<InitializeParams>(request.params.clone())?;
     let workspace_roots = workspace_roots_from_initialize(&params)?;
+    let initialization_options = params
+        .initialization_options
+        .as_ref()
+        .map(canonical_json_string)
+        .transpose()?;
 
     Ok(LspSessionContext {
         backend_key: BackendKey {
-            rust_analyzer_version: RUST_ANALYZER_VERSION.to_owned(),
-            workspace_roots,
+            shared_world: SharedWorldKey {
+                rust_analyzer_version: RUST_ANALYZER_VERSION.to_owned(),
+                toolchain: env::var("RUSTUP_TOOLCHAIN").ok(),
+                sysroot: env::var("RUST_SRC_PATH").ok(),
+                cargo_target: env::var("CARGO_BUILD_TARGET").ok(),
+                load: SharedWorldLoadKey {
+                    load_out_dirs_from_check: false,
+                    with_proc_macro_server: true,
+                    prefill_caches: false,
+                    num_worker_threads: 1,
+                    proc_macro_processes: 1,
+                },
+            },
+            workspace_view: WorkspaceViewKey {
+                workspace_roots,
+                analysis: AnalysisConfigKey {
+                    initialization_options,
+                    workspace_configuration: None,
+                },
+            },
         },
     })
 }
@@ -542,6 +621,47 @@ fn canonical_uri_path(uri: &lsp_types::Url) -> anyhow::Result<String> {
         .to_file_path()
         .map_err(|()| anyhow::anyhow!("workspace uri is not a file path: {uri}"))?;
     Ok(fs::canonicalize(path)?.to_string_lossy().into_owned())
+}
+
+fn canonical_json_string(value: &serde_json::Value) -> anyhow::Result<String> {
+    let mut output = String::new();
+    write_canonical_json(value, &mut output)?;
+    Ok(output)
+}
+
+fn write_canonical_json(value: &serde_json::Value, output: &mut String) -> anyhow::Result<()> {
+    match value {
+        serde_json::Value::Null => output.push_str("null"),
+        serde_json::Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        serde_json::Value::Number(value) => output.push_str(&value.to_string()),
+        serde_json::Value::String(value) => output.push_str(&serde_json::to_string(value)?),
+        serde_json::Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push('{');
+            for (index, (key, value)) in
+                values.iter().collect::<BTreeMap<_, _>>().iter().enumerate()
+            {
+                if index != 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key)?);
+                output.push(':');
+                write_canonical_json(value, output)?;
+            }
+            output.push('}');
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_client(client: &ClientInfo) -> Option<ProtocolError> {
