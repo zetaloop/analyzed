@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, btree_map::Entry},
     env, fs,
     io::{BufReader, ErrorKind},
     os::unix::net::UnixStream,
@@ -18,7 +18,7 @@ use analyzed_ipc::{
     LspSession, ProtocolError, RUST_ANALYZER_VERSION, RuntimePaths, StartupLock, Stop,
     WorkspaceSnapshot, bind_listener, read_json_line, write_json_line,
 };
-use analyzed_ra::WorkspaceStore;
+use analyzed_ra::BackendCore;
 use crossbeam_channel::unbounded;
 use daemonize::Daemonize;
 use lsp_server::{Connection, Message};
@@ -144,7 +144,7 @@ pub fn run_foreground(
     startup_lock_owned: bool,
     daemonize: bool,
 ) -> anyhow::Result<()> {
-    let workspace_root = fs::canonicalize(workspace_root)?;
+    let _workspace_root = workspace_root;
 
     if daemonize {
         Daemonize::new()
@@ -152,7 +152,7 @@ pub fn run_foreground(
             .start()?;
     }
 
-    let runtime = DaemonRuntime::load(&[&workspace_root])?;
+    let runtime = DaemonRuntime::load();
     let state = Arc::clone(&runtime.state);
     let listener = {
         let _lock = (!startup_lock_owned)
@@ -203,23 +203,8 @@ struct DaemonRuntime {
 }
 
 impl DaemonRuntime {
-    fn load(workspace_roots: &[&Path]) -> anyhow::Result<Self> {
-        let mut workspaces = WorkspaceStore::new();
-
-        for root in workspace_roots {
-            workspaces.discover_cargo_workspace(root)?;
-        }
-
-        let workspace_loads = workspaces
-            .workspace_summaries()
-            .map(|summary| WorkspaceSnapshot {
-                root: summary.root.clone(),
-                manifest: summary.manifest.clone(),
-                packages: summary.packages,
-            })
-            .collect();
-
-        Ok(Self {
+    fn load() -> Self {
+        Self {
             state: Arc::new(ServiceState {
                 pid: std::process::id(),
                 started_at_unix_seconds: SystemTime::now()
@@ -228,10 +213,9 @@ impl DaemonRuntime {
                 client_sessions: AtomicUsize::new(0),
                 next_session_id: AtomicUsize::new(1),
                 backends: Mutex::new(BackendRegistry::default()),
-                workspace_loads,
                 stopping: AtomicBool::new(false),
             }),
-        })
+        }
     }
 }
 
@@ -241,18 +225,17 @@ struct ServiceState {
     client_sessions: AtomicUsize,
     next_session_id: AtomicUsize,
     backends: Mutex<BackendRegistry>,
-    workspace_loads: Vec<WorkspaceSnapshot>,
     stopping: AtomicBool,
 }
 
 impl ServiceState {
     fn snapshot(&self) -> DaemonSnapshot {
-        let workspace_loads = self.workspace_loads.clone();
-        let backend_sessions = self
+        let backends = self
             .backends
             .lock()
-            .expect("backend registry mutex poisoned")
-            .snapshots();
+            .expect("backend registry mutex poisoned");
+        let backend_sessions = backends.snapshots();
+        let workspace_loads = backends.workspace_loads();
 
         DaemonSnapshot {
             pid: self.pid,
@@ -275,23 +258,25 @@ impl ServiceState {
         }
     }
 
-    fn register_backend_session(self: &Arc<Self>, key: BackendKey) -> BackendSession {
+    fn register_backend_session(
+        self: &Arc<Self>,
+        key: BackendKey,
+    ) -> anyhow::Result<BackendSession> {
         self.backends
             .lock()
-            .expect("backend registry mutex poisoned")
-            .register(key.clone());
+            .map_err(|error| anyhow::format_err!("backend registry mutex is poisoned: {error}"))?
+            .register(key.clone())?;
 
-        BackendSession {
+        Ok(BackendSession {
             state: Arc::clone(self),
             key,
-        }
+        })
     }
 
     fn unregister_backend_session(&self, key: &BackendKey) {
-        self.backends
-            .lock()
-            .expect("backend registry mutex poisoned")
-            .unregister(key);
+        if let Ok(mut backends) = self.backends.lock() {
+            backends.unregister(key);
+        }
     }
 }
 
@@ -301,8 +286,28 @@ struct BackendRegistry {
 }
 
 impl BackendRegistry {
-    fn register(&mut self, key: BackendKey) {
-        self.entries.entry(key).or_default().client_sessions += 1;
+    fn load(&mut self, key: BackendKey) -> anyhow::Result<()> {
+        if let Entry::Vacant(entry) = self.entries.entry(key) {
+            let core = BackendCore::load_workspace_roots(
+                entry.key().workspace_roots.iter().map(Path::new),
+            )?;
+            entry.insert(BackendEntry {
+                client_sessions: 0,
+                core: Arc::new(Mutex::new(core)),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn register(&mut self, key: BackendKey) -> anyhow::Result<()> {
+        self.load(key.clone())?;
+        self.entries
+            .get_mut(&key)
+            .expect("backend was loaded")
+            .client_sessions += 1;
+
+        Ok(())
     }
 
     fn unregister(&mut self, key: &BackendKey) {
@@ -320,14 +325,36 @@ impl BackendRegistry {
             .map(|(key, entry)| BackendSnapshot {
                 key: key.clone(),
                 client_sessions: entry.client_sessions,
+                workspace_loads: workspace_snapshots(&entry.core),
             })
+            .collect()
+    }
+
+    fn workspace_loads(&self) -> Vec<WorkspaceSnapshot> {
+        self.entries
+            .values()
+            .flat_map(|entry| workspace_snapshots(&entry.core))
             .collect()
     }
 }
 
-#[derive(Default)]
 struct BackendEntry {
     client_sessions: usize,
+    core: Arc<Mutex<BackendCore>>,
+}
+
+fn workspace_snapshots(core: &Arc<Mutex<BackendCore>>) -> Vec<WorkspaceSnapshot> {
+    let core = core.lock().expect("backend core mutex poisoned");
+
+    core.workspace_summaries()
+        .map(|summary| WorkspaceSnapshot {
+            root: summary.root.clone(),
+            manifest: summary.manifest.clone(),
+            packages: summary.packages,
+            files: summary.files,
+            proc_macro_server: summary.proc_macro_server,
+        })
+        .collect()
 }
 
 struct BackendSession {
@@ -409,7 +436,7 @@ fn handle_lsp_session(
 ) -> anyhow::Result<()> {
     let (connection, threads, context) = lsp_stream_connection(stream)?;
     let LspSessionContext { backend_key } = context;
-    let _backend_session = state.register_backend_session(backend_key);
+    let _backend_session = state.register_backend_session(backend_key)?;
     let result = analyzed_ra::run_rust_analyzer_lsp_session(connection);
     let join_result = threads.join();
 

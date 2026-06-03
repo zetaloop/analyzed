@@ -123,6 +123,7 @@ pub struct BackendKey {
 pub struct BackendSnapshot {
     pub key: BackendKey,
     pub client_sessions: usize,
+    pub workspace_loads: Vec<WorkspaceSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -130,6 +131,8 @@ pub struct WorkspaceSnapshot {
     pub root: String,
     pub manifest: String,
     pub packages: usize,
+    pub files: usize,
+    pub proc_macro_server: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
