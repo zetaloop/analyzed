@@ -617,7 +617,7 @@ impl SessionOverlay {
 #[derive(Clone, Debug)]
 pub struct SessionOverlayFile {
     base_file: FileId,
-    session_file: FileId,
+    session_file: Option<FileId>,
     path: VfsPath,
 }
 
@@ -625,7 +625,15 @@ impl SessionOverlayFile {
     pub fn new(base_file: FileId, session_file: FileId, path: VfsPath) -> Self {
         Self {
             base_file,
-            session_file,
+            session_file: Some(session_file),
+            path,
+        }
+    }
+
+    pub fn pending(base_file: FileId, path: VfsPath) -> Self {
+        Self {
+            base_file,
+            session_file: None,
             path,
         }
     }
@@ -634,7 +642,7 @@ impl SessionOverlayFile {
         self.base_file
     }
 
-    pub fn session_file(&self) -> FileId {
+    pub fn session_file(&self) -> Option<FileId> {
         self.session_file
     }
 
@@ -646,14 +654,21 @@ impl SessionOverlayFile {
 #[derive(Clone, Copy, Debug)]
 pub struct SessionOverlayCrate {
     base_crate: ide::Crate,
-    session_crate: ide::Crate,
+    session_crate: Option<ide::Crate>,
 }
 
 impl SessionOverlayCrate {
     pub fn new(base_crate: ide::Crate, session_crate: ide::Crate) -> Self {
         Self {
             base_crate,
-            session_crate,
+            session_crate: Some(session_crate),
+        }
+    }
+
+    pub fn pending(base_crate: ide::Crate) -> Self {
+        Self {
+            base_crate,
+            session_crate: None,
         }
     }
 
@@ -665,12 +680,12 @@ impl SessionOverlayCrate {
         self.base_crate
     }
 
-    pub fn session_crate(&self) -> ide::Crate {
+    pub fn session_crate(&self) -> Option<ide::Crate> {
         self.session_crate
     }
 
     pub fn is_shared(&self) -> bool {
-        self.base_crate == self.session_crate
+        self.session_crate == Some(self.base_crate)
     }
 }
 
@@ -730,6 +745,14 @@ impl BackendCore {
     pub fn workspace_summaries(&self) -> impl Iterator<Item = &WorkspaceSummary> {
         self.view.workspace_summaries(&self.world)
     }
+
+    pub fn shared_world(&self) -> &SharedWorld {
+        &self.world
+    }
+
+    pub fn workspace_view(&self) -> &WorkspaceView {
+        &self.view
+    }
 }
 
 pub struct SharedWorld {
@@ -777,6 +800,38 @@ impl SharedWorld {
 
     pub fn package_instances(&self) -> impl Iterator<Item = &PackageInstance> {
         self.package_instances.values()
+    }
+
+    pub fn crates_for_file(&self, file_id: FileId) -> anyhow::Result<Vec<ide::Crate>> {
+        Ok(self.host.analysis().crates_for(file_id)?)
+    }
+
+    pub fn shared_dependencies(&self, krate: ide::Crate) -> anyhow::Result<Vec<ide::Crate>> {
+        let db = self.host.raw_database();
+        let mut dependencies = Vec::new();
+
+        for dependency in &krate.data(db).dependencies {
+            dependencies.push(self.interned_crate(dependency.crate_id)?);
+        }
+
+        Ok(dependencies)
+    }
+
+    fn interned_crate(&self, krate: ide::Crate) -> anyhow::Result<ide::Crate> {
+        let db = self.host.raw_database();
+        let key = PackageInstanceKey {
+            root_file: path_for_file(db, krate.data(db).root_file_id)?,
+        };
+        let package = self
+            .package_instances
+            .get(&key)
+            .ok_or_else(|| anyhow::format_err!("package instance is not interned: {:?}", key))?;
+
+        if package.crates().contains(&krate) {
+            Ok(krate)
+        } else {
+            anyhow::bail!("crate is not interned in package instance: {:?}", key)
+        }
     }
 
     fn refresh_package_instances(&mut self) -> anyhow::Result<()> {
@@ -827,6 +882,26 @@ impl WorkspaceView {
         self.workspaces
             .iter()
             .filter_map(|index| world.workspace_summary(*index))
+    }
+
+    pub fn overlay_cone(
+        &self,
+        world: &SharedWorld,
+        path: impl AsRef<Path>,
+    ) -> anyhow::Result<SessionOverlay> {
+        let (base_file, vfs_path) = world.workspace_file(path)?;
+        let mut overlay = SessionOverlay::new();
+        overlay.push_file(SessionOverlayFile::pending(base_file, vfs_path));
+
+        for krate in world.crates_for_file(base_file)? {
+            overlay.push_crate(SessionOverlayCrate::pending(krate));
+
+            for dependency in world.shared_dependencies(krate)? {
+                overlay.push_crate(SessionOverlayCrate::shared(dependency));
+            }
+        }
+
+        Ok(overlay)
     }
 }
 
