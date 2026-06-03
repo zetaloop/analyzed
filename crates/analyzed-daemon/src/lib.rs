@@ -286,7 +286,7 @@ impl ServiceState {
 #[derive(Default)]
 struct BackendRegistry {
     worlds: BTreeMap<SharedWorldKey, SharedWorldEntry>,
-    views: BTreeMap<WorkspaceViewKey, WorkspaceViewEntry>,
+    views: BTreeMap<BackendKey, WorkspaceViewEntry>,
 }
 
 impl BackendRegistry {
@@ -298,7 +298,7 @@ impl BackendRegistry {
             });
         }
 
-        if !self.views.contains_key(&key.workspace_view) {
+        if !self.views.contains_key(key) {
             let view = {
                 let world = self
                     .worlds
@@ -316,9 +316,8 @@ impl BackendRegistry {
                 WorkspaceView::new(workspaces)
             };
             self.views.insert(
-                key.workspace_view.clone(),
+                key.clone(),
                 WorkspaceViewEntry {
-                    world_key: key.shared_world.clone(),
                     client_sessions: 0,
                     view,
                 },
@@ -335,7 +334,7 @@ impl BackendRegistry {
             .expect("shared world was loaded")
             .client_sessions += 1;
         self.views
-            .get_mut(&key.workspace_view)
+            .get_mut(&key)
             .expect("workspace view was loaded")
             .client_sessions += 1;
 
@@ -349,7 +348,7 @@ impl BackendRegistry {
             .ok_or_else(|| anyhow::format_err!("shared world is not loaded"))?;
         let view = self
             .views
-            .get(&key.workspace_view)
+            .get(key)
             .ok_or_else(|| anyhow::format_err!("workspace view is not loaded"))?;
 
         Ok(SharedAnalyzerSession::new(
@@ -359,10 +358,10 @@ impl BackendRegistry {
     }
 
     fn unregister(&mut self, key: &BackendKey) {
-        if let Some(entry) = self.views.get_mut(&key.workspace_view) {
+        if let Some(entry) = self.views.get_mut(key) {
             entry.client_sessions -= 1;
             if entry.client_sessions == 0 {
-                self.views.remove(&key.workspace_view);
+                self.views.remove(key);
             }
         }
 
@@ -377,13 +376,10 @@ impl BackendRegistry {
     fn snapshots(&self) -> Vec<BackendSnapshot> {
         self.views
             .iter()
-            .filter_map(|(view_key, entry)| {
-                let world = self.worlds.get(&entry.world_key)?;
+            .filter_map(|(key, entry)| {
+                let world = self.worlds.get(&key.shared_world)?;
                 Some(BackendSnapshot {
-                    key: BackendKey {
-                        shared_world: entry.world_key.clone(),
-                        workspace_view: view_key.clone(),
-                    },
+                    key: key.clone(),
                     client_sessions: entry.client_sessions,
                     workspace_loads: workspace_snapshots(&world.world, &entry.view),
                 })
@@ -393,9 +389,9 @@ impl BackendRegistry {
 
     fn workspace_loads(&self) -> Vec<WorkspaceSnapshot> {
         self.views
-            .values()
-            .filter_map(|entry| {
-                let world = self.worlds.get(&entry.world_key)?;
+            .iter()
+            .filter_map(|(key, entry)| {
+                let world = self.worlds.get(&key.shared_world)?;
                 Some(workspace_snapshots(&world.world, &entry.view))
             })
             .flatten()
@@ -409,7 +405,6 @@ struct SharedWorldEntry {
 }
 
 struct WorkspaceViewEntry {
-    world_key: SharedWorldKey,
     client_sessions: usize,
     view: WorkspaceView,
 }
