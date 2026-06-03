@@ -586,7 +586,6 @@ impl SharedAnalyzerSession {
 }
 
 pub struct SharedAnalyzerSnapshot {
-    pub(crate) database: RootDatabase,
     pub(crate) workspaces: Vec<ProjectWorkspace>,
     pub(crate) files: Vec<SharedAnalyzerFile>,
 }
@@ -875,11 +874,7 @@ impl SharedWorld {
             }
         }
 
-        Ok(SharedAnalyzerSnapshot {
-            database: db.clone(),
-            workspaces,
-            files,
-        })
+        Ok(SharedAnalyzerSnapshot { workspaces, files })
     }
 
     pub fn workspace_file(&self, path: impl AsRef<Path>) -> anyhow::Result<(FileId, VfsPath)> {
@@ -1152,17 +1147,22 @@ pub(crate) mod analyzed_session {
             snapshot: SharedAnalyzerSnapshot,
         ) -> anyhow::Result<Self> {
             let mut session = Self::new(sender, config);
+            let workspaces = snapshot.workspaces;
             let (vfs, line_endings) = vfs_from_shared_files(snapshot.files)?;
 
-            session.state.analysis_host = ide::AnalysisHost::with_database(snapshot.database);
+            load_shared_workspaces_into_host(&mut session.state, &workspaces)?;
             session.state.vfs = Arc::new(parking_lot::RwLock::new((vfs, line_endings)));
-            session.state.workspaces = Arc::new(snapshot.workspaces);
+            install_shared_workspaces(&mut session.state, workspaces);
 
             Ok(session)
         }
 
         pub fn run(self, receiver: Receiver<Message>) -> anyhow::Result<()> {
             self.state.run(receiver)
+        }
+
+        pub fn run_shared(self, receiver: Receiver<Message>) -> anyhow::Result<()> {
+            run_shared_state(self.state, receiver)
         }
 
         pub fn run_connection(
@@ -1206,7 +1206,7 @@ pub(crate) mod analyzed_session {
     ) -> anyhow::Result<()> {
         let (initialize_id, initialize_params) = connection.initialize_start()?;
         tracing::info!("InitializeParams: {}", initialize_params);
-        let config = config_from_initialize_params(&connection, &initialize_params)?;
+        let mut config = config_from_initialize_params(&connection, &initialize_params)?;
         let initialize_result = lsp_types::InitializeResult {
             capabilities: server_capabilities(&config),
             server_info: Some(lsp_types::ServerInfo {
@@ -1218,20 +1218,135 @@ pub(crate) mod analyzed_session {
 
         connection.initialize_finish(initialize_id, serde_json::to_value(initialize_result)?)?;
 
+        if config.discover_workspace_config().is_none()
+            && !config.has_linked_projects()
+            && config.detached_files().is_empty()
+        {
+            config.rediscover_workspaces();
+        }
+
         initialize_rayon();
         let snapshot = session.snapshot()?;
         let Connection { sender, receiver } = connection;
-        RustAnalyzerSession::new_with_shared_snapshot(sender, config, snapshot)?.run(receiver)
+        RustAnalyzerSession::new_with_shared_snapshot(sender, config, snapshot)?.run_shared(receiver)
+    }
+
+    fn load_shared_workspaces_into_host(
+        state: &mut crate::global_state::GlobalState,
+        workspaces: &[project_model::ProjectWorkspace],
+    ) -> anyhow::Result<()> {
+        let cargo_config = project_model::CargoConfig::default();
+        let load_config = load_cargo::LoadCargoConfig {
+            load_out_dirs_from_check: false,
+            with_proc_macro_server: load_cargo::ProcMacroServerChoice::Sysroot,
+            prefill_caches: false,
+            num_worker_threads: 1,
+            proc_macro_processes: 1,
+        };
+        let mut proc_macro_clients = Vec::new();
+
+        for workspace in workspaces {
+            let (_, proc_macro_client) = {
+                let db = state.analysis_host.raw_database_mut();
+                load_cargo::load_workspace_into_db(
+                    workspace.clone(),
+                    &cargo_config.extra_env,
+                    &load_config,
+                    db,
+                )?
+            };
+            proc_macro_clients.push(proc_macro_client.map(Ok::<_, anyhow::Error>));
+        }
+
+        state.proc_macro_clients = Arc::from_iter(proc_macro_clients);
+
+        Ok(())
+    }
+
+    fn install_shared_workspaces(
+        state: &mut crate::global_state::GlobalState,
+        workspaces: Vec<project_model::ProjectWorkspace>,
+    ) {
+        let source_root_config = {
+            let files_config = state.config.files();
+            load_cargo::ProjectFolders::new(
+                &workspaces,
+                &files_config.exclude,
+                Config::user_config_dir_path().as_deref(),
+            )
+            .source_root_config
+        };
+        state.source_root_config = source_root_config;
+        state.local_roots_parent_map = Arc::new(state.source_root_config.source_root_parent_map());
+        state.workspaces = Arc::new(workspaces);
+    }
+
+    fn run_shared_state(
+        mut state: crate::global_state::GlobalState,
+        inbox: Receiver<Message>,
+    ) -> anyhow::Result<()> {
+        state.update_status_or_notify();
+
+        if state.config.did_save_text_document_dynamic_registration() {
+            let additional_patterns = state
+                .config
+                .discover_workspace_config()
+                .map(|cfg| cfg.files_to_watch.clone().into_iter())
+                .into_iter()
+                .flatten()
+                .map(|file| format!("**/{file}"));
+            state.register_did_save_capability(additional_patterns);
+        }
+
+        while let Ok(event) = state.next_event(&inbox) {
+            let Some(event) = event else {
+                anyhow::bail!("client exited without proper shutdown sequence");
+            };
+            if matches!(
+                &event,
+                super::Event::Lsp(lsp_server::Message::Notification(lsp_server::Notification {
+                    method,
+                    ..
+                }))
+                if method
+                    == <lsp_types::notification::Exit as lsp_types::notification::Notification>::METHOD
+            ) {
+                return Ok(());
+            }
+            state.handle_event(event);
+        }
+
+        anyhow::bail!("A receiver has been dropped, something panicked!")
     }
 
     fn vfs_from_shared_files(
-        files: Vec<SharedAnalyzerFile>,
+        mut files: Vec<SharedAnalyzerFile>,
     ) -> anyhow::Result<(vfs::Vfs, FxHashMap<ide::FileId, LineEndings>)> {
         let mut vfs = vfs::Vfs::default();
         let mut line_endings = FxHashMap::default();
+        let mut next_file_id = 0;
+
+        files.sort_by_key(|file| file.file_id.index());
 
         for file in files {
             let file_id = file.file_id;
+            while next_file_id < file_id.index() {
+                let path =
+                    vfs::VfsPath::new_virtual_path(format!("/__analyzed__/deleted/{next_file_id}"));
+                vfs.set_file_contents(path.clone(), Some(Vec::new()));
+                let Some((session_file_id, _)) = vfs.file_id(&path) else {
+                    anyhow::bail!("deleted shared file id placeholder was not inserted: {path}");
+                };
+                let expected = ide::FileId::from_raw(next_file_id);
+                if session_file_id != expected {
+                    anyhow::bail!(
+                        "deleted shared file id mismatch for {path}: expected {expected:?}, got {session_file_id:?}"
+                    );
+                }
+                vfs.set_file_contents(path, None);
+                next_file_id += 1;
+            }
+
             let path = file.path;
             let (text, endings) = LineEndings::normalize(file.text);
             vfs.set_file_contents(path.clone(), Some(text.into_bytes()));
@@ -1245,6 +1360,7 @@ pub(crate) mod analyzed_session {
                 );
             }
             line_endings.insert(file_id, endings);
+            next_file_id += 1;
         }
 
         _ = vfs.take_changes();
