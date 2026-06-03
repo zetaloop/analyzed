@@ -19,7 +19,7 @@ use analyzed_ipc::{
     SharedWorldKey, SharedWorldLoadKey, StartupLock, Stop, WorkspaceSnapshot, WorkspaceViewKey,
     bind_listener, read_json_line, write_json_line,
 };
-use analyzed_ra::{SharedWorld, WorkspaceView};
+use analyzed_ra::{SharedAnalyzerSession, SharedWorld, WorkspaceView};
 use crossbeam_channel::unbounded;
 use daemonize::Daemonize;
 use lsp_server::{Connection, Message};
@@ -263,7 +263,8 @@ impl ServiceState {
         self: &Arc<Self>,
         key: BackendKey,
     ) -> anyhow::Result<BackendSession> {
-        self.backends
+        let shared_session = self
+            .backends
             .lock()
             .map_err(|error| anyhow::format_err!("backend registry mutex is poisoned: {error}"))?
             .register(key.clone())?;
@@ -271,6 +272,7 @@ impl ServiceState {
         Ok(BackendSession {
             state: Arc::clone(self),
             key,
+            shared_session,
         })
     }
 
@@ -326,7 +328,7 @@ impl BackendRegistry {
         Ok(())
     }
 
-    fn register(&mut self, key: BackendKey) -> anyhow::Result<()> {
+    fn register(&mut self, key: BackendKey) -> anyhow::Result<SharedAnalyzerSession> {
         self.load(&key)?;
         self.worlds
             .get_mut(&key.shared_world)
@@ -337,7 +339,23 @@ impl BackendRegistry {
             .expect("workspace view was loaded")
             .client_sessions += 1;
 
-        Ok(())
+        self.shared_session(&key)
+    }
+
+    fn shared_session(&self, key: &BackendKey) -> anyhow::Result<SharedAnalyzerSession> {
+        let world = self
+            .worlds
+            .get(&key.shared_world)
+            .ok_or_else(|| anyhow::format_err!("shared world is not loaded"))?;
+        let view = self
+            .views
+            .get(&key.workspace_view)
+            .ok_or_else(|| anyhow::format_err!("workspace view is not loaded"))?;
+
+        Ok(SharedAnalyzerSession::new(
+            Arc::clone(&world.world),
+            view.view.clone(),
+        ))
     }
 
     fn unregister(&mut self, key: &BackendKey) {
@@ -416,6 +434,7 @@ fn workspace_snapshots(
 struct BackendSession {
     state: Arc<ServiceState>,
     key: BackendKey,
+    shared_session: SharedAnalyzerSession,
 }
 
 impl Drop for BackendSession {
@@ -492,8 +511,11 @@ fn handle_lsp_session(
 ) -> anyhow::Result<()> {
     let (connection, threads, context) = lsp_stream_connection(stream)?;
     let LspSessionContext { backend_key } = context;
-    let _backend_session = state.register_backend_session(backend_key)?;
-    let result = analyzed_ra::run_rust_analyzer_lsp_session(connection);
+    let backend_session = state.register_backend_session(backend_key)?;
+    let result = analyzed_ra::run_shared_rust_analyzer_lsp_session(
+        connection,
+        backend_session.shared_session.clone(),
+    );
     let join_result = threads.join();
 
     match (result, join_result) {

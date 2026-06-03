@@ -257,8 +257,9 @@ pub mod analyzed_bridge;
 pub use analyzed_bridge::{
     BackendCore, LoadedWorkspace, PackageInstance, PackageInstanceKey, RustAnalyzerLspBoundary,
     RustAnalyzerPrivateBoundary, RustAnalyzerSession, RustAnalyzerSessionBoundary,
-    SessionOverlay, SessionOverlayCrate, SessionOverlayFile, SharedWorld, WorkspaceSummary,
-    WorkspaceView, run_rust_analyzer_lsp_session, rust_analyzer_lsp_boundary,
+    SessionOverlay, SessionOverlayCrate, SessionOverlayFile, SharedAnalyzerSession, SharedWorld,
+    WorkspaceSummary, WorkspaceView, run_rust_analyzer_lsp_session,
+    run_shared_rust_analyzer_lsp_session, rust_analyzer_lsp_boundary,
     rust_analyzer_private_boundary, rust_analyzer_session_boundary,
 };
 "#,
@@ -472,7 +473,11 @@ fn write_bridge_module(path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 const BRIDGE_MODULE: &str = r#"
-use std::{collections::{BTreeMap, btree_map::Entry}, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use ide::{AnalysisHost, FileId, RootDatabase};
 use ide_db::base_db::{SourceDatabase, all_crates};
@@ -543,6 +548,13 @@ pub fn run_rust_analyzer_lsp_session(connection: lsp_server::Connection) -> anyh
     crate::main_loop::analyzed_session::run_lsp_session(connection)
 }
 
+pub fn run_shared_rust_analyzer_lsp_session(
+    connection: lsp_server::Connection,
+    session: SharedAnalyzerSession,
+) -> anyhow::Result<()> {
+    crate::main_loop::analyzed_session::run_shared_lsp_session(connection, session)
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct WorkspaceSummary {
     pub root: String,
@@ -550,6 +562,39 @@ pub struct WorkspaceSummary {
     pub packages: usize,
     pub files: usize,
     pub proc_macro_server: bool,
+}
+
+#[derive(Clone)]
+pub struct SharedAnalyzerSession {
+    world: Arc<Mutex<SharedWorld>>,
+    view: WorkspaceView,
+}
+
+impl SharedAnalyzerSession {
+    pub fn new(world: Arc<Mutex<SharedWorld>>, view: WorkspaceView) -> Self {
+        Self { world, view }
+    }
+
+    pub fn snapshot(&self) -> anyhow::Result<SharedAnalyzerSnapshot> {
+        let world = self
+            .world
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
+
+        world.snapshot(&self.view)
+    }
+}
+
+pub struct SharedAnalyzerSnapshot {
+    pub(crate) database: RootDatabase,
+    pub(crate) workspaces: Vec<ProjectWorkspace>,
+    pub(crate) files: Vec<SharedAnalyzerFile>,
+}
+
+pub struct SharedAnalyzerFile {
+    pub(crate) file_id: FileId,
+    pub(crate) path: VfsPath,
+    pub(crate) text: String,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -714,6 +759,7 @@ impl SessionOverlayCrate {
 
 pub struct LoadedWorkspace {
     summary: WorkspaceSummary,
+    workspace: ProjectWorkspace,
     _vfs: Vfs,
     _proc_macro_client: Option<ProcMacroClient>,
 }
@@ -804,6 +850,36 @@ impl SharedWorld {
 
     pub fn workspace_summary(&self, index: usize) -> Option<&WorkspaceSummary> {
         self.loaded_workspaces.get(index).map(LoadedWorkspace::summary)
+    }
+
+    pub fn snapshot(&self, view: &WorkspaceView) -> anyhow::Result<SharedAnalyzerSnapshot> {
+        let db = self.host.raw_database();
+        let mut workspaces = Vec::new();
+        let mut files = Vec::new();
+        let mut seen_files = BTreeSet::new();
+
+        for index in view.workspace_indexes() {
+            let Some(workspace) = self.loaded_workspaces.get(index) else {
+                continue;
+            };
+            workspaces.push(workspace.workspace.clone());
+
+            for (file_id, path) in workspace._vfs.iter() {
+                if seen_files.insert(file_id) {
+                    files.push(SharedAnalyzerFile {
+                        file_id,
+                        path: path.clone(),
+                        text: db.file_text(file_id).text(db).to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(SharedAnalyzerSnapshot {
+            database: db.clone(),
+            workspaces,
+            files,
+        })
     }
 
     pub fn workspace_file(&self, path: impl AsRef<Path>) -> anyhow::Result<(FileId, VfsPath)> {
@@ -923,6 +999,10 @@ impl WorkspaceView {
         self.workspaces.push(workspace);
     }
 
+    pub fn workspace_indexes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.workspaces.iter().copied()
+    }
+
     pub fn workspace_summaries<'a>(
         &'a self,
         world: &'a SharedWorld,
@@ -989,6 +1069,7 @@ fn load_cargo_workspace_into_host(
     let workspace = ProjectWorkspace::load(manifest, &cargo_config, &|_| {})?;
     let root = workspace.workspace_root().to_string();
     let packages = workspace.n_packages();
+    let workspace_for_session = workspace.clone();
     let (vfs, proc_macro_client) = {
         let db = host.raw_database_mut();
         load_workspace_into_db(workspace, &cargo_config.extra_env, &load_config, db)?
@@ -1003,6 +1084,7 @@ fn load_cargo_workspace_into_host(
             files,
             proc_macro_server: proc_macro_client.is_some(),
         },
+        workspace: workspace_for_session,
         _vfs: vfs,
         _proc_macro_client: proc_macro_client,
     })
@@ -1042,11 +1124,15 @@ pub(crate) mod analyzed_session {
     use crossbeam_channel::{Receiver, Sender};
     use lsp_server::{Connection, Message};
     use paths::Utf8PathBuf;
+    use rustc_hash::FxHashMap;
+    use triomphe::Arc;
     use vfs::AbsPathBuf;
 
     use crate::{
+        analyzed_bridge::{SharedAnalyzerFile, SharedAnalyzerSession, SharedAnalyzerSnapshot},
         config::{Config, ConfigChange, ConfigErrors},
         from_json, server_capabilities, version,
+        line_index::LineEndings,
     };
 
     pub struct RustAnalyzerSession {
@@ -1058,6 +1144,21 @@ pub(crate) mod analyzed_session {
             Self {
                 state: crate::global_state::GlobalState::new(sender, config),
             }
+        }
+
+        pub fn new_with_shared_snapshot(
+            sender: Sender<Message>,
+            config: crate::config::Config,
+            snapshot: SharedAnalyzerSnapshot,
+        ) -> anyhow::Result<Self> {
+            let mut session = Self::new(sender, config);
+            let (vfs, line_endings) = vfs_from_shared_files(snapshot.files)?;
+
+            session.state.analysis_host = ide::AnalysisHost::with_database(snapshot.database);
+            session.state.vfs = Arc::new(parking_lot::RwLock::new((vfs, line_endings)));
+            session.state.workspaces = Arc::new(snapshot.workspaces);
+
+            Ok(session)
         }
 
         pub fn run(self, receiver: Receiver<Message>) -> anyhow::Result<()> {
@@ -1097,6 +1198,58 @@ pub(crate) mod analyzed_session {
         initialize_rayon();
         let Connection { sender, receiver } = connection;
         RustAnalyzerSession::new(sender, config).run(receiver)
+    }
+
+    pub(crate) fn run_shared_lsp_session(
+        connection: Connection,
+        session: SharedAnalyzerSession,
+    ) -> anyhow::Result<()> {
+        let (initialize_id, initialize_params) = connection.initialize_start()?;
+        tracing::info!("InitializeParams: {}", initialize_params);
+        let config = config_from_initialize_params(&connection, &initialize_params)?;
+        let initialize_result = lsp_types::InitializeResult {
+            capabilities: server_capabilities(&config),
+            server_info: Some(lsp_types::ServerInfo {
+                name: String::from("rust-analyzer"),
+                version: Some(version().to_string()),
+            }),
+            offset_encoding: None,
+        };
+
+        connection.initialize_finish(initialize_id, serde_json::to_value(initialize_result)?)?;
+
+        initialize_rayon();
+        let snapshot = session.snapshot()?;
+        let Connection { sender, receiver } = connection;
+        RustAnalyzerSession::new_with_shared_snapshot(sender, config, snapshot)?.run(receiver)
+    }
+
+    fn vfs_from_shared_files(
+        files: Vec<SharedAnalyzerFile>,
+    ) -> anyhow::Result<(vfs::Vfs, FxHashMap<ide::FileId, LineEndings>)> {
+        let mut vfs = vfs::Vfs::default();
+        let mut line_endings = FxHashMap::default();
+
+        for file in files {
+            let file_id = file.file_id;
+            let path = file.path;
+            let (text, endings) = LineEndings::normalize(file.text);
+            vfs.set_file_contents(path.clone(), Some(text.into_bytes()));
+
+            let Some((session_file_id, _)) = vfs.file_id(&path) else {
+                anyhow::bail!("shared file was not inserted into session VFS: {path}");
+            };
+            if session_file_id != file_id {
+                anyhow::bail!(
+                    "shared file id mismatch for {path}: expected {file_id:?}, got {session_file_id:?}"
+                );
+            }
+            line_endings.insert(file_id, endings);
+        }
+
+        _ = vfs.take_changes();
+
+        Ok((vfs, line_endings))
     }
 
     fn config_from_initialize_params(
