@@ -125,16 +125,50 @@ pub struct SharedWorldKey {
     pub toolchain: Option<String>,
     pub sysroot: Option<String>,
     pub cargo_target: Option<String>,
+    pub config: SharedWorldConfigKey,
     pub load: SharedWorldLoadKey,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SharedWorldConfigKey {
+    pub cargo: CargoConfigKey,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct CargoConfigKey {
+    pub all_targets: bool,
+    pub features: String,
+    pub target: Option<String>,
+    pub sysroot: Option<String>,
+    pub sysroot_src: Option<String>,
+    pub rustc_source: Option<String>,
+    pub extra_includes: Vec<String>,
+    pub cfg_overrides: String,
+    pub wrap_rustc_in_build_scripts: bool,
+    pub invocation_strategy: String,
+    pub run_build_script_command: String,
+    pub extra_args: Vec<String>,
+    pub extra_env: Vec<(String, Option<String>)>,
+    pub target_dir_config: String,
+    pub set_test: bool,
+    pub no_deps: bool,
+    pub metadata_extra_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SharedWorldLoadKey {
     pub load_out_dirs_from_check: bool,
-    pub with_proc_macro_server: bool,
+    pub proc_macro_server: ProcMacroServerKey,
     pub prefill_caches: bool,
     pub num_worker_threads: u16,
     pub proc_macro_processes: u16,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum ProcMacroServerKey {
+    None,
+    Sysroot,
+    Explicit(String),
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

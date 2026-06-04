@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let generated_src = generated.join("src");
 
     rewrite_lib_header(&generated_src.join("lib.rs"))?;
-    write_bridge_module(&generated_src.join("analyzed_bridge.rs"))?;
+    write_bridge_module(&generated_src.join("analyzed_bridge.rs"), &package.version)?;
     append_main_loop_session_module(&generated_src.join("main_loop.rs"))?;
     append_bridge_export(&generated_src.join("lib.rs"))?;
 
@@ -253,16 +253,18 @@ fn append_bridge_export(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     file.write_all(
         br#"
 
-pub mod analyzed_bridge;
-pub use analyzed_bridge::{
-    BackendCore, LoadedWorkspace, PackageInstance, PackageInstanceKey, RustAnalyzerLspBoundary,
-    RustAnalyzerPrivateBoundary, RustAnalyzerSession, RustAnalyzerSessionBoundary,
-    SessionOverlay, SessionOverlayCrate, SessionOverlayFile, SharedAnalyzerSession, SharedWorld,
-    WorkspaceSummary, WorkspaceView, run_rust_analyzer_lsp_session,
-    run_shared_rust_analyzer_lsp_session, rust_analyzer_lsp_boundary,
-    rust_analyzer_private_boundary, rust_analyzer_session_boundary,
-};
-"#,
+	pub mod analyzed_bridge;
+	pub use analyzed_bridge::{
+	    PackageInstance, PackageInstanceKey, RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary,
+	    SessionOverlay, SessionOverlayCrate, SessionOverlayFile, SharedAnalyzerBackendKey,
+	    SharedAnalyzerCargoConfigKey, SharedAnalyzerConfig,
+	    SharedAnalyzerLoadKey, SharedAnalyzerProcMacroServerKey, SharedAnalyzerSession,
+	    SharedAnalyzerSessionContext, SharedAnalyzerWorldConfigKey, SharedAnalyzerWorldKey,
+	    SharedAnalyzerViewKey, SharedWorld, WorkspaceSummary, WorkspaceView,
+	    run_shared_rust_analyzer_lsp_session, rust_analyzer_lsp_boundary,
+	    rust_analyzer_private_boundary, shared_analyzer_session_context,
+	};
+	"#,
     )?;
 
     Ok(())
@@ -467,27 +469,31 @@ fn rewrite_lib_header(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn write_bridge_module(path: &Path) -> Result<(), Box<dyn Error>> {
-    fs::write(path, BRIDGE_MODULE)?;
+fn write_bridge_module(path: &Path, rust_analyzer_version: &str) -> Result<(), Box<dyn Error>> {
+    fs::write(
+        path,
+        BRIDGE_MODULE.replace("__ANALYZED_RA_VERSION__", rust_analyzer_version),
+    )?;
     Ok(())
 }
 
 const BRIDGE_MODULE: &str = r#"
-use std::{
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
-    path::Path,
-    sync::{Arc, Mutex},
-};
+	use std::{
+	    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+	    env,
+	    path::{Path, PathBuf},
+	    sync::{Arc, Mutex},
+	};
 
-use ide::{AnalysisHost, FileId, RootDatabase};
-use ide_db::base_db::{SourceDatabase, all_crates};
-use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_into_db};
-use proc_macro_api::ProcMacroClient;
-use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace};
+	use ide::{AnalysisHost, FileId, RootDatabase};
+	use ide_db::base_db::{SourceDatabase, all_crates};
+	use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_into_db};
+	use proc_macro_api::ProcMacroClient;
+	use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace};
 use serde::Serialize;
 use vfs::{AbsPathBuf, Vfs, VfsPath};
 
-pub use crate::main_loop::analyzed_session::RustAnalyzerSession;
+const RUST_ANALYZER_VERSION: &str = "__ANALYZED_RA_VERSION__";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RustAnalyzerLspBoundary {
@@ -527,32 +533,360 @@ pub fn rust_analyzer_private_boundary() -> RustAnalyzerPrivateBoundary {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct RustAnalyzerSessionBoundary {
-    pub session: &'static str,
-    pub runner: &'static str,
-}
-
-pub fn rust_analyzer_session_boundary() -> RustAnalyzerSessionBoundary {
-    let _session_size = std::mem::size_of::<RustAnalyzerSession>();
-    let _runner = RustAnalyzerSession::run_connection;
-    let _lsp_runner = run_rust_analyzer_lsp_session;
-
-    RustAnalyzerSessionBoundary {
-        session: std::any::type_name::<RustAnalyzerSession>(),
-        runner: "ra_ap_rust_analyzer::main_loop::analyzed_session::RustAnalyzerSession::run_connection",
-    }
-}
-
-pub fn run_rust_analyzer_lsp_session(connection: lsp_server::Connection) -> anyhow::Result<()> {
-    crate::main_loop::analyzed_session::run_lsp_session(connection)
-}
-
 pub fn run_shared_rust_analyzer_lsp_session(
     connection: lsp_server::Connection,
     session: SharedAnalyzerSession,
 ) -> anyhow::Result<()> {
     crate::main_loop::analyzed_session::run_shared_lsp_session(connection, session)
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedAnalyzerBackendKey {
+    pub shared_world: SharedAnalyzerWorldKey,
+    pub workspace_view: SharedAnalyzerViewKey,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedAnalyzerWorldKey {
+    pub rust_analyzer_version: String,
+    pub toolchain: Option<String>,
+    pub sysroot: Option<String>,
+    pub cargo_target: Option<String>,
+    pub config: SharedAnalyzerWorldConfigKey,
+    pub load: SharedAnalyzerLoadKey,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedAnalyzerWorldConfigKey {
+    pub cargo: SharedAnalyzerCargoConfigKey,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedAnalyzerCargoConfigKey {
+    pub all_targets: bool,
+    pub features: String,
+    pub target: Option<String>,
+    pub sysroot: Option<String>,
+    pub sysroot_src: Option<String>,
+    pub rustc_source: Option<String>,
+    pub extra_includes: Vec<String>,
+    pub cfg_overrides: String,
+    pub wrap_rustc_in_build_scripts: bool,
+    pub invocation_strategy: String,
+    pub run_build_script_command: String,
+    pub extra_args: Vec<String>,
+    pub extra_env: Vec<(String, Option<String>)>,
+    pub target_dir_config: String,
+    pub set_test: bool,
+    pub no_deps: bool,
+    pub metadata_extra_args: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedAnalyzerLoadKey {
+    pub load_out_dirs_from_check: bool,
+    pub proc_macro_server: SharedAnalyzerProcMacroServerKey,
+    pub prefill_caches: bool,
+    pub num_worker_threads: u16,
+    pub proc_macro_processes: u16,
+}
+
+#[derive(Clone, Debug)]
+pub enum SharedAnalyzerProcMacroServerKey {
+    None,
+    Sysroot,
+    Explicit(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedAnalyzerViewKey {
+    pub workspace_roots: Vec<String>,
+    pub analysis: SharedAnalyzerAnalysisKey,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedAnalyzerAnalysisKey {
+    pub initialization_options: Option<String>,
+    pub workspace_configuration: Option<String>,
+}
+
+pub fn shared_analyzer_session_context(
+    initialize_params: &serde_json::Value,
+) -> anyhow::Result<SharedAnalyzerSessionContext> {
+    let lsp_types::InitializeParams {
+        root_uri,
+        capabilities,
+        workspace_folders,
+        initialization_options,
+        client_info,
+        ..
+    } = crate::from_json::<lsp_types::InitializeParams>("InitializeParams", initialize_params)?;
+    let root_path = root_path_from_initialize(root_uri)?;
+    let workspace_roots = workspace_roots_from_initialize(&root_path, workspace_folders)?;
+    let mut config = crate::config::Config::new(
+        root_path,
+        capabilities,
+        workspace_roots
+            .iter()
+            .filter_map(|root| AbsPathBuf::try_from(root.as_str()).ok())
+            .collect(),
+        client_info,
+    );
+
+    if let Some(json) = initialization_options.clone() {
+        let mut change = crate::config::ConfigChange::default();
+        change.change_client_config(json);
+
+        let errors: crate::config::ConfigErrors;
+        (config, errors, _) = config.apply_change(change);
+        if !errors.is_empty() {
+            tracing::warn!("rust-analyzer config errors while deriving backend key: {errors}");
+        }
+    }
+
+    if config.discover_workspace_config().is_none()
+        && !config.has_linked_projects()
+        && config.detached_files().is_empty()
+    {
+        config.rediscover_workspaces();
+    }
+
+    let cargo_config = config.cargo(None);
+    let load = shared_load_config_from_config(&config)?;
+    let analysis = SharedAnalyzerAnalysisKey {
+        initialization_options: initialization_options
+            .as_ref()
+            .map(canonical_json_string)
+            .transpose()?,
+        workspace_configuration: None,
+    };
+    let backend_key = SharedAnalyzerBackendKey {
+        shared_world: SharedAnalyzerWorldKey {
+            rust_analyzer_version: RUST_ANALYZER_VERSION.to_owned(),
+            toolchain: env::var("RUSTUP_TOOLCHAIN").ok(),
+            sysroot: env::var("RUST_SRC_PATH").ok(),
+            cargo_target: cargo_config
+                .target
+                .clone()
+                .or_else(|| env::var("CARGO_BUILD_TARGET").ok()),
+            config: SharedAnalyzerWorldConfigKey {
+                cargo: cargo_config_key(&cargo_config),
+            },
+            load: load.key.clone(),
+        },
+        workspace_view: SharedAnalyzerViewKey {
+            workspace_roots: workspace_roots.clone(),
+            analysis,
+        },
+    };
+
+    Ok(SharedAnalyzerSessionContext {
+        backend_key,
+        config: Arc::new(SharedAnalyzerConfig {
+            workspace_roots,
+            cargo_config,
+            load,
+        }),
+    })
+}
+
+pub struct SharedAnalyzerSessionContext {
+    pub backend_key: SharedAnalyzerBackendKey,
+    pub config: Arc<SharedAnalyzerConfig>,
+}
+
+pub struct SharedAnalyzerConfig {
+    workspace_roots: Vec<String>,
+    pub(crate) cargo_config: CargoConfig,
+    pub(crate) load: SharedLoadConfig,
+}
+
+impl SharedAnalyzerConfig {
+    pub fn workspace_roots(&self) -> &[String] {
+        &self.workspace_roots
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedLoadConfig {
+    key: SharedAnalyzerLoadKey,
+}
+
+impl SharedLoadConfig {
+    pub(crate) fn to_load_cargo_config(&self) -> LoadCargoConfig {
+        LoadCargoConfig {
+            load_out_dirs_from_check: self.key.load_out_dirs_from_check,
+            with_proc_macro_server: match &self.key.proc_macro_server {
+                SharedAnalyzerProcMacroServerKey::None => ProcMacroServerChoice::None,
+                SharedAnalyzerProcMacroServerKey::Sysroot => ProcMacroServerChoice::Sysroot,
+                SharedAnalyzerProcMacroServerKey::Explicit(path) => {
+                    ProcMacroServerChoice::Explicit(AbsPathBuf::assert_utf8(PathBuf::from(path)))
+                }
+            },
+            prefill_caches: self.key.prefill_caches,
+            num_worker_threads: self.key.num_worker_threads as usize,
+            proc_macro_processes: self.key.proc_macro_processes as usize,
+        }
+    }
+}
+
+fn root_path_from_initialize(root_uri: Option<lsp_types::Url>) -> anyhow::Result<AbsPathBuf> {
+    match root_uri
+        .and_then(|it| it.to_file_path().ok())
+        .map(patch_path_prefix)
+        .and_then(|it| std::fs::canonicalize(it).ok())
+        .and_then(|it| paths::Utf8PathBuf::from_path_buf(it).ok())
+        .and_then(|it| AbsPathBuf::try_from(it).ok())
+    {
+        Some(path) => Ok(path),
+        None => Ok(AbsPathBuf::assert_utf8(std::fs::canonicalize(env::current_dir()?)?)),
+    }
+}
+
+fn workspace_roots_from_initialize(
+    root_path: &AbsPathBuf,
+    workspace_folders: Option<Vec<lsp_types::WorkspaceFolder>>,
+) -> anyhow::Result<Vec<String>> {
+    let mut roots = workspace_folders
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|workspace| workspace.uri.to_file_path().ok())
+        .map(patch_path_prefix)
+        .map(std::fs::canonicalize)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    if roots.is_empty() {
+        roots.push(root_path.to_string());
+    }
+
+    roots.sort();
+    roots.dedup();
+
+    Ok(roots)
+}
+
+fn shared_load_config_from_config(
+    config: &crate::config::Config,
+) -> anyhow::Result<SharedLoadConfig> {
+    Ok(SharedLoadConfig {
+        key: SharedAnalyzerLoadKey {
+            load_out_dirs_from_check: config.run_build_scripts(None),
+            proc_macro_server: if config.expand_proc_macros() {
+                config
+                    .proc_macro_srv()
+                    .map(|path| SharedAnalyzerProcMacroServerKey::Explicit(path.to_string()))
+                    .unwrap_or(SharedAnalyzerProcMacroServerKey::Sysroot)
+            } else {
+                SharedAnalyzerProcMacroServerKey::None
+            },
+            prefill_caches: config.prefill_caches(),
+            num_worker_threads: u16::try_from(config.prime_caches_num_threads())?,
+            proc_macro_processes: u16::try_from(config.proc_macro_num_processes())?,
+        },
+    })
+}
+
+fn cargo_config_key(config: &CargoConfig) -> SharedAnalyzerCargoConfigKey {
+    let mut extra_env = config
+        .extra_env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    extra_env.sort();
+
+    SharedAnalyzerCargoConfigKey {
+        all_targets: config.all_targets,
+        features: format!("{:?}", config.features),
+        target: config.target.clone(),
+        sysroot: config.sysroot.as_ref().map(|it| format!("{it:?}")),
+        sysroot_src: config.sysroot_src.as_ref().map(ToString::to_string),
+        rustc_source: config.rustc_source.as_ref().map(|it| format!("{it:?}")),
+        extra_includes: config
+            .extra_includes
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        cfg_overrides: format!("{:?}", config.cfg_overrides),
+        wrap_rustc_in_build_scripts: config.wrap_rustc_in_build_scripts,
+        invocation_strategy: format!("{:?}", config.invocation_strategy),
+        run_build_script_command: format!("{:?}", config.run_build_script_command),
+        extra_args: config.extra_args.clone(),
+        extra_env,
+        target_dir_config: format!("{:?}", config.target_dir_config),
+        set_test: config.set_test,
+        no_deps: config.no_deps,
+        metadata_extra_args: config.metadata_extra_args.clone(),
+    }
+}
+
+fn canonical_json_string(value: &serde_json::Value) -> anyhow::Result<String> {
+    let mut output = String::new();
+    write_canonical_json(value, &mut output)?;
+    Ok(output)
+}
+
+fn write_canonical_json(value: &serde_json::Value, output: &mut String) -> anyhow::Result<()> {
+    match value {
+        serde_json::Value::Null => output.push_str("null"),
+        serde_json::Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        serde_json::Value::Number(value) => output.push_str(&value.to_string()),
+        serde_json::Value::String(value) => output.push_str(&serde_json::to_string(value)?),
+        serde_json::Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push('{');
+            for (index, (key, value)) in
+                values.iter().collect::<BTreeMap<_, _>>().iter().enumerate()
+            {
+                if index != 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key)?);
+                output.push(':');
+                write_canonical_json(value, output)?;
+            }
+            output.push('}');
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn patch_path_prefix(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    if cfg!(windows) {
+        let mut components = path.components();
+        match components.next() {
+            Some(Component::Prefix(prefix)) => {
+                let prefix = match prefix.kind() {
+                    Prefix::Disk(disk) => format!("{}:", disk.to_ascii_uppercase() as char),
+                    Prefix::VerbatimDisk(disk) => {
+                        format!(r"\\?\{}:", disk.to_ascii_uppercase() as char)
+                    }
+                    _ => return path,
+                };
+                let mut path = PathBuf::new();
+                path.push(prefix);
+                path.extend(components);
+                path
+            }
+            _ => path,
+        }
+    } else {
+        path
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -568,11 +902,16 @@ pub struct WorkspaceSummary {
 pub struct SharedAnalyzerSession {
     world: Arc<Mutex<SharedWorld>>,
     view: WorkspaceView,
+    config: Arc<SharedAnalyzerConfig>,
 }
 
 impl SharedAnalyzerSession {
-    pub fn new(world: Arc<Mutex<SharedWorld>>, view: WorkspaceView) -> Self {
-        Self { world, view }
+    pub fn new(
+        world: Arc<Mutex<SharedWorld>>,
+        view: WorkspaceView,
+        config: Arc<SharedAnalyzerConfig>,
+    ) -> Self {
+        Self { world, view, config }
     }
 
     pub fn snapshot(&self) -> anyhow::Result<SharedAnalyzerSnapshot> {
@@ -581,13 +920,14 @@ impl SharedAnalyzerSession {
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
 
-        world.snapshot(&self.view)
+        world.snapshot(&self.view, Arc::clone(&self.config))
     }
 }
 
 pub struct SharedAnalyzerSnapshot {
     pub(crate) workspaces: Vec<ProjectWorkspace>,
     pub(crate) files: Vec<SharedAnalyzerFile>,
+    pub(crate) config: Arc<SharedAnalyzerConfig>,
 }
 
 pub struct SharedAnalyzerFile {
@@ -756,7 +1096,7 @@ impl SessionOverlayCrate {
     }
 }
 
-pub struct LoadedWorkspace {
+struct LoadedWorkspace {
     summary: WorkspaceSummary,
     workspace: ProjectWorkspace,
     _vfs: Vfs,
@@ -764,62 +1104,8 @@ pub struct LoadedWorkspace {
 }
 
 impl LoadedWorkspace {
-    pub fn summary(&self) -> &WorkspaceSummary {
+    fn summary(&self) -> &WorkspaceSummary {
         &self.summary
-    }
-}
-
-pub struct BackendCore {
-    world: SharedWorld,
-    view: WorkspaceView,
-}
-
-impl BackendCore {
-    pub fn new() -> Self {
-        Self {
-            world: SharedWorld::new(),
-            view: WorkspaceView::new(Vec::new()),
-        }
-    }
-
-    pub fn load_workspace_roots<I, P>(roots: I) -> anyhow::Result<Self>
-    where
-        I: IntoIterator<Item = P>,
-        P: AsRef<Path>,
-    {
-        let mut core = Self::new();
-        let mut workspaces = Vec::new();
-
-        for root in roots {
-            workspaces.push(core.world.load_cargo_workspace(root)?);
-        }
-        core.view = WorkspaceView::new(workspaces);
-
-        Ok(core)
-    }
-
-    pub fn load_cargo_workspace(
-        &mut self,
-        root: impl AsRef<Path>,
-    ) -> anyhow::Result<&WorkspaceSummary> {
-        let index = self.world.load_cargo_workspace(root)?;
-        self.view.push_workspace(index);
-
-        self.world
-            .workspace_summary(index)
-            .ok_or_else(|| anyhow::format_err!("loaded workspace index is unavailable"))
-    }
-
-    pub fn workspace_summaries(&self) -> impl Iterator<Item = &WorkspaceSummary> {
-        self.view.workspace_summaries(&self.world)
-    }
-
-    pub fn shared_world(&self) -> &SharedWorld {
-        &self.world
-    }
-
-    pub fn workspace_view(&self) -> &WorkspaceView {
-        &self.view
     }
 }
 
@@ -840,14 +1126,18 @@ impl SharedWorld {
         }
     }
 
-    pub fn load_cargo_workspace(&mut self, root: impl AsRef<Path>) -> anyhow::Result<usize> {
+    pub fn load_cargo_workspace(
+        &mut self,
+        root: impl AsRef<Path>,
+        config: &SharedAnalyzerConfig,
+    ) -> anyhow::Result<usize> {
         let root = AbsPathBuf::assert_utf8(std::fs::canonicalize(root)?);
         let root_key = root.to_string();
         if let Some(index) = self.workspace_indexes.get(&root_key) {
             return Ok(*index);
         }
 
-        let loaded = load_cargo_workspace_into_host(&mut self.host, root)?;
+        let loaded = load_cargo_workspace_into_host(&mut self.host, root, config)?;
         let index = self.loaded_workspaces.len();
         self.loaded_workspaces.push(loaded);
         self.workspace_indexes.insert(root_key, index);
@@ -860,7 +1150,11 @@ impl SharedWorld {
         self.loaded_workspaces.get(index).map(LoadedWorkspace::summary)
     }
 
-    pub fn snapshot(&self, view: &WorkspaceView) -> anyhow::Result<SharedAnalyzerSnapshot> {
+    pub fn snapshot(
+        &self,
+        view: &WorkspaceView,
+        config: Arc<SharedAnalyzerConfig>,
+    ) -> anyhow::Result<SharedAnalyzerSnapshot> {
         let db = self.host.raw_database();
         let mut workspaces = Vec::new();
         let mut files = Vec::new();
@@ -883,7 +1177,11 @@ impl SharedWorld {
             }
         }
 
-        Ok(SharedAnalyzerSnapshot { workspaces, files })
+        Ok(SharedAnalyzerSnapshot {
+            workspaces,
+            files,
+            config,
+        })
     }
 
     pub fn workspace_file(&self, path: impl AsRef<Path>) -> anyhow::Result<(FileId, VfsPath)> {
@@ -1049,34 +1347,26 @@ impl WorkspaceView {
     }
 }
 
-impl Default for BackendCore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 fn load_cargo_workspace_into_host(
     host: &mut AnalysisHost,
     root: impl AsRef<Path>,
+    config: &SharedAnalyzerConfig,
 ) -> anyhow::Result<LoadedWorkspace> {
-    let cargo_config = CargoConfig::default();
-    let load_config = LoadCargoConfig {
-        load_out_dirs_from_check: false,
-        with_proc_macro_server: ProcMacroServerChoice::Sysroot,
-        prefill_caches: false,
-        num_worker_threads: 1,
-        proc_macro_processes: 1,
-    };
     let root = AbsPathBuf::assert_utf8(std::fs::canonicalize(root)?);
     let manifest = ProjectManifest::discover_single(&root)?;
     let manifest_path = manifest.manifest_path().clone();
-    let workspace = ProjectWorkspace::load(manifest, &cargo_config, &|_| {})?;
+    let workspace = ProjectWorkspace::load(manifest, &config.cargo_config, &|_| {})?;
     let root = workspace.workspace_root().to_string();
     let packages = workspace.n_packages();
     let workspace_for_session = workspace.clone();
     let (vfs, proc_macro_client) = {
         let db = host.raw_database_mut();
-        load_workspace_into_db(workspace, &cargo_config.extra_env, &load_config, db)?
+        load_workspace_into_db(
+            workspace,
+            &config.cargo_config.extra_env,
+            &config.load.to_load_cargo_config(),
+            db,
+        )?
     };
     let files = vfs.iter().count();
 
@@ -1123,7 +1413,7 @@ fn package_instance_key(db: &RootDatabase, krate: ide::Crate) -> anyhow::Result<
 const MAIN_LOOP_SESSION_MODULE: &str = r#"
 
 pub(crate) mod analyzed_session {
-    use std::{env, path::PathBuf, sync::Once};
+    use std::{env, sync::Once};
 
     use crossbeam_channel::{Receiver, Sender};
     use lsp_server::{Connection, Message};
@@ -1133,80 +1423,46 @@ pub(crate) mod analyzed_session {
     use vfs::AbsPathBuf;
 
     use crate::{
-        analyzed_bridge::{SharedAnalyzerFile, SharedAnalyzerSession, SharedAnalyzerSnapshot},
+        analyzed_bridge::{
+            SharedAnalyzerConfig, SharedAnalyzerFile, SharedAnalyzerSession, SharedAnalyzerSnapshot,
+            patch_path_prefix,
+        },
         config::{Config, ConfigChange, ConfigErrors},
         from_json, server_capabilities, version,
         line_index::LineEndings,
     };
 
-    pub struct RustAnalyzerSession {
+    pub(crate) struct RustAnalyzerSession {
         state: crate::global_state::GlobalState,
     }
 
     impl RustAnalyzerSession {
-        pub fn new(sender: Sender<Message>, config: crate::config::Config) -> Self {
+        pub(crate) fn new(sender: Sender<Message>, config: crate::config::Config) -> Self {
             Self {
                 state: crate::global_state::GlobalState::new(sender, config),
             }
         }
 
-        pub fn new_with_shared_snapshot(
+        pub(crate) fn new_with_shared_snapshot(
             sender: Sender<Message>,
             config: crate::config::Config,
             snapshot: SharedAnalyzerSnapshot,
         ) -> anyhow::Result<Self> {
             let mut session = Self::new(sender, config);
             let workspaces = snapshot.workspaces;
+            let shared_config = snapshot.config;
             let (vfs, line_endings) = vfs_from_shared_files(snapshot.files)?;
 
-            load_shared_workspaces_into_host(&mut session.state, &workspaces)?;
+            load_shared_workspaces_into_host(&mut session.state, &workspaces, &shared_config)?;
             session.state.vfs = Arc::new(parking_lot::RwLock::new((vfs, line_endings)));
             install_shared_workspaces(&mut session.state, workspaces);
 
             Ok(session)
         }
 
-        pub fn run(self, receiver: Receiver<Message>) -> anyhow::Result<()> {
-            self.state.run(receiver)
-        }
-
-        pub fn run_shared(self, receiver: Receiver<Message>) -> anyhow::Result<()> {
+        pub(crate) fn run_shared(self, receiver: Receiver<Message>) -> anyhow::Result<()> {
             run_shared_state(self.state, receiver)
         }
-
-        pub fn run_connection(
-            config: crate::config::Config,
-            connection: Connection,
-        ) -> anyhow::Result<()> {
-            Self::new(connection.sender, config).run(connection.receiver)
-        }
-    }
-
-    pub(crate) fn run_lsp_session(connection: Connection) -> anyhow::Result<()> {
-        let (initialize_id, initialize_params) = connection.initialize_start()?;
-        tracing::info!("InitializeParams: {}", initialize_params);
-        let mut config = config_from_initialize_params(&connection, &initialize_params)?;
-        let initialize_result = lsp_types::InitializeResult {
-            capabilities: server_capabilities(&config),
-            server_info: Some(lsp_types::ServerInfo {
-                name: String::from("rust-analyzer"),
-                version: Some(version().to_string()),
-            }),
-            offset_encoding: None,
-        };
-
-        connection.initialize_finish(initialize_id, serde_json::to_value(initialize_result)?)?;
-
-        if config.discover_workspace_config().is_none()
-            && !config.has_linked_projects()
-            && config.detached_files().is_empty()
-        {
-            config.rediscover_workspaces();
-        }
-
-        initialize_rayon();
-        let Connection { sender, receiver } = connection;
-        RustAnalyzerSession::new(sender, config).run(receiver)
     }
 
     pub(crate) fn run_shared_lsp_session(
@@ -1243,15 +1499,9 @@ pub(crate) mod analyzed_session {
     fn load_shared_workspaces_into_host(
         state: &mut crate::global_state::GlobalState,
         workspaces: &[project_model::ProjectWorkspace],
+        config: &SharedAnalyzerConfig,
     ) -> anyhow::Result<()> {
-        let cargo_config = project_model::CargoConfig::default();
-        let load_config = load_cargo::LoadCargoConfig {
-            load_out_dirs_from_check: false,
-            with_proc_macro_server: load_cargo::ProcMacroServerChoice::Sysroot,
-            prefill_caches: false,
-            num_worker_threads: 1,
-            proc_macro_processes: 1,
-        };
+        let load_config = config.load.to_load_cargo_config();
         let mut proc_macro_clients = Vec::new();
 
         for workspace in workspaces {
@@ -1259,7 +1509,7 @@ pub(crate) mod analyzed_session {
                 let db = state.analysis_host.raw_database_mut();
                 load_cargo::load_workspace_into_db(
                     workspace.clone(),
-                    &cargo_config.extra_env,
+                    &config.cargo_config.extra_env,
                     &load_config,
                     db,
                 )?
@@ -1462,32 +1712,6 @@ pub(crate) mod analyzed_session {
                 .thread_name(|index| format!("RayonWorker{index}"))
                 .build_global();
         });
-    }
-
-    fn patch_path_prefix(path: PathBuf) -> PathBuf {
-        use std::path::{Component, Prefix};
-
-        if cfg!(windows) {
-            let mut components = path.components();
-            match components.next() {
-                Some(Component::Prefix(prefix)) => {
-                    let prefix = match prefix.kind() {
-                        Prefix::Disk(disk) => format!("{}:", disk.to_ascii_uppercase() as char),
-                        Prefix::VerbatimDisk(disk) => {
-                            format!(r"\\?\{}:", disk.to_ascii_uppercase() as char)
-                        }
-                        _ => return path,
-                    };
-                    let mut path = PathBuf::new();
-                    path.push(prefix);
-                    path.extend(components);
-                    path
-                }
-                _ => path,
-            }
-        } else {
-            path
-        }
     }
 }
 "#;

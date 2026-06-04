@@ -14,16 +14,16 @@ use std::{
 };
 
 use analyzed_ipc::{
-    AnalysisConfigKey, BackendKey, BackendSnapshot, ClientInfo, DaemonRequest, DaemonResponse,
-    DaemonSnapshot, Hello, LspSession, ProtocolError, RUST_ANALYZER_VERSION, RuntimePaths,
-    SharedWorldKey, SharedWorldLoadKey, StartupLock, Stop, WorkspaceSnapshot, WorkspaceViewKey,
-    bind_listener, read_json_line, write_json_line,
+    AnalysisConfigKey, BackendKey, BackendSnapshot, CargoConfigKey, ClientInfo, DaemonRequest,
+    DaemonResponse, DaemonSnapshot, Hello, LspSession, ProcMacroServerKey, ProtocolError,
+    RUST_ANALYZER_VERSION, RuntimePaths, SharedWorldConfigKey, SharedWorldKey, SharedWorldLoadKey,
+    StartupLock, Stop, WorkspaceSnapshot, WorkspaceViewKey, bind_listener, read_json_line,
+    write_json_line,
 };
-use analyzed_ra::{SharedAnalyzerSession, SharedWorld, WorkspaceView};
+use analyzed_ra::{SharedAnalyzerConfig, SharedAnalyzerSession, SharedWorld, WorkspaceView};
 use crossbeam_channel::unbounded;
 use daemonize::Daemonize;
 use lsp_server::{Connection, Message};
-use lsp_types::InitializeParams;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -262,12 +262,13 @@ impl ServiceState {
     fn register_backend_session(
         self: &Arc<Self>,
         key: BackendKey,
+        shared_config: Arc<SharedAnalyzerConfig>,
     ) -> anyhow::Result<BackendSession> {
         let shared_session = self
             .backends
             .lock()
             .map_err(|error| anyhow::format_err!("backend registry mutex is poisoned: {error}"))?
-            .register(key.clone())?;
+            .register(key.clone(), shared_config)?;
 
         Ok(BackendSession {
             state: Arc::clone(self),
@@ -290,7 +291,11 @@ struct BackendRegistry {
 }
 
 impl BackendRegistry {
-    fn load(&mut self, key: &BackendKey) -> anyhow::Result<()> {
+    fn load(
+        &mut self,
+        key: &BackendKey,
+        shared_config: &Arc<SharedAnalyzerConfig>,
+    ) -> anyhow::Result<()> {
         if let Entry::Vacant(entry) = self.worlds.entry(key.shared_world.clone()) {
             entry.insert(SharedWorldEntry {
                 client_sessions: 0,
@@ -309,8 +314,8 @@ impl BackendRegistry {
                 })?;
                 let mut workspaces = Vec::new();
 
-                for root in &key.workspace_view.workspace_roots {
-                    workspaces.push(world.load_cargo_workspace(Path::new(root))?);
+                for root in shared_config.workspace_roots() {
+                    workspaces.push(world.load_cargo_workspace(Path::new(root), shared_config)?);
                 }
 
                 WorkspaceView::new(workspaces)
@@ -327,8 +332,12 @@ impl BackendRegistry {
         Ok(())
     }
 
-    fn register(&mut self, key: BackendKey) -> anyhow::Result<SharedAnalyzerSession> {
-        self.load(&key)?;
+    fn register(
+        &mut self,
+        key: BackendKey,
+        shared_config: Arc<SharedAnalyzerConfig>,
+    ) -> anyhow::Result<SharedAnalyzerSession> {
+        self.load(&key, &shared_config)?;
         self.worlds
             .get_mut(&key.shared_world)
             .expect("shared world was loaded")
@@ -338,10 +347,14 @@ impl BackendRegistry {
             .expect("workspace view was loaded")
             .client_sessions += 1;
 
-        self.shared_session(&key)
+        self.shared_session(&key, shared_config)
     }
 
-    fn shared_session(&self, key: &BackendKey) -> anyhow::Result<SharedAnalyzerSession> {
+    fn shared_session(
+        &self,
+        key: &BackendKey,
+        shared_config: Arc<SharedAnalyzerConfig>,
+    ) -> anyhow::Result<SharedAnalyzerSession> {
         let world = self
             .worlds
             .get(&key.shared_world)
@@ -354,6 +367,7 @@ impl BackendRegistry {
         Ok(SharedAnalyzerSession::new(
             Arc::clone(&world.world),
             view.view.clone(),
+            shared_config,
         ))
     }
 
@@ -505,8 +519,11 @@ fn handle_lsp_session(
     _session_id: usize,
 ) -> anyhow::Result<()> {
     let (connection, threads, context) = lsp_stream_connection(stream)?;
-    let LspSessionContext { backend_key } = context;
-    let backend_session = state.register_backend_session(backend_key)?;
+    let LspSessionContext {
+        backend_key,
+        shared_config,
+    } = context;
+    let backend_session = state.register_backend_session(backend_key, shared_config)?;
     let result = analyzed_ra::run_shared_rust_analyzer_lsp_session(
         connection,
         backend_session.shared_session.clone(),
@@ -522,6 +539,7 @@ fn handle_lsp_session(
 
 struct LspSessionContext {
     backend_key: BackendKey,
+    shared_config: Arc<SharedAnalyzerConfig>,
 }
 
 fn lsp_stream_connection(
@@ -576,109 +594,72 @@ fn lsp_session_context(message: &Message) -> anyhow::Result<LspSessionContext> {
         );
     }
 
-    let params = serde_json::from_value::<InitializeParams>(request.params.clone())?;
-    let workspace_roots = workspace_roots_from_initialize(&params)?;
-    let initialization_options = params
-        .initialization_options
-        .as_ref()
-        .map(canonical_json_string)
-        .transpose()?;
+    let context = analyzed_ra::shared_analyzer_session_context(&request.params)?;
 
     Ok(LspSessionContext {
-        backend_key: BackendKey {
-            shared_world: SharedWorldKey {
-                rust_analyzer_version: RUST_ANALYZER_VERSION.to_owned(),
-                toolchain: env::var("RUSTUP_TOOLCHAIN").ok(),
-                sysroot: env::var("RUST_SRC_PATH").ok(),
-                cargo_target: env::var("CARGO_BUILD_TARGET").ok(),
-                load: SharedWorldLoadKey {
-                    load_out_dirs_from_check: false,
-                    with_proc_macro_server: true,
-                    prefill_caches: false,
-                    num_worker_threads: 1,
-                    proc_macro_processes: 1,
-                },
-            },
-            workspace_view: WorkspaceViewKey {
-                workspace_roots,
-                analysis: AnalysisConfigKey {
-                    initialization_options,
-                    workspace_configuration: None,
-                },
-            },
-        },
+        backend_key: backend_key_from_shared(context.backend_key),
+        shared_config: context.config,
     })
 }
 
-fn workspace_roots_from_initialize(params: &InitializeParams) -> anyhow::Result<Vec<String>> {
-    let mut roots = Vec::new();
-
-    if let Some(workspace_folders) = &params.workspace_folders {
-        for workspace in workspace_folders {
-            roots.push(canonical_uri_path(&workspace.uri)?);
-        }
+fn backend_key_from_shared(key: analyzed_ra::SharedAnalyzerBackendKey) -> BackendKey {
+    BackendKey {
+        shared_world: SharedWorldKey {
+            rust_analyzer_version: key.shared_world.rust_analyzer_version,
+            toolchain: key.shared_world.toolchain,
+            sysroot: key.shared_world.sysroot,
+            cargo_target: key.shared_world.cargo_target,
+            config: SharedWorldConfigKey {
+                cargo: cargo_config_key_from_shared(key.shared_world.config.cargo),
+            },
+            load: load_key_from_shared(key.shared_world.load),
+        },
+        workspace_view: WorkspaceViewKey {
+            workspace_roots: key.workspace_view.workspace_roots,
+            analysis: AnalysisConfigKey {
+                initialization_options: key.workspace_view.analysis.initialization_options,
+                workspace_configuration: key.workspace_view.analysis.workspace_configuration,
+            },
+        },
     }
-    if roots.is_empty()
-        && let Some(root_uri) = &params.root_uri
-    {
-        roots.push(canonical_uri_path(root_uri)?);
-    }
-    if roots.is_empty() {
-        roots.push(env::current_dir()?.to_string_lossy().into_owned());
-    }
-
-    roots.sort();
-    roots.dedup();
-
-    Ok(roots)
 }
 
-fn canonical_uri_path(uri: &lsp_types::Url) -> anyhow::Result<String> {
-    let path = uri
-        .to_file_path()
-        .map_err(|()| anyhow::anyhow!("workspace uri is not a file path: {uri}"))?;
-    Ok(fs::canonicalize(path)?.to_string_lossy().into_owned())
+fn cargo_config_key_from_shared(key: analyzed_ra::SharedAnalyzerCargoConfigKey) -> CargoConfigKey {
+    CargoConfigKey {
+        all_targets: key.all_targets,
+        features: key.features,
+        target: key.target,
+        sysroot: key.sysroot,
+        sysroot_src: key.sysroot_src,
+        rustc_source: key.rustc_source,
+        extra_includes: key.extra_includes,
+        cfg_overrides: key.cfg_overrides,
+        wrap_rustc_in_build_scripts: key.wrap_rustc_in_build_scripts,
+        invocation_strategy: key.invocation_strategy,
+        run_build_script_command: key.run_build_script_command,
+        extra_args: key.extra_args,
+        extra_env: key.extra_env,
+        target_dir_config: key.target_dir_config,
+        set_test: key.set_test,
+        no_deps: key.no_deps,
+        metadata_extra_args: key.metadata_extra_args,
+    }
 }
 
-fn canonical_json_string(value: &serde_json::Value) -> anyhow::Result<String> {
-    let mut output = String::new();
-    write_canonical_json(value, &mut output)?;
-    Ok(output)
-}
-
-fn write_canonical_json(value: &serde_json::Value, output: &mut String) -> anyhow::Result<()> {
-    match value {
-        serde_json::Value::Null => output.push_str("null"),
-        serde_json::Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
-        serde_json::Value::Number(value) => output.push_str(&value.to_string()),
-        serde_json::Value::String(value) => output.push_str(&serde_json::to_string(value)?),
-        serde_json::Value::Array(values) => {
-            output.push('[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(',');
-                }
-                write_canonical_json(value, output)?;
+fn load_key_from_shared(key: analyzed_ra::SharedAnalyzerLoadKey) -> SharedWorldLoadKey {
+    SharedWorldLoadKey {
+        load_out_dirs_from_check: key.load_out_dirs_from_check,
+        proc_macro_server: match key.proc_macro_server {
+            analyzed_ra::SharedAnalyzerProcMacroServerKey::None => ProcMacroServerKey::None,
+            analyzed_ra::SharedAnalyzerProcMacroServerKey::Sysroot => ProcMacroServerKey::Sysroot,
+            analyzed_ra::SharedAnalyzerProcMacroServerKey::Explicit(path) => {
+                ProcMacroServerKey::Explicit(path)
             }
-            output.push(']');
-        }
-        serde_json::Value::Object(values) => {
-            output.push('{');
-            for (index, (key, value)) in
-                values.iter().collect::<BTreeMap<_, _>>().iter().enumerate()
-            {
-                if index != 0 {
-                    output.push(',');
-                }
-                output.push_str(&serde_json::to_string(key)?);
-                output.push(':');
-                write_canonical_json(value, output)?;
-            }
-            output.push('}');
-        }
+        },
+        prefill_caches: key.prefill_caches,
+        num_worker_threads: key.num_worker_threads,
+        proc_macro_processes: key.proc_macro_processes,
     }
-
-    Ok(())
 }
 
 fn validate_client(client: &ClientInfo) -> Option<ProtocolError> {
