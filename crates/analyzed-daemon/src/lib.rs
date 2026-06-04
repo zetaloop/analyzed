@@ -390,6 +390,8 @@ impl BackendRegistry {
                 Some(BackendSnapshot {
                     key: key.clone(),
                     client_sessions: entry.client_sessions,
+                    overlay_sessions: active_overlay_sessions(&world.world),
+                    overlay_files: overlay_files(&world.world),
                     workspace_loads: workspace_snapshots(&world.world, &entry.view),
                 })
             })
@@ -433,6 +435,20 @@ fn workspace_snapshots(
             proc_macro_server: summary.proc_macro_server,
         })
         .collect()
+}
+
+fn active_overlay_sessions(world: &Arc<Mutex<SharedWorld>>) -> usize {
+    world
+        .lock()
+        .expect("shared world mutex poisoned")
+        .active_overlay_sessions()
+}
+
+fn overlay_files(world: &Arc<Mutex<SharedWorld>>) -> usize {
+    world
+        .lock()
+        .expect("shared world mutex poisoned")
+        .overlay_files()
 }
 
 struct BackendSession {

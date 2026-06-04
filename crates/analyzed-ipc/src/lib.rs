@@ -187,6 +187,8 @@ pub struct AnalysisConfigKey {
 pub struct BackendSnapshot {
     pub key: BackendKey,
     pub client_sessions: usize,
+    pub overlay_sessions: usize,
+    pub overlay_files: usize,
     pub workspace_loads: Vec<WorkspaceSnapshot>,
 }
 
