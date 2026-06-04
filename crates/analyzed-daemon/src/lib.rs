@@ -347,14 +347,10 @@ impl BackendRegistry {
             .expect("workspace view was loaded")
             .client_sessions += 1;
 
-        self.shared_session(&key, shared_config)
+        self.shared_session(&key)
     }
 
-    fn shared_session(
-        &self,
-        key: &BackendKey,
-        shared_config: Arc<SharedAnalyzerConfig>,
-    ) -> anyhow::Result<SharedAnalyzerSession> {
+    fn shared_session(&self, key: &BackendKey) -> anyhow::Result<SharedAnalyzerSession> {
         let world = self
             .worlds
             .get(&key.shared_world)
@@ -367,7 +363,6 @@ impl BackendRegistry {
         Ok(SharedAnalyzerSession::new(
             Arc::clone(&world.world),
             view.view.clone(),
-            shared_config,
         ))
     }
 

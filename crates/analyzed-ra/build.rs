@@ -30,6 +30,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let generated_src = generated.join("src");
 
     rewrite_lib_header(&generated_src.join("lib.rs"))?;
+    patch_global_state_source(&generated_src.join("global_state.rs"))?;
+    patch_main_loop_source(&generated_src.join("main_loop.rs"))?;
     write_bridge_module(&generated_src.join("analyzed_bridge.rs"), &package.version)?;
     append_main_loop_session_module(&generated_src.join("main_loop.rs"))?;
     append_bridge_export(&generated_src.join("lib.rs"))?;
@@ -469,6 +471,124 @@ fn rewrite_lib_header(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(global_state_rs)?;
+
+    replace_once(
+        &mut source,
+        "    pub(crate) analysis_host: AnalysisHost,\n    pub(crate) diagnostics: DiagnosticCollection,\n",
+        "    pub(crate) analysis_host: AnalysisHost,\n    pub(crate) analyzed_shared: Option<crate::analyzed_bridge::SharedAnalyzerRuntime>,\n    pub(crate) diagnostics: DiagnosticCollection,\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    pub(crate) analysis: Analysis,\n    pub(crate) check_fixes: CheckFixes,\n",
+        "    pub(crate) analysis: Analysis,\n    pub(crate) analyzed_shared: Option<crate::analyzed_bridge::SharedAnalyzerRuntime>,\n    pub(crate) check_fixes: CheckFixes,\n",
+    )?;
+    replace_once(
+        &mut source,
+        "            analysis_host,\n            diagnostics: Default::default(),\n",
+        "            analysis_host,\n            analyzed_shared: None,\n            diagnostics: Default::default(),\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    pub(crate) fn process_changes(&mut self) -> bool {\n        let _p = span!(Level::INFO, \"GlobalState::process_changes\").entered();\n",
+        "    pub(crate) fn process_changes(&mut self) -> bool {\n        let _p = span!(Level::INFO, \"GlobalState::process_changes\").entered();\n        if self.analyzed_shared.is_some() {\n            return self.analyzed_process_shared_changes();\n        }\n",
+    )?;
+    replace_once(
+        &mut source,
+        "            workspaces: Arc::clone(&self.workspaces),\n            analysis: self.analysis_host.analysis(),\n            vfs: Arc::clone(&self.vfs),\n",
+        "            workspaces: Arc::clone(&self.workspaces),\n            analysis: self\n                .analyzed_shared\n                .as_ref()\n                .map_or_else(|| self.analysis_host.analysis(), |shared| shared.analysis()),\n            analyzed_shared: self.analyzed_shared.clone(),\n            vfs: Arc::clone(&self.vfs),\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {\n        url_to_file_id(&self.vfs_read(), url)\n    }\n",
+        "    pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {\n        if let Some(shared) = &self.analyzed_shared {\n            return shared.url_to_file_id(url);\n        }\n        url_to_file_id(&self.vfs_read(), url)\n    }\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    pub(crate) fn file_id_to_url(&self, id: FileId) -> Url {\n        file_id_to_url(&self.vfs_read(), id)\n    }\n",
+        "    pub(crate) fn file_id_to_url(&self, id: FileId) -> Url {\n        if let Some(shared) = &self.analyzed_shared\n            && let Some(url) = shared.file_id_to_url(id)\n        {\n            return url;\n        }\n        file_id_to_url(&self.vfs_read(), id)\n    }\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    pub(crate) fn vfs_path_to_file_id(&self, vfs_path: &VfsPath) -> anyhow::Result<Option<FileId>> {\n        vfs_path_to_file_id(&self.vfs_read(), vfs_path)\n    }\n",
+        "    pub(crate) fn vfs_path_to_file_id(&self, vfs_path: &VfsPath) -> anyhow::Result<Option<FileId>> {\n        if let Some(shared) = &self.analyzed_shared {\n            return shared.vfs_path_to_file_id(vfs_path);\n        }\n        vfs_path_to_file_id(&self.vfs_read(), vfs_path)\n    }\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    pub(crate) fn file_line_index(&self, file_id: FileId) -> Cancellable<LineIndex> {\n        let endings = self.vfs.read().1[&file_id];\n        let index = self.analysis.file_line_index(file_id)?;\n",
+        "    pub(crate) fn file_line_index(&self, file_id: FileId) -> Cancellable<LineIndex> {\n        let endings = self\n            .analyzed_shared\n            .as_ref()\n            .and_then(|shared| shared.line_endings(file_id))\n            .unwrap_or_else(|| self.vfs.read().1[&file_id]);\n        let index = self.analysis.file_line_index(file_id)?;\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    pub(crate) fn file_version(&self, file_id: FileId) -> Option<i32> {\n        Some(self.mem_docs.get(self.vfs_read().file_path(file_id))?.version)\n    }\n",
+        "    pub(crate) fn file_version(&self, file_id: FileId) -> Option<i32> {\n        let path = self.file_id_to_file_path(file_id);\n        Some(self.mem_docs.get(&path)?.version)\n    }\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    pub(crate) fn anchored_path(&self, path: &AnchoredPathBuf) -> Url {\n        let mut base = self.vfs_read().file_path(path.anchor).clone();\n",
+        "    pub(crate) fn anchored_path(&self, path: &AnchoredPathBuf) -> Url {\n        let mut base = self.file_id_to_file_path(path.anchor);\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    pub(crate) fn file_id_to_file_path(&self, file_id: FileId) -> vfs::VfsPath {\n        self.vfs_read().file_path(file_id).clone()\n    }\n",
+        "    pub(crate) fn file_id_to_file_path(&self, file_id: FileId) -> vfs::VfsPath {\n        if let Some(shared) = &self.analyzed_shared\n            && let Some(path) = shared.file_id_to_vfs_path(file_id)\n        {\n            return path;\n        }\n        self.vfs_read().file_path(file_id).clone()\n    }\n",
+    )?;
+    replace_once(
+        &mut source,
+        "        let path = self.vfs_read().file_path(file_id).clone();\n        let path = path.as_path()?;\n",
+        "        let path = self.file_id_to_file_path(file_id);\n        let path = path.as_path()?;\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    pub(crate) fn file_exists(&self, file_id: FileId) -> bool {\n        self.vfs.read().0.exists(file_id)\n    }\n",
+        "    pub(crate) fn file_exists(&self, file_id: FileId) -> bool {\n        if let Some(shared) = &self.analyzed_shared\n            && let Some(exists) = shared.file_exists(file_id)\n        {\n            return exists;\n        }\n        self.vfs.read().0.exists(file_id)\n    }\n",
+    )?;
+
+    fs::write(global_state_rs, source)?;
+    Ok(())
+}
+
+fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(main_loop_rs)?;
+
+    replace_once(
+        &mut source,
+        "    global_state::{\n        FetchBuildDataResponse, FetchWorkspaceRequest, FetchWorkspaceResponse, GlobalState,\n        file_id_to_url, url_to_file_id,\n    },\n",
+        "    global_state::{\n        FetchBuildDataResponse, FetchWorkspaceRequest, FetchWorkspaceResponse, GlobalState,\n    },\n",
+    )?;
+    replace_once(
+        &mut source,
+        "                let uri = file_id_to_url(&self.vfs.read().0, file_id);\n",
+        "                let uri = self.analyzed_file_id_to_url(file_id);\n",
+    )?;
+    replace_once(
+        &mut source,
+        "                    match url_to_file_id(&self.vfs.read().0, &diag.url) {\n",
+        "                    match self.analyzed_url_to_file_id(&diag.url) {\n",
+    )?;
+    replace_once(
+        &mut source,
+        "        let db = self.analysis_host.raw_database();\n        let generation = self.diagnostics.next_generation();\n        let subscriptions = {\n            let vfs = &self.vfs.read().0;\n            self.mem_docs\n                .iter()\n                .map(|path| vfs.file_id(path).unwrap())\n                .filter_map(|(file_id, excluded)| {\n                    (excluded == vfs::FileExcluded::No).then_some(file_id)\n                })\n                .filter(|&file_id| {\n                    let source_root_id = db.file_source_root(file_id).source_root_id(db);\n                    let source_root = db.source_root(source_root_id).source_root(db);\n                    // Only publish diagnostics for files in the workspace, not from crates.io deps\n                    // or the sysroot.\n                    // While theoretically these should never have errors, we have quite a few false\n                    // positives particularly in the stdlib, and those diagnostics would stay around\n                    // forever if we emitted them here.\n                    !source_root.is_library\n                })\n                .collect::<std::sync::Arc<_>>()\n        };\n",
+        "        let generation = self.diagnostics.next_generation();\n        let subscriptions = if self.analyzed_shared.is_some() {\n            let snap = self.snapshot();\n            self.mem_docs\n                .iter()\n                .filter_map(|path| snap.vfs_path_to_file_id(path).ok().flatten())\n                .filter(|&file_id| {\n                    snap.analysis\n                        .is_library_file(file_id)\n                        .is_ok_and(|is_library| !is_library)\n                })\n                .collect::<std::sync::Arc<_>>()\n        } else {\n            let db = self.analysis_host.raw_database();\n            let vfs = &self.vfs.read().0;\n            self.mem_docs\n                .iter()\n                .map(|path| vfs.file_id(path).unwrap())\n                .filter_map(|(file_id, excluded)| {\n                    (excluded == vfs::FileExcluded::No).then_some(file_id)\n                })\n                .filter(|&file_id| {\n                    let source_root_id = db.file_source_root(file_id).source_root_id(db);\n                    let source_root = db.source_root(source_root_id).source_root(db);\n                    // Only publish diagnostics for files in the workspace, not from crates.io deps\n                    // or the sysroot.\n                    // While theoretically these should never have errors, we have quite a few false\n                    // positives particularly in the stdlib, and those diagnostics would stay around\n                    // forever if we emitted them here.\n                    !source_root.is_library\n                })\n                .collect::<std::sync::Arc<_>>()\n        };\n",
+    )?;
+
+    fs::write(main_loop_rs, source)?;
+    Ok(())
+}
+
+fn replace_once(
+    source: &mut String,
+    needle: &str,
+    replacement: &str,
+) -> Result<(), Box<dyn Error>> {
+    let Some(index) = source.find(needle) else {
+        return Err(format!("could not find source fragment:\n{needle}").into());
+    };
+    source.replace_range(index..index + needle.len(), replacement);
+    Ok(())
+}
+
 fn write_bridge_module(path: &Path, rust_analyzer_version: &str) -> Result<(), Box<dyn Error>> {
     fs::write(
         path,
@@ -479,19 +599,21 @@ fn write_bridge_module(path: &Path, rust_analyzer_version: &str) -> Result<(), B
 
 const BRIDGE_MODULE: &str = r#"
 	use std::{
-	    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+	    collections::{BTreeMap, btree_map::Entry},
 	    env,
 	    path::{Path, PathBuf},
 	    sync::{Arc, Mutex},
 	};
 
-	use ide::{AnalysisHost, FileId, RootDatabase};
+	use hir::ChangeWithProcMacros;
+	use ide::{Analysis, AnalysisHost, FileId, RootDatabase};
 	use ide_db::base_db::{SourceDatabase, all_crates};
 	use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_into_db};
+	use lsp_types::Url;
 	use proc_macro_api::ProcMacroClient;
 	use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace};
-use serde::Serialize;
-use vfs::{AbsPathBuf, Vfs, VfsPath};
+	use serde::Serialize;
+	use vfs::{AbsPathBuf, Vfs, VfsPath};
 
 const RUST_ANALYZER_VERSION: &str = "__ANALYZED_RA_VERSION__";
 
@@ -902,16 +1024,18 @@ pub struct WorkspaceSummary {
 pub struct SharedAnalyzerSession {
     world: Arc<Mutex<SharedWorld>>,
     view: WorkspaceView,
-    config: Arc<SharedAnalyzerConfig>,
+    runtime: SharedAnalyzerRuntime,
 }
 
 impl SharedAnalyzerSession {
-    pub fn new(
-        world: Arc<Mutex<SharedWorld>>,
-        view: WorkspaceView,
-        config: Arc<SharedAnalyzerConfig>,
-    ) -> Self {
-        Self { world, view, config }
+    pub fn new(world: Arc<Mutex<SharedWorld>>, view: WorkspaceView) -> Self {
+        let runtime = SharedAnalyzerRuntime::new(Arc::clone(&world));
+
+        Self {
+            world,
+            view,
+            runtime,
+        }
     }
 
     pub fn snapshot(&self) -> anyhow::Result<SharedAnalyzerSnapshot> {
@@ -920,20 +1044,96 @@ impl SharedAnalyzerSession {
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
 
-        world.snapshot(&self.view, Arc::clone(&self.config))
+        world.snapshot(&self.view, self.runtime.clone())
     }
 }
 
 pub struct SharedAnalyzerSnapshot {
     pub(crate) workspaces: Vec<ProjectWorkspace>,
-    pub(crate) files: Vec<SharedAnalyzerFile>,
-    pub(crate) config: Arc<SharedAnalyzerConfig>,
+    pub(crate) runtime: SharedAnalyzerRuntime,
 }
 
-pub struct SharedAnalyzerFile {
-    pub(crate) file_id: FileId,
-    pub(crate) path: VfsPath,
-    pub(crate) text: String,
+#[derive(Clone)]
+pub struct SharedAnalyzerRuntime {
+    world: Arc<Mutex<SharedWorld>>,
+}
+
+impl SharedAnalyzerRuntime {
+    fn new(world: Arc<Mutex<SharedWorld>>) -> Self {
+        Self { world }
+    }
+
+    pub(crate) fn analysis(&self) -> Analysis {
+        self.world
+            .lock()
+            .expect("shared world mutex poisoned")
+            .host
+            .analysis()
+    }
+
+    pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {
+        let path = crate::lsp::from_proto::vfs_path(url)?;
+        self.vfs_path_to_file_id(&path)
+    }
+
+    pub(crate) fn vfs_path_to_file_id(&self, path: &VfsPath) -> anyhow::Result<Option<FileId>> {
+        let path = normalize_vfs_path(path);
+        Ok(self
+            .world
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
+            .file_id_for_vfs_path(&path))
+    }
+
+    pub(crate) fn file_id_to_url(&self, file_id: FileId) -> Option<Url> {
+        let path = self.file_id_to_vfs_path(file_id)?;
+        let path = path.as_path()?;
+        Some(crate::lsp::to_proto::url_from_abs_path(path))
+    }
+
+    pub(crate) fn file_id_to_vfs_path(&self, file_id: FileId) -> Option<VfsPath> {
+        self.world
+            .lock()
+            .expect("shared world mutex poisoned")
+            .vfs_path_for_file_id(file_id)
+    }
+
+    pub(crate) fn line_endings(&self, file_id: FileId) -> Option<crate::line_index::LineEndings> {
+        self.world
+            .lock()
+            .expect("shared world mutex poisoned")
+            .line_endings_for_file_id(file_id)
+    }
+
+    pub(crate) fn file_exists(&self, file_id: FileId) -> Option<bool> {
+        self.world
+            .lock()
+            .expect("shared world mutex poisoned")
+            .file_exists(file_id)
+    }
+
+    pub(crate) fn apply_file_change(
+        &self,
+        path: &VfsPath,
+        text: Option<(String, crate::line_index::LineEndings)>,
+    ) -> anyhow::Result<Option<FileId>> {
+        let path = normalize_vfs_path(path);
+        self.world
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
+            .apply_file_change(&path, text)
+    }
+}
+
+fn normalize_vfs_path(path: &VfsPath) -> VfsPath {
+    let Some(path) = path.as_path() else {
+        return path.clone();
+    };
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return VfsPath::from(path.to_path_buf());
+    };
+
+    VfsPath::from(AbsPathBuf::assert_utf8(path))
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1100,6 +1300,7 @@ struct LoadedWorkspace {
     summary: WorkspaceSummary,
     workspace: ProjectWorkspace,
     _vfs: Vfs,
+    line_endings: BTreeMap<FileId, crate::line_index::LineEndings>,
     _proc_macro_client: Option<ProcMacroClient>,
 }
 
@@ -1153,34 +1354,20 @@ impl SharedWorld {
     pub fn snapshot(
         &self,
         view: &WorkspaceView,
-        config: Arc<SharedAnalyzerConfig>,
+        runtime: SharedAnalyzerRuntime,
     ) -> anyhow::Result<SharedAnalyzerSnapshot> {
-        let db = self.host.raw_database();
         let mut workspaces = Vec::new();
-        let mut files = Vec::new();
-        let mut seen_files = BTreeSet::new();
 
         for index in view.workspace_indexes() {
             let Some(workspace) = self.loaded_workspaces.get(index) else {
                 continue;
             };
             workspaces.push(workspace.workspace.clone());
-
-            for (file_id, path) in workspace._vfs.iter() {
-                if seen_files.insert(file_id) {
-                    files.push(SharedAnalyzerFile {
-                        file_id,
-                        path: path.clone(),
-                        text: db.file_text(file_id).text(db).to_string(),
-                    });
-                }
-            }
         }
 
         Ok(SharedAnalyzerSnapshot {
             workspaces,
-            files,
-            config,
+            runtime,
         })
     }
 
@@ -1207,6 +1394,62 @@ impl SharedWorld {
         }
 
         anyhow::bail!("workspace file is not loaded: {path}")
+    }
+
+    pub fn file_id_for_vfs_path(&self, path: &VfsPath) -> Option<FileId> {
+        self.loaded_workspaces
+            .iter()
+            .find_map(|workspace| workspace._vfs.file_id(path).map(|(file_id, _)| file_id))
+    }
+
+    pub fn vfs_path_for_file_id(&self, file_id: FileId) -> Option<VfsPath> {
+        self.loaded_workspaces
+            .iter()
+            .find_map(|workspace| workspace._vfs.iter().find_map(|(id, path)| (id == file_id).then(|| path.clone())))
+    }
+
+    pub(crate) fn line_endings_for_file_id(
+        &self,
+        file_id: FileId,
+    ) -> Option<crate::line_index::LineEndings> {
+        self.loaded_workspaces
+            .iter()
+            .find_map(|workspace| workspace.line_endings.get(&file_id).copied())
+    }
+
+    pub fn file_exists(&self, file_id: FileId) -> Option<bool> {
+        self.loaded_workspaces.iter().find_map(|workspace| {
+            workspace
+                ._vfs
+                .iter()
+                .any(|(id, _)| id == file_id)
+                .then(|| workspace._vfs.exists(file_id))
+        })
+    }
+
+    pub(crate) fn apply_file_change(
+        &mut self,
+        path: &VfsPath,
+        text: Option<(String, crate::line_index::LineEndings)>,
+    ) -> anyhow::Result<Option<FileId>> {
+        let Some(file_id) = self.file_id_for_vfs_path(path) else {
+            return Ok(None);
+        };
+
+        let mut change = ChangeWithProcMacros::default();
+        let text = text.map(|(text, line_endings)| {
+            for workspace in &mut self.loaded_workspaces {
+                if let Entry::Occupied(mut entry) = workspace.line_endings.entry(file_id) {
+                    entry.insert(line_endings);
+                    break;
+                }
+            }
+            text
+        });
+        change.change_file(file_id, text);
+        self.host.apply_change(change);
+
+        Ok(Some(file_id))
     }
 
     pub fn crate_root_file(&self, krate: ide::Crate) -> anyhow::Result<(FileId, VfsPath)> {
@@ -1369,6 +1612,16 @@ fn load_cargo_workspace_into_host(
         )?
     };
     let files = vfs.iter().count();
+    let line_endings = {
+        let db = host.raw_database();
+        vfs.iter()
+            .map(|(file_id, _)| {
+                let text = db.file_text(file_id).text(db).to_string();
+                let (_, line_endings) = crate::line_index::LineEndings::normalize(text);
+                (file_id, line_endings)
+            })
+            .collect()
+    };
 
     Ok(LoadedWorkspace {
         summary: WorkspaceSummary {
@@ -1380,6 +1633,7 @@ fn load_cargo_workspace_into_host(
         },
         workspace: workspace_for_session,
         _vfs: vfs,
+        line_endings,
         _proc_macro_client: proc_macro_client,
     })
 }
@@ -1416,19 +1670,20 @@ pub(crate) mod analyzed_session {
     use std::{env, sync::Once};
 
     use crossbeam_channel::{Receiver, Sender};
+    use ide::FileId;
     use lsp_server::{Connection, Message};
+    use lsp_types::Url;
     use paths::Utf8PathBuf;
-    use rustc_hash::FxHashMap;
     use triomphe::Arc;
     use vfs::AbsPathBuf;
 
     use crate::{
         analyzed_bridge::{
-            SharedAnalyzerConfig, SharedAnalyzerFile, SharedAnalyzerSession, SharedAnalyzerSnapshot,
-            patch_path_prefix,
+            SharedAnalyzerSession, SharedAnalyzerSnapshot, patch_path_prefix,
         },
         config::{Config, ConfigChange, ConfigErrors},
         from_json, server_capabilities, version,
+        global_state::{FetchWorkspaceRequest, FetchWorkspaceResponse},
         line_index::LineEndings,
     };
 
@@ -1450,11 +1705,7 @@ pub(crate) mod analyzed_session {
         ) -> anyhow::Result<Self> {
             let mut session = Self::new(sender, config);
             let workspaces = snapshot.workspaces;
-            let shared_config = snapshot.config;
-            let (vfs, line_endings) = vfs_from_shared_files(snapshot.files)?;
-
-            load_shared_workspaces_into_host(&mut session.state, &workspaces, &shared_config)?;
-            session.state.vfs = Arc::new(parking_lot::RwLock::new((vfs, line_endings)));
+            session.state.analyzed_shared = Some(snapshot.runtime);
             install_shared_workspaces(&mut session.state, workspaces);
 
             Ok(session)
@@ -1496,36 +1747,11 @@ pub(crate) mod analyzed_session {
         RustAnalyzerSession::new_with_shared_snapshot(sender, config, snapshot)?.run_shared(receiver)
     }
 
-    fn load_shared_workspaces_into_host(
-        state: &mut crate::global_state::GlobalState,
-        workspaces: &[project_model::ProjectWorkspace],
-        config: &SharedAnalyzerConfig,
-    ) -> anyhow::Result<()> {
-        let load_config = config.load.to_load_cargo_config();
-        let mut proc_macro_clients = Vec::new();
-
-        for workspace in workspaces {
-            let (_, proc_macro_client) = {
-                let db = state.analysis_host.raw_database_mut();
-                load_cargo::load_workspace_into_db(
-                    workspace.clone(),
-                    &config.cargo_config.extra_env,
-                    &load_config,
-                    db,
-                )?
-            };
-            proc_macro_clients.push(proc_macro_client.map(Ok::<_, anyhow::Error>));
-        }
-
-        state.proc_macro_clients = Arc::from_iter(proc_macro_clients);
-
-        Ok(())
-    }
-
     fn install_shared_workspaces(
         state: &mut crate::global_state::GlobalState,
         workspaces: Vec<project_model::ProjectWorkspace>,
     ) {
+        let fetched_workspaces = workspaces.iter().cloned().map(Ok).collect();
         let source_root_config = {
             let files_config = state.config.files();
             load_cargo::ProjectFolders::new(
@@ -1538,6 +1764,30 @@ pub(crate) mod analyzed_session {
         state.source_root_config = source_root_config;
         state.local_roots_parent_map = Arc::new(state.source_root_config.source_root_parent_map());
         state.workspaces = Arc::new(workspaces);
+        state.fetch_workspaces_queue.request_op(
+            "startup".to_owned(),
+            FetchWorkspaceRequest {
+                path: None,
+                force_crate_graph_reload: false,
+            },
+        );
+        _ = state.fetch_workspaces_queue.should_start_op();
+        state.fetch_workspaces_queue.op_completed(FetchWorkspaceResponse {
+            workspaces: fetched_workspaces,
+            force_crate_graph_reload: false,
+        });
+        state.vfs_done = true;
+        state.finish_loading_crate_graph();
+
+        if state.config.check_on_save(None)
+            && state.config.flycheck_workspace(None)
+            && !state.fetch_build_data_queue.op_requested()
+        {
+            state
+                .flycheck
+                .iter()
+                .for_each(|flycheck| flycheck.restart_workspace(None));
+        }
     }
 
     fn run_shared_state(
@@ -1578,53 +1828,82 @@ pub(crate) mod analyzed_session {
         anyhow::bail!("A receiver has been dropped, something panicked!")
     }
 
-    fn vfs_from_shared_files(
-        mut files: Vec<SharedAnalyzerFile>,
-    ) -> anyhow::Result<(vfs::Vfs, FxHashMap<ide::FileId, LineEndings>)> {
-        let mut vfs = vfs::Vfs::default();
-        let mut line_endings = FxHashMap::default();
-        let mut next_file_id = 0;
-
-        files.sort_by_key(|file| file.file_id.index());
-
-        for file in files {
-            let file_id = file.file_id;
-            while next_file_id < file_id.index() {
-                let path =
-                    vfs::VfsPath::new_virtual_path(format!("/__analyzed__/deleted/{next_file_id}"));
-                vfs.set_file_contents(path.clone(), Some(Vec::new()));
-                let Some((session_file_id, _)) = vfs.file_id(&path) else {
-                    anyhow::bail!("deleted shared file id placeholder was not inserted: {path}");
-                };
-                let expected = ide::FileId::from_raw(next_file_id);
-                if session_file_id != expected {
-                    anyhow::bail!(
-                        "deleted shared file id mismatch for {path}: expected {expected:?}, got {session_file_id:?}"
-                    );
-                }
-                vfs.set_file_contents(path, None);
-                next_file_id += 1;
-            }
-
-            let path = file.path;
-            let (text, endings) = LineEndings::normalize(file.text);
-            vfs.set_file_contents(path.clone(), Some(text.into_bytes()));
-
-            let Some((session_file_id, _)) = vfs.file_id(&path) else {
-                anyhow::bail!("shared file was not inserted into session VFS: {path}");
+    impl crate::global_state::GlobalState {
+        pub(crate) fn analyzed_process_shared_changes(&mut self) -> bool {
+            let Some(shared) = self.analyzed_shared.clone() else {
+                return false;
             };
-            if session_file_id != file_id {
-                anyhow::bail!(
-                    "shared file id mismatch for {path}: expected {file_id:?}, got {session_file_id:?}"
-                );
+
+            let mut guard = self.vfs.write();
+            let changed_files = guard.0.take_changes();
+            if changed_files.is_empty() {
+                return false;
             }
-            line_endings.insert(file_id, endings);
-            next_file_id += 1;
+
+            let mut modified_rust_files = Vec::new();
+            let mut changed = false;
+            for file in changed_files.into_values() {
+                let vfs_path = guard.0.file_path(file.file_id).clone();
+                let is_modified = file.is_modified();
+                let exists = file.exists();
+                let is_rust_file = vfs_path
+                    .as_path()
+                    .is_some_and(|path| path.extension() == Some("rs"));
+                let text = match file.change {
+                    vfs::Change::Create(contents, _) | vfs::Change::Modify(contents, _) => {
+                        String::from_utf8(contents).ok().map(LineEndings::normalize)
+                    }
+                    vfs::Change::Delete => None,
+                };
+
+                match shared.apply_file_change(&vfs_path, text) {
+                    Ok(Some(file_id)) => {
+                        changed = true;
+                        if !exists {
+                            self.diagnostics.clear_native_for(file_id);
+                        }
+                        if is_modified && is_rust_file {
+                            modified_rust_files.push(file_id);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!("failed to apply shared analyzer change for {vfs_path}: {error}");
+                    }
+                }
+            }
+            drop(guard);
+
+            if !modified_rust_files.is_empty() {
+                _ = self
+                    .deferred_task_queue
+                    .sender
+                    .send(crate::main_loop::DeferredTask::CheckProcMacroSources(modified_rust_files));
+            }
+
+            changed
         }
 
-        _ = vfs.take_changes();
+        pub(crate) fn analyzed_file_id_to_url(&self, file_id: FileId) -> Url {
+            if let Some(shared) = &self.analyzed_shared
+                && let Some(url) = shared.file_id_to_url(file_id)
+            {
+                return url;
+            }
 
-        Ok((vfs, line_endings))
+            crate::global_state::file_id_to_url(&self.vfs.read().0, file_id)
+        }
+
+        pub(crate) fn analyzed_url_to_file_id(
+            &self,
+            url: &Url,
+        ) -> anyhow::Result<Option<FileId>> {
+            if let Some(shared) = &self.analyzed_shared {
+                return shared.url_to_file_id(url);
+            }
+
+            crate::global_state::url_to_file_id(&self.vfs.read().0, url)
+        }
     }
 
     fn config_from_initialize_params(
