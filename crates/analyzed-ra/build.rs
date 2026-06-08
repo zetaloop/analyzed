@@ -878,13 +878,16 @@ impl SharedAnalyzerRuntime {
             .world
             .lock()
             .expect("shared world mutex poisoned");
+        let visible_files = world.visible_crate_roots_for_session(self.session_id());
         let line_endings = world.line_endings_for_session(self.session_id());
         *self
             .session
             .line_endings
             .lock()
             .expect("shared analyzer line endings mutex poisoned") = line_endings;
-        world.host.analysis()
+        world
+            .host
+            .analyzed_analysis_with_visible_files(Arc::new(visible_files))
     }
 
     pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {
@@ -1744,6 +1747,30 @@ impl SharedWorld {
         if let Some(next_file_id) = max_file_id.map(|file_id| file_id + 1) {
             self.next_overlay_file_id = self.next_overlay_file_id.max(next_file_id);
         }
+    }
+
+    fn visible_crate_roots_for_session(
+        &self,
+        session_id: u64,
+    ) -> rustc_hash::FxHashSet<FileId> {
+        let db = self.host.raw_database();
+        let overlay = self.session_overlays.get(&session_id);
+        let overlay_base_crates = overlay
+            .map(|overlay| overlay.crates.keys().copied().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        let mut visible_files = rustc_hash::FxHashSet::default();
+
+        for krate in &self.base_crates {
+            if !overlay_base_crates.contains(krate) {
+                visible_files.insert(krate.data(db).root_file_id);
+            }
+        }
+
+        if let Some(overlay) = overlay {
+            visible_files.extend(overlay.crates.values().copied());
+        }
+
+        visible_files
     }
 
     fn base_file_for_vfs_path(&self, path: &VfsPath) -> Option<FileId> {
