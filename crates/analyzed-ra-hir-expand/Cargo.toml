@@ -1,0 +1,82 @@
+[package]
+name = "ra_ap_hir_expand"
+version = "0.0.334"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+[lib]
+name = "ra_ap_hir_expand"
+path = "src/lib.rs"
+doctest = false
+test = false
+
+[features]
+in-rust-tree = ["syntax/in-rust-tree"]
+
+[build-dependencies]
+analyzed-bridge = { path = "../analyzed-bridge" }
+
+[dependencies]
+base-db = { path = "../analyzed-ra-base-db", package = "ra_ap_base_db" }
+cfg = { version = "=0.0.334", package = "ra_ap_cfg", features = ["tt", "syntax"] }
+cov-mark = { version = "2.0.0" }
+either = { version = "1.15.0" }
+intern = { version = "=0.0.334", package = "ra_ap_intern" }
+itertools = { version = "0.14.0" }
+mbe = { version = "=0.0.334", package = "ra_ap_mbe" }
+parser = { version = "=0.0.334", package = "ra_ap_parser" }
+query-group = { version = "=0.0.334", package = "ra_ap_query-group-macro" }
+rustc-hash = { version = "2.1.1" }
+salsa = { version = "0.26.2", features = ["rayon", "salsa_unstable", "macros", "inventory"], default-features = false }
+salsa-macros = { version = "0.26.2" }
+smallvec = { version = "1.15.1", features = ["const_new", "union", "const_generics"] }
+span = { version = "=0.0.334", package = "ra_ap_span" }
+stdx = { version = "=0.0.334", package = "ra_ap_stdx" }
+syntax = { version = "=0.0.334", package = "ra_ap_syntax" }
+syntax-bridge = { version = "=0.0.334", package = "ra_ap_syntax-bridge" }
+thin-vec = { version = "0.2.16" }
+tracing = { version = "0.1.41", features = ["std"], default-features = false }
+triomphe = { version = "0.1.14", features = ["std"], default-features = false }
+tt = { version = "=0.0.334", package = "ra_ap_tt" }
+
+[dev-dependencies]
+ra_ap_hir_expand = "=0.0.334"
+
+[lints.clippy]
+assigning_clones = "allow"
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+dbg_macro = "warn"
+enum_variant_names = "allow"
+len_without_is_empty = "allow"
+literal_string_with_formatting_args = "allow"
+new_ret_no_self = "allow"
+perf = { level = "deny", priority = -1 }
+print_stderr = "warn"
+print_stdout = "warn"
+rc_buffer = "warn"
+restriction = { level = "allow", priority = -1 }
+result_unit_err = "allow"
+single_match = "allow"
+str_to_string = "warn"
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+todo = "warn"
+too_long_first_doc_paragraph = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+unnecessary_map_or = "allow"
+useless_asref = "allow"
+vec_init_then_push = "allow"
+wrong_self_convention = "allow"
+
+[lints.rust]
+elided_lifetimes_in_paths = "warn"
+explicit_outlives_requirements = "warn"
+unexpected_cfgs = { level = "warn", priority = 0, check-cfg = ["cfg(bootstrap)", "cfg(no_salsa_async_drops)"] }
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_extern_crates = "warn"
+unused_lifetimes = "warn"

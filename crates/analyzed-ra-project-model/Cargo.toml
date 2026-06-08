@@ -1,0 +1,82 @@
+[package]
+name = "ra_ap_project_model"
+version = "0.0.334"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+[lib]
+name = "ra_ap_project_model"
+path = "src/lib.rs"
+doctest = false
+test = false
+
+[features]
+default = []
+in-rust-tree = []
+
+[build-dependencies]
+analyzed-bridge = { path = "../analyzed-bridge" }
+
+[dependencies]
+anyhow = { version = "1.0.98" }
+base-db = { path = "../analyzed-ra-base-db", package = "ra_ap_base_db" }
+cargo_metadata = { version = "0.23.0" }
+cfg = { version = "=0.0.334", package = "ra_ap_cfg", features = ["tt", "syntax"] }
+intern = { version = "=0.0.334", package = "ra_ap_intern" }
+itertools = { version = "0.14.0" }
+la-arena = { version = "0.3.1" }
+paths = { version = "=0.0.334", package = "ra_ap_paths", features = ["serde1"] }
+rustc-hash = { version = "2.1.1" }
+semver = { version = "1.0.26" }
+serde = { version = "1.0.219" }
+serde_derive = { version = "1.0.219" }
+serde_json = { version = "1.0.140" }
+span = { version = "=0.0.334", package = "ra_ap_span" }
+stdx = { version = "=0.0.334", package = "ra_ap_stdx" }
+temp-dir = { version = "0.1.16" }
+toml = { version = "0.9.8" }
+toolchain = { version = "=0.0.334", package = "ra_ap_toolchain" }
+tracing = { version = "0.1.41", features = ["std", "attributes"], default-features = false }
+triomphe = { version = "0.1.14", features = ["std"], default-features = false }
+
+[dev-dependencies]
+ra_ap_project_model = "=0.0.334"
+
+[lints.clippy]
+assigning_clones = "allow"
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+dbg_macro = "warn"
+enum_variant_names = "allow"
+len_without_is_empty = "allow"
+literal_string_with_formatting_args = "allow"
+new_ret_no_self = "allow"
+perf = { level = "deny", priority = -1 }
+print_stderr = "warn"
+print_stdout = "warn"
+rc_buffer = "warn"
+restriction = { level = "allow", priority = -1 }
+result_unit_err = "allow"
+single_match = "allow"
+str_to_string = "warn"
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+todo = "warn"
+too_long_first_doc_paragraph = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+unnecessary_map_or = "allow"
+useless_asref = "allow"
+vec_init_then_push = "allow"
+wrong_self_convention = "allow"
+
+[lints.rust]
+elided_lifetimes_in_paths = "warn"
+explicit_outlives_requirements = "warn"
+unexpected_cfgs = { level = "warn", priority = 0, check-cfg = ["cfg(bootstrap)", "cfg(no_salsa_async_drops)"] }
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_extern_crates = "warn"
+unused_lifetimes = "warn"

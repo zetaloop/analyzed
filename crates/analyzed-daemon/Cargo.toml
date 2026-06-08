@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 analyzed-ipc.workspace = true
-analyzed-ra.workspace = true
+ra_ap_rust-analyzer.workspace = true
 anyhow.workspace = true
 crossbeam-channel.workspace = true
 daemonize.workspace = true

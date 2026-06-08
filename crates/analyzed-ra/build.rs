@@ -3,278 +3,26 @@ use std::{
     error::Error,
     fs,
     io::Write,
-    path::{Component, Path, PathBuf},
-    process::Command,
+    path::{Path, PathBuf},
 };
 
-use flate2::read::GzDecoder;
-use sha2::{Digest, Sha256};
 use toml::{Table, Value, map::Map};
+
+use analyzed_bridge as build_support;
 
 const RA_PACKAGE: &str = "ra_ap_rust-analyzer";
 
-#[derive(Debug)]
-struct LockedPackage {
-    version: String,
-    checksum: String,
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
-    let package = locked_ra_package()?;
-    let archive = registry_archive(&package)?;
-    verify_archive_checksum(&archive, &package)?;
-    let generated = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"))
-        .join("ra_ap_rust_analyzer_bridge");
-    unpack_crate_archive(&archive, &generated, &package)?;
+    let (generated, package) =
+        build_support::prepare_bridge_package(RA_PACKAGE, "ra_ap_rust_analyzer_bridge")?;
     verify_manifest_matches_bridge(&generated.join("Cargo.toml"))?;
     let generated_src = generated.join("src");
-
-    rewrite_lib_header(&generated_src.join("lib.rs"))?;
     patch_global_state_source(&generated_src.join("global_state.rs"))?;
     patch_main_loop_source(&generated_src.join("main_loop.rs"))?;
     write_bridge_module(&generated_src.join("analyzed_bridge.rs"), &package.version)?;
     append_main_loop_session_module(&generated_src.join("main_loop.rs"))?;
     append_bridge_export(&generated_src.join("lib.rs"))?;
-
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed={}", archive.display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        workspace_root().join("Cargo.lock").display()
-    );
-
-    Ok(())
-}
-
-fn registry_archive(package: &LockedPackage) -> Result<PathBuf, Box<dyn Error>> {
-    let cargo_home = cargo_home()?;
-    if let Some(archive) = find_registry_archive(&cargo_home, package)? {
-        return Ok(archive);
-    }
-
-    fetch_registry_archive()?;
-
-    if let Some(archive) = find_registry_archive(&cargo_home, package)? {
-        return Ok(archive);
-    }
-
-    Err(format!(
-        "could not find {} under {} after `cargo fetch --locked`",
-        archive_name(package),
-        cargo_home.join("registry").join("cache").display()
-    )
-    .into())
-}
-
-fn cargo_home() -> Result<PathBuf, Box<dyn Error>> {
-    env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
-        .ok_or_else(|| "CARGO_HOME is unavailable".into())
-}
-
-fn find_registry_archive(
-    cargo_home: &Path,
-    package: &LockedPackage,
-) -> Result<Option<PathBuf>, Box<dyn Error>> {
-    let registry_cache = cargo_home.join("registry").join("cache");
-    let package_archive = archive_name(package);
-    let registries = fs::read_dir(&registry_cache)?;
-
-    for registry in registries {
-        let candidate = registry?.path().join(&package_archive);
-        if candidate.is_file() {
-            return Ok(Some(candidate));
-        }
-    }
-
-    Ok(None)
-}
-
-fn fetch_registry_archive() -> Result<(), Box<dyn Error>> {
-    let cargo = env::var_os("CARGO").ok_or("CARGO is unavailable")?;
-    let status = Command::new(cargo)
-        .arg("fetch")
-        .arg("--locked")
-        .arg("--manifest-path")
-        .arg(workspace_root().join("Cargo.toml"))
-        .status()?;
-
-    if !status.success() {
-        return Err(format!("cargo fetch --locked failed with {status}").into());
-    }
-
-    Ok(())
-}
-
-fn verify_archive_checksum(archive: &Path, package: &LockedPackage) -> Result<(), Box<dyn Error>> {
-    let actual = hex_digest(fs::read(archive)?);
-
-    if actual != package.checksum {
-        return Err(format!(
-            "checksum mismatch for {}: expected {}, got {actual}",
-            archive.display(),
-            package.checksum,
-        )
-        .into());
-    }
-
-    Ok(())
-}
-
-fn locked_ra_package() -> Result<LockedPackage, Box<dyn Error>> {
-    let lock = fs::read_to_string(workspace_root().join("Cargo.lock"))?;
-    let mut packages = Vec::new();
-    let mut name = None;
-    let mut version = None;
-    let mut checksum = None;
-
-    for line in lock.lines() {
-        if line == "[[package]]" {
-            push_locked_ra_package(&mut packages, &mut name, &mut version, &mut checksum)?;
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("name = ") {
-            name = Some(value.trim_matches('"').to_owned());
-        } else if let Some(value) = line.strip_prefix("version = ") {
-            version = Some(value.trim_matches('"').to_owned());
-        } else if let Some(value) = line.strip_prefix("checksum = ") {
-            checksum = Some(value.trim_matches('"').to_owned());
-        }
-    }
-
-    push_locked_ra_package(&mut packages, &mut name, &mut version, &mut checksum)?;
-
-    match packages.len() {
-        1 => Ok(packages.remove(0)),
-        0 => Err(format!("could not find {RA_PACKAGE} in Cargo.lock").into()),
-        count => Err(format!("found {count} {RA_PACKAGE} packages in Cargo.lock").into()),
-    }
-}
-
-fn push_locked_ra_package(
-    packages: &mut Vec<LockedPackage>,
-    name: &mut Option<String>,
-    version: &mut Option<String>,
-    checksum: &mut Option<String>,
-) -> Result<(), Box<dyn Error>> {
-    if name.as_deref() == Some(RA_PACKAGE) {
-        packages.push(LockedPackage {
-            version: version
-                .take()
-                .ok_or_else(|| format!("{RA_PACKAGE} is missing version in Cargo.lock"))?,
-            checksum: checksum
-                .take()
-                .ok_or_else(|| format!("{RA_PACKAGE} is missing checksum in Cargo.lock"))?,
-        });
-    }
-
-    *name = None;
-    *version = None;
-    *checksum = None;
-
-    Ok(())
-}
-
-fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn unpack_crate_archive(
-    archive: &Path,
-    destination: &Path,
-    package: &LockedPackage,
-) -> Result<(), Box<dyn Error>> {
-    let decoder = GzDecoder::new(fs::File::open(archive)?);
-    let mut archive = tar::Archive::new(decoder);
-    let package_dir = package_dir(package);
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?;
-        let relative = checked_archive_path(&path, &package_dir)?;
-        let destination_path = destination.join(relative);
-        let entry_type = entry.header().entry_type();
-
-        if entry_type.is_dir() {
-            fs::create_dir_all(&destination_path)?;
-        } else if entry_type.is_file() {
-            if let Some(parent) = destination_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            entry.unpack(&destination_path)?;
-        } else {
-            return Err(format!("unsupported archive entry type for {}", path.display()).into());
-        }
-    }
-
-    Ok(())
-}
-
-fn checked_archive_path(path: &Path, package_dir: &str) -> Result<PathBuf, Box<dyn Error>> {
-    let mut components = path.components();
-    match components.next() {
-        Some(Component::Normal(component)) if component == package_dir => {}
-        _ => return Err(format!("unexpected archive path {}", path.display()).into()),
-    }
-
-    let mut relative = PathBuf::new();
-    for component in components {
-        match component {
-            Component::Normal(part) => relative.push(part),
-            _ => return Err(format!("unsupported archive path {}", path.display()).into()),
-        }
-    }
-
-    if relative.as_os_str().is_empty() {
-        Ok(PathBuf::from("."))
-    } else {
-        Ok(relative)
-    }
-}
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"))
-        .join("../..")
-}
-
-fn package_dir(package: &LockedPackage) -> String {
-    format!("{RA_PACKAGE}-{}", package.version)
-}
-
-fn archive_name(package: &LockedPackage) -> String {
-    format!("{}.crate", package_dir(package))
-}
-
-fn append_bridge_export(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut file = fs::OpenOptions::new().append(true).open(lib_rs)?;
-    file.write_all(
-        br#"
-
-	pub mod analyzed_bridge;
-	pub use analyzed_bridge::{
-	    PackageInstance, PackageInstanceKey, RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary,
-	    SessionOverlay, SessionOverlayCrate, SessionOverlayFile, SharedAnalyzerBackendKey,
-	    SharedAnalyzerCargoConfigKey, SharedAnalyzerConfig,
-	    SharedAnalyzerLoadKey, SharedAnalyzerProcMacroServerKey, SharedAnalyzerSession,
-	    SharedAnalyzerSessionContext, SharedAnalyzerWorldConfigKey, SharedAnalyzerWorldKey,
-	    SharedAnalyzerViewKey, SharedWorld, WorkspaceSummary, WorkspaceView,
-	    run_shared_rust_analyzer_lsp_session, rust_analyzer_lsp_boundary,
-	    rust_analyzer_private_boundary, shared_analyzer_session_context,
-	};
-	"#,
-    )?;
-
-    Ok(())
-}
-
-fn append_main_loop_session_module(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut file = fs::OpenOptions::new().append(true).open(main_loop_rs)?;
-    file.write_all(MAIN_LOOP_SESSION_MODULE.as_bytes())?;
     Ok(())
 }
 
@@ -316,7 +64,7 @@ fn verify_manifest_matches_bridge(ra_manifest_path: &Path) -> Result<(), Box<dyn
         Ok(())
     } else {
         Err(format!(
-            "analyzed-ra Cargo.toml is out of sync with {RA_PACKAGE}:\n{}",
+            "ra_ap_rust-analyzer bridge Cargo.toml is out of sync with {RA_PACKAGE}:\n{}",
             mismatches.join("\n")
         )
         .into())
@@ -355,8 +103,10 @@ fn compare_manifest_section(
             compare_manifest_tables(label, &expected, &actual, mismatches);
         }
         (Some(_), Some(_)) => mismatches.push(format!("  {label}: different value")),
-        (Some(_), None) => mismatches.push(format!("  {label}: missing section in analyzed-ra")),
-        (None, Some(_)) => mismatches.push(format!("  {label}: extra section in analyzed-ra")),
+        (Some(_), None) => {
+            mismatches.push(format!("  {label}: missing section in bridge manifest"))
+        }
+        (None, Some(_)) => mismatches.push(format!("  {label}: extra section in bridge manifest")),
         (None, None) => {}
     }
 }
@@ -382,13 +132,13 @@ fn compare_manifest_tables(
 
     if !expected_only.is_empty() {
         mismatches.push(format!(
-            "  {label}: missing keys in analyzed-ra: {}",
+            "  {label}: missing keys in bridge manifest: {}",
             expected_only.join(", ")
         ));
     }
     if !actual_only.is_empty() {
         mismatches.push(format!(
-            "  {label}: extra keys in analyzed-ra: {}",
+            "  {label}: extra keys in bridge manifest: {}",
             actual_only.join(", ")
         ));
     }
@@ -443,7 +193,24 @@ fn normalize_dependency(value: &Value) -> Value {
             dependency.insert("version".to_owned(), Value::String(version.clone()));
             Value::Table(dependency)
         }
-        Value::Table(dependency) => Value::Table(dependency.clone()),
+        Value::Table(dependency) => {
+            let mut dependency = dependency.clone();
+            if dependency
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.starts_with("../analyzed-ra"))
+            {
+                dependency.remove("path");
+                dependency.insert(
+                    "version".to_owned(),
+                    Value::String(format!(
+                        "={}",
+                        env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION is set by Cargo")
+                    )),
+                );
+            }
+            Value::Table(dependency)
+        }
         _ => value.clone(),
     }
 }
@@ -454,20 +221,31 @@ fn table_keys(table: &Table) -> Vec<String> {
     keys
 }
 
-fn rewrite_lib_header(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let source = fs::read_to_string(lib_rs)?;
-    let mut rewritten = String::new();
+fn append_bridge_export(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut file = fs::OpenOptions::new().append(true).open(lib_rs)?;
+    file.write_all(
+        br#"
 
-    for line in source.lines() {
-        if line.starts_with("//!") || line.starts_with("#![") {
-            continue;
-        }
+	pub mod analyzed_bridge;
+	pub use analyzed_bridge::{
+	    PackageInstance, PackageInstanceKey, RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary,
+	    SessionOverlay, SessionOverlayCrate, SessionOverlayFile, SharedAnalyzerBackendKey,
+	    SharedAnalyzerCargoConfigKey, SharedAnalyzerConfig,
+	    SharedAnalyzerLoadKey, SharedAnalyzerProcMacroServerKey, SharedAnalyzerSession,
+	    SharedAnalyzerSessionContext, SharedAnalyzerWorldConfigKey, SharedAnalyzerWorldKey,
+	    SharedAnalyzerViewKey, SharedWorld, WorkspaceSummary, WorkspaceView,
+	    run_shared_rust_analyzer_lsp_session, rust_analyzer_lsp_boundary,
+	    rust_analyzer_private_boundary, shared_analyzer_session_context,
+	};
+	"#,
+    )?;
 
-        rewritten.push_str(line);
-        rewritten.push('\n');
-    }
+    Ok(())
+}
 
-    fs::write(lib_rs, rewritten)?;
+fn append_main_loop_session_module(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut file = fs::OpenOptions::new().append(true).open(main_loop_rs)?;
+    file.write_all(MAIN_LOOP_SESSION_MODULE.as_bytes())?;
     Ok(())
 }
 

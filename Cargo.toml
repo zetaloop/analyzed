@@ -1,9 +1,23 @@
 [workspace]
 members = [
+    "crates/analyzed-bridge",
     "crates/analyzed",
     "crates/analyzed-daemon",
     "crates/analyzed-ipc",
     "crates/analyzed-ra",
+    "crates/analyzed-ra-base-db",
+    "crates/analyzed-ra-hir",
+    "crates/analyzed-ra-hir-def",
+    "crates/analyzed-ra-hir-expand",
+    "crates/analyzed-ra-hir-ty",
+    "crates/analyzed-ra-ide",
+    "crates/analyzed-ra-ide-assists",
+    "crates/analyzed-ra-ide-completion",
+    "crates/analyzed-ra-ide-db",
+    "crates/analyzed-ra-ide-diagnostics",
+    "crates/analyzed-ra-ide-ssr",
+    "crates/analyzed-ra-load-cargo",
+    "crates/analyzed-ra-project-model",
 ]
 resolver = "3"
 
@@ -16,7 +30,7 @@ license = "MIT"
 [workspace.dependencies]
 analyzed-daemon = { path = "crates/analyzed-daemon" }
 analyzed-ipc = { path = "crates/analyzed-ipc" }
-analyzed-ra = { path = "crates/analyzed-ra" }
+ra_ap_rust-analyzer = { path = "crates/analyzed-ra" }
 
 anyhow = "1.0.102"
 camino = "1.2.2"

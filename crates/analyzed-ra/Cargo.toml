@@ -1,117 +1,110 @@
 [package]
-name = "analyzed-ra"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+name = "ra_ap_rust-analyzer"
+version = "0.0.334"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
 
 [lib]
+name = "ra_ap_rust_analyzer"
+path = "src/lib.rs"
 doctest = false
 test = false
 
+[features]
+dhat = ["dep:dhat"]
+force-always-assert = ["stdx/force-always-assert"]
+in-rust-tree = ["cfg/in-rust-tree", "hir-def/in-rust-tree", "hir-ty/in-rust-tree", "hir/in-rust-tree", "ide-ssr/in-rust-tree", "ide/in-rust-tree", "load-cargo/in-rust-tree", "parser/in-rust-tree", "proc-macro-api/in-rust-tree", "syntax/in-rust-tree"]
+jemalloc = ["jemallocator", "profile/jemalloc"]
+
 [build-dependencies]
-flate2 = "1.1.5"
-sha2 = "0.10.9"
-tar = "0.4.44"
+analyzed-bridge = { path = "../analyzed-bridge" }
 toml = "0.9.8"
 
-[dev-dependencies]
-ra_ap_rust-analyzer = "=0.0.334"
-
 [dependencies]
-anyhow = "1.0.98"
-base64 = "0.22"
-cargo_metadata = "0.23.0"
+anyhow = { version = "1.0.98" }
+base64 = { version = "0.22" }
+cargo_metadata = { version = "0.23.0" }
 cfg = { version = "=0.0.334", package = "ra_ap_cfg", features = ["tt", "syntax"] }
-crossbeam-channel = "0.5.15"
-dirs = "6.0.0"
-dissimilar = "1.0.10"
-hir = { version = "=0.0.334", package = "ra_ap_hir" }
-hir-def = { version = "=0.0.334", package = "ra_ap_hir_def" }
-hir-ty = { version = "=0.0.334", package = "ra_ap_hir_ty" }
-ide = { version = "=0.0.334", package = "ra_ap_ide" }
-ide-completion = { version = "=0.0.334", package = "ra_ap_ide_completion" }
-ide-db = { version = "=0.0.334", package = "ra_ap_ide_db" }
-ide-ssr = { version = "=0.0.334", package = "ra_ap_ide_ssr" }
+crossbeam-channel = { version = "0.5.15" }
+dhat = { version = "0.3.3", optional = true }
+dirs = { version = "6.0.0" }
+dissimilar = { version = "1.0.10" }
+hir = { path = "../analyzed-ra-hir", package = "ra_ap_hir" }
+hir-def = { path = "../analyzed-ra-hir-def", package = "ra_ap_hir_def" }
+hir-ty = { path = "../analyzed-ra-hir-ty", package = "ra_ap_hir_ty" }
+ide = { path = "../analyzed-ra-ide", package = "ra_ap_ide" }
+ide-completion = { path = "../analyzed-ra-ide-completion", package = "ra_ap_ide_completion" }
+ide-db = { path = "../analyzed-ra-ide-db", package = "ra_ap_ide_db" }
+ide-ssr = { path = "../analyzed-ra-ide-ssr", package = "ra_ap_ide_ssr" }
 indexmap = { version = "2.9.0", features = ["serde"] }
-itertools = "0.14.0"
-load-cargo = { version = "=0.0.334", package = "ra_ap_load-cargo" }
-lsp-server = "0.7.9"
+itertools = { version = "0.14.0" }
+load-cargo = { path = "../analyzed-ra-load-cargo", package = "ra_ap_load-cargo" }
+lsp-server = { version = "0.7.9" }
 lsp-types = { version = "=0.95.0", features = ["proposed"] }
-memchr = "2.7.5"
-mimalloc = { version = "0.1.46", optional = true, default-features = false }
-num_cpus = "1.17.0"
-oorandom = "11.1.5"
-parking_lot = "0.12.4"
+memchr = { version = "2.7.5" }
+mimalloc = { version = "0.1.46", default-features = false, optional = true }
+num_cpus = { version = "1.17.0" }
+oorandom = { version = "11.1.5" }
+parking_lot = { version = "0.12.4" }
 parser = { version = "=0.0.334", package = "ra_ap_parser" }
 paths = { version = "=0.0.334", package = "ra_ap_paths" }
 proc-macro-api = { version = "=0.0.334", package = "ra_ap_proc_macro_api" }
 process-wrap = { version = "8.2.1", features = ["std"] }
 profile = { version = "=0.0.334", package = "ra_ap_profile" }
-project-model = { version = "=0.0.334", package = "ra_ap_project_model" }
+project-model = { path = "../analyzed-ra-project-model", package = "ra_ap_project_model" }
 ra-ap-rustc_type_ir = { version = "0.165", default-features = false }
-rayon = "1.10.0"
-rustc-hash = "2.1.1"
-scip = "0.7.1"
-semver = "1.0.26"
-serde = "1.0.219"
-serde_derive = "1.0.219"
+rayon = { version = "1.10.0" }
+rustc-hash = { version = "2.1.1" }
+scip = { version = "0.7.1" }
+semver = { version = "1.0.26" }
+serde = { version = "1.0.219" }
+serde_derive = { version = "1.0.219" }
 serde_json = { version = "1.0.140", features = ["preserve_order"] }
 smallvec = { version = "1.15.1", features = ["const_new", "union", "const_generics"] }
 stdx = { version = "=0.0.334", package = "ra_ap_stdx" }
 syntax = { version = "=0.0.334", package = "ra_ap_syntax" }
-tenthash = "1.1.0"
-toml = "0.9.8"
+tenthash = { version = "1.1.0" }
+toml = { version = "0.9.8" }
 toolchain = { version = "=0.0.334", package = "ra_ap_toolchain" }
 tracing = { version = "0.1.41", features = ["std"], default-features = false }
 tracing-subscriber = { version = "0.3.20", features = ["registry", "fmt", "local-time", "std", "time", "tracing-log"], default-features = false }
-tracing-tree = "0.4.0"
+tracing-tree = { version = "0.4.0" }
 triomphe = { version = "0.1.14", features = ["std"], default-features = false }
 vfs = { version = "=0.0.334", package = "ra_ap_vfs" }
 vfs-notify = { version = "=0.0.334", package = "ra_ap_vfs-notify" }
-walkdir = "2.5.0"
-xflags = "0.3.2"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug", "Win32_System_Threading"] }
+walkdir = { version = "2.5.0" }
+xflags = { version = "0.3.2" }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemallocator = { version = "0.5.4", package = "tikv-jemallocator", optional = true }
 
-[features]
-dhat = ["dep:dhat"]
-force-always-assert = ["stdx/force-always-assert"]
-in-rust-tree = [
-    "cfg/in-rust-tree",
-    "hir-def/in-rust-tree",
-    "hir-ty/in-rust-tree",
-    "hir/in-rust-tree",
-    "ide-ssr/in-rust-tree",
-    "ide/in-rust-tree",
-    "load-cargo/in-rust-tree",
-    "parser/in-rust-tree",
-    "proc-macro-api/in-rust-tree",
-    "syntax/in-rust-tree",
-]
-jemalloc = ["jemallocator", "profile/jemalloc"]
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug", "Win32_System_Threading"] }
 
-[dependencies.dhat]
-version = "0.3.3"
-optional = true
+[dev-dependencies]
+ra_ap_rust-analyzer = "=0.0.334"
 
 [lints.clippy]
 assigning_clones = "allow"
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
 dbg_macro = "warn"
 enum_variant_names = "allow"
 len_without_is_empty = "allow"
 literal_string_with_formatting_args = "allow"
 new_ret_no_self = "allow"
+perf = { level = "deny", priority = -1 }
 print_stderr = "warn"
 print_stdout = "warn"
 rc_buffer = "warn"
+restriction = { level = "allow", priority = -1 }
 result_unit_err = "allow"
 single_match = "allow"
 str_to_string = "warn"
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
 todo = "warn"
 too_long_first_doc_paragraph = "allow"
 too_many_arguments = "allow"
@@ -121,39 +114,11 @@ useless_asref = "allow"
 vec_init_then_push = "allow"
 wrong_self_convention = "allow"
 
-[lints.clippy.complexity]
-level = "warn"
-priority = -1
-
-[lints.clippy.correctness]
-level = "deny"
-priority = -1
-
-[lints.clippy.perf]
-level = "deny"
-priority = -1
-
-[lints.clippy.restriction]
-level = "allow"
-priority = -1
-
-[lints.clippy.style]
-level = "warn"
-priority = -1
-
-[lints.clippy.suspicious]
-level = "warn"
-priority = -1
-
 [lints.rust]
 elided_lifetimes_in_paths = "warn"
 explicit_outlives_requirements = "warn"
+unexpected_cfgs = { level = "warn", priority = 0, check-cfg = ["cfg(bootstrap)", "cfg(no_salsa_async_drops)"] }
 unreachable_pub = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 unused_extern_crates = "warn"
 unused_lifetimes = "warn"
-
-[lints.rust.unexpected_cfgs]
-level = "warn"
-priority = 0
-check-cfg = ["cfg(bootstrap)", "cfg(no_salsa_async_drops)"]

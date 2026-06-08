@@ -20,10 +20,12 @@ use analyzed_ipc::{
     StartupLock, Stop, WorkspaceSnapshot, WorkspaceViewKey, bind_listener, read_json_line,
     write_json_line,
 };
-use analyzed_ra::{SharedAnalyzerConfig, SharedAnalyzerSession, SharedWorld, WorkspaceView};
 use crossbeam_channel::unbounded;
 use daemonize::Daemonize;
 use lsp_server::{Connection, Message};
+use ra_ap_rust_analyzer::{
+    SharedAnalyzerConfig, SharedAnalyzerSession, SharedWorld, WorkspaceView,
+};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -535,7 +537,7 @@ fn handle_lsp_session(
         shared_config,
     } = context;
     let backend_session = state.register_backend_session(backend_key, shared_config)?;
-    let result = analyzed_ra::run_shared_rust_analyzer_lsp_session(
+    let result = ra_ap_rust_analyzer::run_shared_rust_analyzer_lsp_session(
         connection,
         backend_session.shared_session.clone(),
     );
@@ -605,7 +607,7 @@ fn lsp_session_context(message: &Message) -> anyhow::Result<LspSessionContext> {
         );
     }
 
-    let context = analyzed_ra::shared_analyzer_session_context(&request.params)?;
+    let context = ra_ap_rust_analyzer::shared_analyzer_session_context(&request.params)?;
 
     Ok(LspSessionContext {
         backend_key: backend_key_from_shared(context.backend_key),
@@ -613,7 +615,7 @@ fn lsp_session_context(message: &Message) -> anyhow::Result<LspSessionContext> {
     })
 }
 
-fn backend_key_from_shared(key: analyzed_ra::SharedAnalyzerBackendKey) -> BackendKey {
+fn backend_key_from_shared(key: ra_ap_rust_analyzer::SharedAnalyzerBackendKey) -> BackendKey {
     BackendKey {
         shared_world: SharedWorldKey {
             rust_analyzer_version: key.shared_world.rust_analyzer_version,
@@ -635,7 +637,9 @@ fn backend_key_from_shared(key: analyzed_ra::SharedAnalyzerBackendKey) -> Backen
     }
 }
 
-fn cargo_config_key_from_shared(key: analyzed_ra::SharedAnalyzerCargoConfigKey) -> CargoConfigKey {
+fn cargo_config_key_from_shared(
+    key: ra_ap_rust_analyzer::SharedAnalyzerCargoConfigKey,
+) -> CargoConfigKey {
     CargoConfigKey {
         all_targets: key.all_targets,
         features: key.features,
@@ -657,13 +661,15 @@ fn cargo_config_key_from_shared(key: analyzed_ra::SharedAnalyzerCargoConfigKey) 
     }
 }
 
-fn load_key_from_shared(key: analyzed_ra::SharedAnalyzerLoadKey) -> SharedWorldLoadKey {
+fn load_key_from_shared(key: ra_ap_rust_analyzer::SharedAnalyzerLoadKey) -> SharedWorldLoadKey {
     SharedWorldLoadKey {
         load_out_dirs_from_check: key.load_out_dirs_from_check,
         proc_macro_server: match key.proc_macro_server {
-            analyzed_ra::SharedAnalyzerProcMacroServerKey::None => ProcMacroServerKey::None,
-            analyzed_ra::SharedAnalyzerProcMacroServerKey::Sysroot => ProcMacroServerKey::Sysroot,
-            analyzed_ra::SharedAnalyzerProcMacroServerKey::Explicit(path) => {
+            ra_ap_rust_analyzer::SharedAnalyzerProcMacroServerKey::None => ProcMacroServerKey::None,
+            ra_ap_rust_analyzer::SharedAnalyzerProcMacroServerKey::Sysroot => {
+                ProcMacroServerKey::Sysroot
+            }
+            ra_ap_rust_analyzer::SharedAnalyzerProcMacroServerKey::Explicit(path) => {
                 ProcMacroServerKey::Explicit(path)
             }
         },

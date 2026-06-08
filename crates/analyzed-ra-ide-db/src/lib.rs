@@ -3,7 +3,4 @@
 #![allow(macro_expanded_macro_exports_accessed_by_absolute_paths)]
 #![allow(unfulfilled_lint_expectations)]
 
-include!(concat!(
-    env!("OUT_DIR"),
-    "/ra_ap_rust_analyzer_bridge/src/lib.rs"
-));
+include!(concat!(env!("OUT_DIR"), "/ra_ap_ide_db_bridge/src/lib.rs"));

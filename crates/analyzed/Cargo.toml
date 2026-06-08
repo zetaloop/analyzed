@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 analyzed-daemon.workspace = true
 analyzed-ipc.workspace = true
-analyzed-ra.workspace = true
+ra_ap_rust-analyzer.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true

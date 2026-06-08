@@ -1,0 +1,72 @@
+[package]
+name = "ra_ap_ide_completion"
+version = "0.0.334"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+[lib]
+name = "ra_ap_ide_completion"
+path = "src/lib.rs"
+doctest = false
+test = false
+
+[features]
+default = []
+in-rust-tree = []
+
+[build-dependencies]
+analyzed-bridge = { path = "../analyzed-bridge" }
+
+[dependencies]
+base-db = { path = "../analyzed-ra-base-db", package = "ra_ap_base_db" }
+cov-mark = { version = "2.0.0" }
+hir = { path = "../analyzed-ra-hir", package = "ra_ap_hir" }
+ide-db = { path = "../analyzed-ra-ide-db", package = "ra_ap_ide_db" }
+itertools = { version = "0.14.0" }
+macros = { version = "=0.0.334", package = "ra_ap_macros" }
+smallvec = { version = "1.15.1", features = ["const_new", "union", "const_generics"] }
+stdx = { version = "=0.0.334", package = "ra_ap_stdx" }
+syntax = { version = "=0.0.334", package = "ra_ap_syntax" }
+tracing = { version = "0.1.41", features = ["std"], default-features = false }
+
+[dev-dependencies]
+ra_ap_ide_completion = "=0.0.334"
+
+[lints.clippy]
+assigning_clones = "allow"
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+dbg_macro = "warn"
+enum_variant_names = "allow"
+len_without_is_empty = "allow"
+literal_string_with_formatting_args = "allow"
+new_ret_no_self = "allow"
+perf = { level = "deny", priority = -1 }
+print_stderr = "warn"
+print_stdout = "warn"
+rc_buffer = "warn"
+restriction = { level = "allow", priority = -1 }
+result_unit_err = "allow"
+single_match = "allow"
+str_to_string = "warn"
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+todo = "warn"
+too_long_first_doc_paragraph = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+unnecessary_map_or = "allow"
+useless_asref = "allow"
+vec_init_then_push = "allow"
+wrong_self_convention = "allow"
+
+[lints.rust]
+elided_lifetimes_in_paths = "warn"
+explicit_outlives_requirements = "warn"
+unexpected_cfgs = { level = "warn", priority = 0, check-cfg = ["cfg(bootstrap)", "cfg(no_salsa_async_drops)"] }
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_extern_crates = "warn"
+unused_lifetimes = "warn"
