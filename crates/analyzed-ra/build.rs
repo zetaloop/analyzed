@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     verify_manifest_matches_bridge(&generated.join("Cargo.toml"))?;
     let generated_src = generated.join("src");
     patch_global_state_source(&generated_src.join("global_state.rs"))?;
+    patch_flycheck_to_proto_source(&generated_src.join("diagnostics/flycheck_to_proto.rs"))?;
     patch_main_loop_source(&generated_src.join("main_loop.rs"))?;
     write_bridge_module(&generated_src.join("analyzed_bridge.rs"), &package.version)?;
     append_main_loop_session_module(&generated_src.join("main_loop.rs"))?;
@@ -327,6 +328,24 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
     Ok(())
 }
 
+fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(flycheck_to_proto_rs)?;
+
+    replace_once(
+        &mut source,
+        "use vfs::{AbsPath, AbsPathBuf};\n",
+        "use vfs::{AbsPath, AbsPathBuf, VfsPath};\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    let uri = url_from_abs_path(&file_name);\n",
+        "    let uri = snap\n        .vfs_path_to_file_id(&VfsPath::from(file_name.clone()))\n        .ok()\n        .flatten()\n        .map(|file_id| snap.file_id_to_url(file_id))\n        .unwrap_or_else(|| url_from_abs_path(&file_name));\n",
+    )?;
+
+    fs::write(flycheck_to_proto_rs, source)?;
+    Ok(())
+}
+
 fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(main_loop_rs)?;
 
@@ -344,6 +363,18 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
         &mut source,
         "                    match url_to_file_id(&self.vfs.read().0, &diag.url) {\n",
         "                    match self.analyzed_url_to_file_id(&diag.url) {\n",
+    )?;
+    replace_once(
+        &mut source,
+        "                let diagnostics =
+                    self.diagnostics.diagnostics_for(file_id).cloned().collect::<Vec<_>>();
+                self.publish_diagnostics(uri, version, diagnostics);
+",
+        "                let diagnostics =
+                    self.diagnostics.diagnostics_for(file_id).cloned().collect::<Vec<_>>();
+                let diagnostics = self.analyzed_filter_diagnostics(diagnostics);
+                self.publish_diagnostics(uri, version, diagnostics);
+",
     )?;
     replace_once(
         &mut source,
@@ -2251,6 +2282,42 @@ pub(crate) mod analyzed_session {
 
             crate::global_state::url_to_file_id(&self.vfs.read().0, url)
         }
+
+        pub(crate) fn analyzed_filter_diagnostics(
+            &self,
+            diagnostics: Vec<lsp_types::Diagnostic>,
+        ) -> Vec<lsp_types::Diagnostic> {
+            if self.analyzed_shared.is_none() {
+                return diagnostics;
+            }
+
+            let rustc_diagnostics = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.source.as_deref() == Some("rustc"))
+                .map(analyzed_diagnostic_key)
+                .collect::<Vec<_>>();
+
+            diagnostics
+                .into_iter()
+                .filter(|diagnostic| {
+                    diagnostic.source.as_deref() != Some("rust-analyzer")
+                        || !rustc_diagnostics
+                            .iter()
+                            .any(|key| *key == analyzed_diagnostic_key(diagnostic))
+                })
+                .collect()
+        }
+    }
+
+    fn analyzed_diagnostic_key(
+        diagnostic: &lsp_types::Diagnostic,
+    ) -> (lsp_types::Range, Option<String>) {
+        let code = diagnostic.code.as_ref().map(|code| match code {
+            lsp_types::NumberOrString::Number(code) => code.to_string(),
+            lsp_types::NumberOrString::String(code) => code.clone(),
+        });
+
+        (diagnostic.range, code)
     }
 
     fn config_from_initialize_params(
