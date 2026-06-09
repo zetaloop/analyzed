@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     env, fs,
     io::{BufReader, ErrorKind},
     os::unix::net::UnixStream,
@@ -24,7 +24,7 @@ use crossbeam_channel::unbounded;
 use daemonize::Daemonize;
 use lsp_server::{Connection, Message};
 use ra_ap_rust_analyzer::{
-    SharedAnalyzerConfig, SharedAnalyzerSession, SharedWorld, WorkspaceView,
+    SharedAnalyzerConfig, SharedAnalyzerProvider, SharedAnalyzerSession, SharedWorld, WorkspaceView,
 };
 use serde::Serialize;
 
@@ -261,22 +261,18 @@ impl ServiceState {
         }
     }
 
-    fn register_backend_session(
+    fn resolve_backend_session(
         self: &Arc<Self>,
         key: BackendKey,
         shared_config: Arc<SharedAnalyzerConfig>,
-    ) -> anyhow::Result<BackendSession> {
+    ) -> anyhow::Result<SharedAnalyzerSession> {
         let shared_session = self
             .backends
             .lock()
             .map_err(|error| anyhow::format_err!("backend registry mutex is poisoned: {error}"))?
             .register(key.clone(), shared_config)?;
 
-        Ok(BackendSession {
-            state: Arc::clone(self),
-            key,
-            shared_session,
-        })
+        Ok(shared_session)
     }
 
     fn unregister_backend_session(&self, key: &BackendKey) {
@@ -453,15 +449,54 @@ fn overlay_files(world: &Arc<Mutex<SharedWorld>>) -> usize {
         .overlay_files()
 }
 
-struct BackendSession {
+struct BackendSessionRefs {
     state: Arc<ServiceState>,
-    key: BackendKey,
-    shared_session: SharedAnalyzerSession,
+    keys: Mutex<BTreeSet<BackendKey>>,
 }
 
-impl Drop for BackendSession {
+impl BackendSessionRefs {
+    fn new(state: Arc<ServiceState>) -> Self {
+        Self {
+            state,
+            keys: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    fn resolve(
+        &self,
+        key: BackendKey,
+        shared_config: Arc<SharedAnalyzerConfig>,
+    ) -> anyhow::Result<SharedAnalyzerSession> {
+        let mut keys = self
+            .keys
+            .lock()
+            .map_err(|error| anyhow::format_err!("backend session mutex is poisoned: {error}"))?;
+        if keys.contains(&key) {
+            return self
+                .state
+                .backends
+                .lock()
+                .map_err(|error| {
+                    anyhow::format_err!("backend registry mutex is poisoned: {error}")
+                })?
+                .shared_session(&key);
+        }
+
+        let session = self
+            .state
+            .resolve_backend_session(key.clone(), shared_config)?;
+        keys.insert(key);
+        Ok(session)
+    }
+}
+
+impl Drop for BackendSessionRefs {
     fn drop(&mut self) {
-        self.state.unregister_backend_session(&self.key);
+        if let Ok(keys) = self.keys.get_mut() {
+            for key in keys.iter() {
+                self.state.unregister_backend_session(key);
+            }
+        }
     }
 }
 
@@ -531,16 +566,14 @@ fn handle_lsp_session(
     state: Arc<ServiceState>,
     _session_id: usize,
 ) -> anyhow::Result<()> {
-    let (connection, threads, context) = lsp_stream_connection(stream)?;
-    let LspSessionContext {
-        backend_key,
-        shared_config,
-    } = context;
-    let backend_session = state.register_backend_session(backend_key, shared_config)?;
-    let result = ra_ap_rust_analyzer::run_shared_rust_analyzer_lsp_session(
-        connection,
-        backend_session.shared_session.clone(),
-    );
+    let (connection, threads) = lsp_stream_connection(stream)?;
+    let backend_refs = Arc::new(BackendSessionRefs::new(Arc::clone(&state)));
+    let provider_backend_refs = Arc::clone(&backend_refs);
+    let provider = SharedAnalyzerProvider::new(move |key, shared_config| {
+        provider_backend_refs.resolve(backend_key_from_shared(key), shared_config)
+    });
+    let result = ra_ap_rust_analyzer::run_shared_rust_analyzer_lsp_session(connection, provider);
+    drop(backend_refs);
     let join_result = threads.join();
 
     match (result, join_result) {
@@ -550,20 +583,13 @@ fn handle_lsp_session(
     }
 }
 
-struct LspSessionContext {
-    backend_key: BackendKey,
-    shared_config: Arc<SharedAnalyzerConfig>,
-}
-
-fn lsp_stream_connection(
-    stream: UnixStream,
-) -> anyhow::Result<(Connection, LspStreamThreads, LspSessionContext)> {
+fn lsp_stream_connection(stream: UnixStream) -> anyhow::Result<(Connection, LspStreamThreads)> {
     let reader_stream = stream.try_clone()?;
     let mut reader = BufReader::new(reader_stream);
     let initialize = Message::read(&mut reader)?.ok_or_else(|| {
         anyhow::anyhow!("lsp client disconnected before sending initialize request")
     })?;
-    let context = lsp_session_context(&initialize)?;
+    validate_initialize(&initialize)?;
     let (writer_sender, writer_receiver) = unbounded::<Message>();
     let (reader_sender, reader_receiver) = unbounded::<Message>();
     reader_sender.send(initialize)?;
@@ -592,11 +618,10 @@ fn lsp_stream_connection(
             receiver: reader_receiver,
         },
         LspStreamThreads { reader, writer },
-        context,
     ))
 }
 
-fn lsp_session_context(message: &Message) -> anyhow::Result<LspSessionContext> {
+fn validate_initialize(message: &Message) -> anyhow::Result<()> {
     let Message::Request(request) = message else {
         anyhow::bail!("lsp client sent a non-request message before initialize");
     };
@@ -607,12 +632,7 @@ fn lsp_session_context(message: &Message) -> anyhow::Result<LspSessionContext> {
         );
     }
 
-    let context = ra_ap_rust_analyzer::shared_analyzer_session_context(&request.params)?;
-
-    Ok(LspSessionContext {
-        backend_key: backend_key_from_shared(context.backend_key),
-        shared_config: context.config,
-    })
+    Ok(())
 }
 
 fn backend_key_from_shared(key: ra_ap_rust_analyzer::SharedAnalyzerBackendKey) -> BackendKey {

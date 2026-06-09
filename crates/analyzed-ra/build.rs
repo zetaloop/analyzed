@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     patch_global_state_source(&generated_src.join("global_state.rs"))?;
     patch_flycheck_to_proto_source(&generated_src.join("diagnostics/flycheck_to_proto.rs"))?;
     patch_main_loop_source(&generated_src.join("main_loop.rs"))?;
+    patch_reload_source(&generated_src.join("reload.rs"))?;
     write_bridge_module(&generated_src.join("analyzed_bridge.rs"), &package.version)?;
     append_main_loop_session_module(&generated_src.join("main_loop.rs"))?;
     append_bridge_export(&generated_src.join("lib.rs"))?;
@@ -232,11 +233,11 @@ fn append_bridge_export(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 	    PackageInstance, PackageInstanceKey, RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary,
 	    SessionOverlay, SessionOverlayCrate, SessionOverlayFile, SharedAnalyzerBackendKey,
 	    SharedAnalyzerCargoConfigKey, SharedAnalyzerConfig,
-	    SharedAnalyzerLoadKey, SharedAnalyzerProcMacroServerKey, SharedAnalyzerSession,
-	    SharedAnalyzerSessionContext, SharedAnalyzerWorldConfigKey, SharedAnalyzerWorldKey,
+	    SharedAnalyzerLoadKey, SharedAnalyzerProcMacroServerKey, SharedAnalyzerProvider,
+	    SharedAnalyzerSession, SharedAnalyzerWorldConfigKey, SharedAnalyzerWorldKey,
 	    SharedAnalyzerViewKey, SharedWorld, WorkspaceSummary, WorkspaceView,
 	    run_shared_rust_analyzer_lsp_session, rust_analyzer_lsp_boundary,
-	    rust_analyzer_private_boundary, shared_analyzer_session_context,
+	    rust_analyzer_private_boundary,
 	};
 	"#,
     )?;
@@ -256,7 +257,7 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
     replace_once(
         &mut source,
         "    pub(crate) analysis_host: AnalysisHost,\n    pub(crate) diagnostics: DiagnosticCollection,\n",
-        "    pub(crate) analysis_host: AnalysisHost,\n    pub(crate) analyzed_shared: Option<crate::analyzed_bridge::SharedAnalyzerRuntime>,\n    pub(crate) diagnostics: DiagnosticCollection,\n",
+        "    pub(crate) analysis_host: AnalysisHost,\n    pub(crate) analyzed_provider: Option<crate::analyzed_bridge::SharedAnalyzerProvider>,\n    pub(crate) analyzed_shared: Option<crate::analyzed_bridge::SharedAnalyzerRuntime>,\n    pub(crate) diagnostics: DiagnosticCollection,\n",
     )?;
     replace_once(
         &mut source,
@@ -266,7 +267,12 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
     replace_once(
         &mut source,
         "            analysis_host,\n            diagnostics: Default::default(),\n",
-        "            analysis_host,\n            analyzed_shared: None,\n            diagnostics: Default::default(),\n",
+        "            analysis_host,\n            analyzed_provider: None,\n            analyzed_shared: None,\n            diagnostics: Default::default(),\n",
+    )?;
+    replace_once(
+        &mut source,
+        "pub(crate) struct FetchWorkspaceResponse {\n    pub(crate) workspaces: Vec<anyhow::Result<ProjectWorkspace>>,\n    pub(crate) force_crate_graph_reload: bool,\n}\n",
+        "#[derive(Debug)]\npub(crate) struct FetchWorkspaceResponse {\n    pub(crate) workspaces: Vec<anyhow::Result<ProjectWorkspace>>,\n    pub(crate) force_crate_graph_reload: bool,\n    pub(crate) analyzed_shared: Option<crate::analyzed_bridge::SharedAnalyzerRuntime>,\n}\n",
     )?;
     replace_once(
         &mut source,
@@ -351,9 +357,26 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
 
     replace_once(
         &mut source,
+        "    FetchWorkspace(ProjectWorkspaceProgress),\n    FetchBuildData(BuildDataProgress),\n",
+        "    FetchWorkspace(ProjectWorkspaceProgress),\n    AnalyzedFetchWorkspace(FetchWorkspaceResponse),\n    FetchBuildData(BuildDataProgress),\n",
+    )?;
+
+    replace_once(
+        &mut source,
         "    global_state::{\n        FetchBuildDataResponse, FetchWorkspaceRequest, FetchWorkspaceResponse, GlobalState,\n        file_id_to_url, url_to_file_id,\n    },\n",
         "    global_state::{\n        FetchBuildDataResponse, FetchWorkspaceRequest, FetchWorkspaceResponse, GlobalState,\n    },\n",
     )?;
+    replace_once(
+        &mut source,
+        "                        let resp = FetchWorkspaceResponse { workspaces, force_crate_graph_reload };\n",
+        "                        let resp = FetchWorkspaceResponse {\n                            workspaces,\n                            force_crate_graph_reload,\n                            analyzed_shared: None,\n                        };\n",
+    )?;
+    replace_once(
+        &mut source,
+        "            Task::DiscoverLinkedProjects(arg) => {\n",
+        "            Task::AnalyzedFetchWorkspace(resp) => {\n                self.fetch_workspaces_queue.op_completed(resp);\n                if let Err(e) = self.fetch_workspace_error() {\n                    error!(\"FetchWorkspaceError: {e}\");\n                }\n                self.wants_to_switch = Some(\"fetched workspace\".to_owned());\n                self.diagnostics.clear_check_all();\n                self.report_progress(\"Fetching\", Progress::End, None, None, None);\n            }\n            Task::DiscoverLinkedProjects(arg) => {\n",
+    )?;
+
     replace_once(
         &mut source,
         "                let uri = file_id_to_url(&self.vfs.read().0, file_id);\n",
@@ -383,6 +406,24 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     )?;
 
     fs::write(main_loop_rs, source)?;
+    Ok(())
+}
+
+fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(reload_rs)?;
+
+    replace_once(
+        &mut source,
+        "        info!(%cause, \"will fetch workspaces\");\n\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, {\n",
+        "        info!(%cause, \"will fetch workspaces\");\n\n        if let Some(provider) = self.analyzed_provider.clone() {\n            let shared_context = crate::analyzed_bridge::shared_analyzer_context_from_config(&self.config);\n            self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {\n                sender.send(Task::FetchWorkspace(ProjectWorkspaceProgress::Begin)).unwrap();\n                let response = match shared_context {\n                    Ok((key, config)) => provider\n                        .resolve(key, config)\n                        .and_then(|session| session.snapshot())\n                        .map(|snapshot| FetchWorkspaceResponse {\n                            workspaces: snapshot.workspaces.into_iter().map(Ok).collect(),\n                            force_crate_graph_reload,\n                            analyzed_shared: Some(snapshot.runtime),\n                        })\n                        .unwrap_or_else(|error| FetchWorkspaceResponse {\n                            workspaces: vec![Err(error)],\n                            force_crate_graph_reload,\n                            analyzed_shared: None,\n                        }),\n                    Err(error) => FetchWorkspaceResponse {\n                        workspaces: vec![Err(error)],\n                        force_crate_graph_reload,\n                        analyzed_shared: None,\n                    },\n                };\n                sender.send(Task::AnalyzedFetchWorkspace(response)).unwrap();\n            });\n            return;\n        }\n\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, {\n",
+    )?;
+    replace_once(
+        &mut source,
+        "        let Some(FetchWorkspaceResponse { workspaces, force_crate_graph_reload }) =\n            self.fetch_workspaces_queue.last_op_result()\n        else {\n            return;\n        };\n",
+        "        let Some(FetchWorkspaceResponse {\n            workspaces,\n            force_crate_graph_reload,\n            analyzed_shared,\n        }) = self.fetch_workspaces_queue.last_op_result()\n        else {\n            return;\n        };\n        if let Some(shared) = analyzed_shared.clone() {\n            self.analyzed_shared = Some(shared);\n        }\n",
+    )?;
+
+    fs::write(reload_rs, source)?;
     Ok(())
 }
 
@@ -469,9 +510,43 @@ pub fn rust_analyzer_private_boundary() -> RustAnalyzerPrivateBoundary {
 
 pub fn run_shared_rust_analyzer_lsp_session(
     connection: lsp_server::Connection,
-    session: SharedAnalyzerSession,
+    provider: SharedAnalyzerProvider,
 ) -> anyhow::Result<()> {
-    crate::main_loop::analyzed_session::run_shared_lsp_session(connection, session)
+    crate::main_loop::analyzed_session::run_shared_lsp_session(connection, provider)
+}
+
+#[derive(Clone)]
+pub struct SharedAnalyzerProvider {
+    resolve: Arc<
+        dyn Fn(
+                SharedAnalyzerBackendKey,
+                Arc<SharedAnalyzerConfig>,
+            ) -> anyhow::Result<SharedAnalyzerSession>
+            + Send
+            + Sync
+            + std::panic::RefUnwindSafe,
+    >,
+}
+
+impl SharedAnalyzerProvider {
+    pub fn new<F>(resolve: F) -> Self
+    where
+        F: Fn(SharedAnalyzerBackendKey, Arc<SharedAnalyzerConfig>) -> anyhow::Result<SharedAnalyzerSession>
+            + Send
+            + Sync
+            + std::panic::RefUnwindSafe
+            + 'static,
+    {
+        Self { resolve: Arc::new(resolve) }
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        key: SharedAnalyzerBackendKey,
+        config: Arc<SharedAnalyzerConfig>,
+    ) -> anyhow::Result<SharedAnalyzerSession> {
+        (self.resolve)(key, config)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -544,54 +619,20 @@ pub struct SharedAnalyzerAnalysisKey {
     pub workspace_configuration: Option<String>,
 }
 
-pub fn shared_analyzer_session_context(
-    initialize_params: &serde_json::Value,
-) -> anyhow::Result<SharedAnalyzerSessionContext> {
-    let lsp_types::InitializeParams {
-        root_uri,
-        capabilities,
-        workspace_folders,
-        initialization_options,
-        client_info,
-        ..
-    } = crate::from_json::<lsp_types::InitializeParams>("InitializeParams", initialize_params)?;
-    let root_path = root_path_from_initialize(root_uri)?;
-    let workspace_roots = workspace_roots_from_initialize(&root_path, workspace_folders)?;
-    let mut config = crate::config::Config::new(
-        root_path,
-        capabilities,
-        workspace_roots
-            .iter()
-            .filter_map(|root| AbsPathBuf::try_from(root.as_str()).ok())
-            .collect(),
-        client_info,
-    );
-
-    if let Some(json) = initialization_options.clone() {
-        let mut change = crate::config::ConfigChange::default();
-        change.change_client_config(json);
-
-        let errors: crate::config::ConfigErrors;
-        (config, errors, _) = config.apply_change(change);
-        if !errors.is_empty() {
-            tracing::warn!("rust-analyzer config errors while deriving backend key: {errors}");
-        }
-    }
-
-    if config.discover_workspace_config().is_none()
-        && !config.has_linked_projects()
-        && config.detached_files().is_empty()
-    {
-        config.rediscover_workspaces();
-    }
-
+pub(crate) fn shared_analyzer_context_from_config(
+    config: &crate::config::Config,
+) -> anyhow::Result<(SharedAnalyzerBackendKey, Arc<SharedAnalyzerConfig>)> {
+    let mut workspace_roots = config
+        .workspace_roots()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    workspace_roots.sort();
+    workspace_roots.dedup();
     let cargo_config = config.cargo(None);
-    let load = shared_load_config_from_config(&config)?;
+    let load = shared_load_config_from_config(config)?;
     let analysis = SharedAnalyzerAnalysisKey {
-        initialization_options: initialization_options
-            .as_ref()
-            .map(canonical_json_string)
-            .transpose()?,
+        initialization_options: None,
         workspace_configuration: None,
     };
     let backend_key = SharedAnalyzerBackendKey {
@@ -614,19 +655,14 @@ pub fn shared_analyzer_session_context(
         },
     };
 
-    Ok(SharedAnalyzerSessionContext {
+    Ok((
         backend_key,
-        config: Arc::new(SharedAnalyzerConfig {
+        Arc::new(SharedAnalyzerConfig {
             workspace_roots,
             cargo_config,
             load,
         }),
-    })
-}
-
-pub struct SharedAnalyzerSessionContext {
-    pub backend_key: SharedAnalyzerBackendKey,
-    pub config: Arc<SharedAnalyzerConfig>,
+    ))
 }
 
 pub struct SharedAnalyzerConfig {
@@ -662,44 +698,6 @@ impl SharedLoadConfig {
             proc_macro_processes: self.key.proc_macro_processes as usize,
         }
     }
-}
-
-fn root_path_from_initialize(root_uri: Option<lsp_types::Url>) -> anyhow::Result<AbsPathBuf> {
-    match root_uri
-        .and_then(|it| it.to_file_path().ok())
-        .map(patch_path_prefix)
-        .and_then(|it| std::fs::canonicalize(it).ok())
-        .and_then(|it| paths::Utf8PathBuf::from_path_buf(it).ok())
-        .and_then(|it| AbsPathBuf::try_from(it).ok())
-    {
-        Some(path) => Ok(path),
-        None => Ok(AbsPathBuf::assert_utf8(std::fs::canonicalize(env::current_dir()?)?)),
-    }
-}
-
-fn workspace_roots_from_initialize(
-    root_path: &AbsPathBuf,
-    workspace_folders: Option<Vec<lsp_types::WorkspaceFolder>>,
-) -> anyhow::Result<Vec<String>> {
-    let mut roots = workspace_folders
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|workspace| workspace.uri.to_file_path().ok())
-        .map(patch_path_prefix)
-        .map(std::fs::canonicalize)
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-
-    if roots.is_empty() {
-        roots.push(root_path.to_string());
-    }
-
-    roots.sort();
-    roots.dedup();
-
-    Ok(roots)
 }
 
 fn shared_load_config_from_config(
@@ -754,47 +752,6 @@ fn cargo_config_key(config: &CargoConfig) -> SharedAnalyzerCargoConfigKey {
         no_deps: config.no_deps,
         metadata_extra_args: config.metadata_extra_args.clone(),
     }
-}
-
-fn canonical_json_string(value: &serde_json::Value) -> anyhow::Result<String> {
-    let mut output = String::new();
-    write_canonical_json(value, &mut output)?;
-    Ok(output)
-}
-
-fn write_canonical_json(value: &serde_json::Value, output: &mut String) -> anyhow::Result<()> {
-    match value {
-        serde_json::Value::Null => output.push_str("null"),
-        serde_json::Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
-        serde_json::Value::Number(value) => output.push_str(&value.to_string()),
-        serde_json::Value::String(value) => output.push_str(&serde_json::to_string(value)?),
-        serde_json::Value::Array(values) => {
-            output.push('[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(',');
-                }
-                write_canonical_json(value, output)?;
-            }
-            output.push(']');
-        }
-        serde_json::Value::Object(values) => {
-            output.push('{');
-            for (index, (key, value)) in
-                values.iter().collect::<BTreeMap<_, _>>().iter().enumerate()
-            {
-                if index != 0 {
-                    output.push(',');
-                }
-                output.push_str(&serde_json::to_string(key)?);
-                output.push(':');
-                write_canonical_json(value, output)?;
-            }
-            output.push('}');
-        }
-    }
-
-    Ok(())
 }
 
 pub(crate) fn patch_path_prefix(path: PathBuf) -> PathBuf {
@@ -882,6 +839,14 @@ impl Drop for SharedAnalyzerRuntimeSession {
         if let Ok(mut world) = self.world.lock() {
             world.unregister_session(self.id);
         }
+    }
+}
+
+impl std::fmt::Debug for SharedAnalyzerRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedAnalyzerRuntime")
+            .field("session", &self.session_id())
+            .finish_non_exhaustive()
     }
 }
 
@@ -1431,10 +1396,17 @@ impl SharedWorld {
             .filter_map(|(path, display_path, text, line_endings)| {
                 let key = path_key(&path);
                 self.base_file_for_vfs_path(&normalize_vfs_path(&path))
-                    .map(|base_file| {
+                    .and_then(|base_file| {
+                        let db = self.host.raw_database();
+                        let base_text = db.file_text(base_file).text(db);
+                        if base_text.as_ref() == text.as_str() {
+                            return None;
+                        }
+                        Some(
                         (
                             key,
                             (path, display_path, base_file, text, line_endings),
+                        )
                         )
                     })
             })
@@ -2044,16 +2016,13 @@ pub(crate) mod analyzed_session {
     use lsp_server::{Connection, Message};
     use lsp_types::Url;
     use paths::Utf8PathBuf;
-    use triomphe::Arc;
     use vfs::AbsPathBuf;
 
     use crate::{
-        analyzed_bridge::{
-            SharedAnalyzerSession, SharedAnalyzerSnapshot, patch_path_prefix,
-        },
+        analyzed_bridge::{SharedAnalyzerProvider, patch_path_prefix},
         config::{Config, ConfigChange, ConfigErrors},
         from_json, server_capabilities, version,
-        global_state::{FetchWorkspaceRequest, FetchWorkspaceResponse},
+        global_state::FetchWorkspaceRequest,
         line_index::LineEndings,
     };
 
@@ -2068,18 +2037,15 @@ pub(crate) mod analyzed_session {
             }
         }
 
-        pub(crate) fn new_with_shared_snapshot(
+        pub(crate) fn new_with_shared_provider(
             sender: Sender<Message>,
             config: crate::config::Config,
-            snapshot: SharedAnalyzerSnapshot,
-        ) -> anyhow::Result<Self> {
+            provider: SharedAnalyzerProvider,
+        ) -> Self {
             let mut session = Self::new(sender, config);
-            let workspaces = snapshot.workspaces;
-            let runtime = snapshot.runtime;
-            session.state.analyzed_shared = Some(runtime);
-            install_shared_workspaces(&mut session.state, workspaces);
+            session.state.analyzed_provider = Some(provider);
 
-            Ok(session)
+            session
         }
 
         pub(crate) fn run_shared(self, receiver: Receiver<Message>) -> anyhow::Result<()> {
@@ -2089,7 +2055,7 @@ pub(crate) mod analyzed_session {
 
     pub(crate) fn run_shared_lsp_session(
         connection: Connection,
-        session: SharedAnalyzerSession,
+        provider: SharedAnalyzerProvider,
     ) -> anyhow::Result<()> {
         let (initialize_id, initialize_params) = connection.initialize_start()?;
         tracing::info!("InitializeParams: {}", initialize_params);
@@ -2113,52 +2079,8 @@ pub(crate) mod analyzed_session {
         }
 
         initialize_rayon();
-        let snapshot = session.snapshot()?;
         let Connection { sender, receiver } = connection;
-        RustAnalyzerSession::new_with_shared_snapshot(sender, config, snapshot)?.run_shared(receiver)
-    }
-
-    fn install_shared_workspaces(
-        state: &mut crate::global_state::GlobalState,
-        workspaces: Vec<project_model::ProjectWorkspace>,
-    ) {
-        let fetched_workspaces = workspaces.iter().cloned().map(Ok).collect();
-        let source_root_config = {
-            let files_config = state.config.files();
-            load_cargo::ProjectFolders::new(
-                &workspaces,
-                &files_config.exclude,
-                Config::user_config_dir_path().as_deref(),
-            )
-            .source_root_config
-        };
-        state.source_root_config = source_root_config;
-        state.local_roots_parent_map = Arc::new(state.source_root_config.source_root_parent_map());
-        state.workspaces = Arc::new(workspaces);
-        state.fetch_workspaces_queue.request_op(
-            "startup".to_owned(),
-            FetchWorkspaceRequest {
-                path: None,
-                force_crate_graph_reload: false,
-            },
-        );
-        _ = state.fetch_workspaces_queue.should_start_op();
-        state.fetch_workspaces_queue.op_completed(FetchWorkspaceResponse {
-            workspaces: fetched_workspaces,
-            force_crate_graph_reload: false,
-        });
-        state.vfs_done = true;
-        state.finish_loading_crate_graph();
-
-        if state.config.check_on_save(None)
-            && state.config.flycheck_workspace(None)
-            && !state.fetch_build_data_queue.op_requested()
-        {
-            state
-                .flycheck
-                .iter()
-                .for_each(|flycheck| flycheck.restart_workspace(None));
-        }
+        RustAnalyzerSession::new_with_shared_provider(sender, config, provider).run_shared(receiver)
     }
 
     fn run_shared_state(
@@ -2176,6 +2098,18 @@ pub(crate) mod analyzed_session {
                 .flatten()
                 .map(|file| format!("**/{file}"));
             state.register_did_save_capability(additional_patterns);
+        }
+
+        if state.config.discover_workspace_config().is_none() {
+            state.fetch_workspaces_queue.request_op(
+                "startup".to_owned(),
+                FetchWorkspaceRequest { path: None, force_crate_graph_reload: false },
+            );
+            if let Some((cause, FetchWorkspaceRequest { path, force_crate_graph_reload })) =
+                state.fetch_workspaces_queue.should_start_op()
+            {
+                state.fetch_workspaces(cause, path, force_crate_graph_reload);
+            }
         }
 
         while let Ok(event) = state.next_event(&inbox) {
