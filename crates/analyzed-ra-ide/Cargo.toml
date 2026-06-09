@@ -24,7 +24,7 @@ cfg = { version = "=0.0.334", package = "ra_ap_cfg", features = ["tt", "syntax"]
 cov-mark = { version = "2.0.0" }
 dot = { version = "0.1.4" }
 either = { version = "1.15.0" }
-hir = { path = "../analyzed-ra-hir", package = "ra_ap_hir" }
+hir = { version = "=0.0.334", package = "ra_ap_hir" }
 ide-assists = { path = "../analyzed-ra-ide-assists", package = "ra_ap_ide_assists" }
 ide-completion = { path = "../analyzed-ra-ide-completion", package = "ra_ap_ide_completion" }
 ide-db = { path = "../analyzed-ra-ide-db", package = "ra_ap_ide_db" }

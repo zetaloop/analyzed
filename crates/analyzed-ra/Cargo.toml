@@ -31,9 +31,9 @@ crossbeam-channel = { version = "0.5.15" }
 dhat = { version = "0.3.3", optional = true }
 dirs = { version = "6.0.0" }
 dissimilar = { version = "1.0.10" }
-hir = { path = "../analyzed-ra-hir", package = "ra_ap_hir" }
-hir-def = { path = "../analyzed-ra-hir-def", package = "ra_ap_hir_def" }
-hir-ty = { path = "../analyzed-ra-hir-ty", package = "ra_ap_hir_ty" }
+hir = { version = "=0.0.334", package = "ra_ap_hir" }
+hir-def = { version = "=0.0.334", package = "ra_ap_hir_def" }
+hir-ty = { version = "=0.0.334", package = "ra_ap_hir_ty" }
 ide = { path = "../analyzed-ra-ide", package = "ra_ap_ide" }
 ide-completion = { path = "../analyzed-ra-ide-completion", package = "ra_ap_ide_completion" }
 ide-db = { path = "../analyzed-ra-ide-db", package = "ra_ap_ide_db" }
@@ -53,7 +53,7 @@ paths = { version = "=0.0.334", package = "ra_ap_paths" }
 proc-macro-api = { version = "=0.0.334", package = "ra_ap_proc_macro_api" }
 process-wrap = { version = "8.2.1", features = ["std"] }
 profile = { version = "=0.0.334", package = "ra_ap_profile" }
-project-model = { path = "../analyzed-ra-project-model", package = "ra_ap_project_model" }
+project-model = { version = "=0.0.334", package = "ra_ap_project_model" }
 ra-ap-rustc_type_ir = { version = "0.165", default-features = false }
 rayon = { version = "1.10.0" }
 rustc-hash = { version = "2.1.1" }

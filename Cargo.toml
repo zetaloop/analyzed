@@ -5,11 +5,6 @@ members = [
     "crates/analyzed-daemon",
     "crates/analyzed-ipc",
     "crates/analyzed-ra",
-    "crates/analyzed-ra-base-db",
-    "crates/analyzed-ra-hir",
-    "crates/analyzed-ra-hir-def",
-    "crates/analyzed-ra-hir-expand",
-    "crates/analyzed-ra-hir-ty",
     "crates/analyzed-ra-ide",
     "crates/analyzed-ra-ide-assists",
     "crates/analyzed-ra-ide-completion",
@@ -17,7 +12,6 @@ members = [
     "crates/analyzed-ra-ide-diagnostics",
     "crates/analyzed-ra-ide-ssr",
     "crates/analyzed-ra-load-cargo",
-    "crates/analyzed-ra-project-model",
 ]
 resolver = "3"
 

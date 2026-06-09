@@ -21,13 +21,13 @@ analyzed-bridge = { path = "../analyzed-bridge" }
 
 [dependencies]
 arrayvec = { version = "0.7.6" }
-base-db = { path = "../analyzed-ra-base-db", package = "ra_ap_base_db" }
+base-db = { version = "=0.0.334", package = "ra_ap_base_db" }
 bitflags = { version = "2.9.1" }
 cov-mark = { version = "2.0.0" }
 crossbeam-channel = { version = "0.5.15" }
 either = { version = "1.15.0" }
 fst = { version = "0.4.7", default-features = false }
-hir = { path = "../analyzed-ra-hir", package = "ra_ap_hir" }
+hir = { version = "=0.0.334", package = "ra_ap_hir" }
 itertools = { version = "0.14.0" }
 line-index = { version = "0.1.2" }
 macros = { version = "=0.0.334", package = "ra_ap_macros" }

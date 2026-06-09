@@ -10,6 +10,7 @@ const GENERATED_DIR: &str = "ra_ap_ide_bridge";
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (generated, _) = build_support::prepare_bridge_package(PACKAGE, GENERATED_DIR)?;
     patch_ide_source(&generated.join("src/lib.rs"))?;
+    patch_view_crate_graph_source(&generated.join("src/view_crate_graph.rs"))?;
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())
 }
@@ -24,5 +25,18 @@ fn patch_ide_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     )?;
 
     fs::write(lib_rs, source)?;
+    Ok(())
+}
+
+fn patch_view_crate_graph_source(view_crate_graph_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(view_crate_graph_rs)?;
+
+    replace_once(
+        &mut source,
+        "    let all_crates = all_crates(db);\n    let crates_to_render = all_crates\n        .iter()\n        .copied()\n",
+        "    let all_crates = db.analyzed_visible_base_crates(all_crates(db).iter().copied());\n    let crates_to_render = all_crates\n        .into_iter()\n",
+    )?;
+
+    fs::write(view_crate_graph_rs, source)?;
     Ok(())
 }
