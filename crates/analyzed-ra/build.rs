@@ -22,6 +22,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     patch_discover_source(&generated_src.join("discover.rs"))?;
     patch_flycheck_to_proto_source(&generated_src.join("diagnostics/flycheck_to_proto.rs"))?;
     patch_notification_source(&generated_src.join("handlers/notification.rs"))?;
+    patch_dispatch_source(&generated_src.join("handlers/dispatch.rs"))?;
     patch_main_loop_source(&generated_src.join("main_loop.rs"))?;
     patch_reload_source(&generated_src.join("reload.rs"))?;
     patch_test_tool_attributes(&generated_src)?;
@@ -543,8 +544,61 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
         "    let file_id = state.vfs.read().0.file_id(&vfs_path);\n    if let Some((file_id, vfs::FileExcluded::No)) = file_id {\n",
         "    let file_id = state.analyzed_shared.base_vfs_path_to_file_id(&vfs_path);\n    if let Ok(Some(file_id)) = file_id {\n",
     )?;
+    replace_once(
+        &mut source,
+        "    global_state::{FetchWorkspaceRequest, GlobalState},\n",
+        "    global_state::{FetchWorkspaceRequest, GlobalState, GlobalStateSnapshot},\n",
+    )?;
+    replace_once(
+        &mut source,
+        "        let task: Box<dyn FnOnce() -> ide::Cancellable<()> + Send + UnwindSafe> =\n            match invocation_strategy {\n",
+        "        let task: Box<dyn Fn(&GlobalStateSnapshot) -> ide::Cancellable<()> + Send + UnwindSafe> =\n            match invocation_strategy {\n",
+    )?;
+    replace_once(
+        &mut source,
+        "                InvocationStrategy::Once => {\n                    Box::new(move || {\n",
+        "                InvocationStrategy::Once => {\n                    Box::new(move |world: &GlobalStateSnapshot| {\n",
+    )?;
+    replace_once(
+        &mut source,
+        "                        let world = world;\n",
+        "",
+    )?;
+    replace_once(
+        &mut source,
+        "                InvocationStrategy::PerWorkspace => {\n                    Box::new(move || {\n",
+        "                InvocationStrategy::PerWorkspace => {\n                    Box::new(move |world: &GlobalStateSnapshot| {\n",
+    )?;
+    replace_once(
+        &mut source,
+        "                        let target = TargetSpec::for_file(&world, file_id)?.map(|it| {\n",
+        "                        let target = TargetSpec::for_file(world, file_id)?.map(|it| {\n",
+    )?;
+    replace_once(
+        &mut source,
+        "        state.task_pool.handle.spawn_with_sender(stdx::thread::ThreadIntent::Worker, move |_| {\n            if let Err(e) = std::panic::catch_unwind(task) {\n                tracing::error!(\"flycheck task panicked: {e:?}\")\n            }\n        });\n        true\n",
+        "        let analyzed_shared = state.analyzed_shared.clone();\n        state.task_pool.handle.spawn_with_sender(stdx::thread::ThreadIntent::Worker, move |_| {\n            let mut world = world;\n            loop {\n                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(&world))) {\n                    Ok(Ok(())) => break,\n                    Ok(Err(_cancelled)) => world.analysis = analyzed_shared.analysis(),\n                    Err(e) => {\n                        tracing::error!(\"flycheck task panicked: {e:?}\");\n                        break;\n                    }\n                }\n            }\n        });\n        true\n",
+    )?;
 
     fs::write(notification_rs, source)?;
+    Ok(())
+}
+
+fn patch_dispatch_source(dispatch_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(dispatch_rs)?;
+
+    replace_once(
+        &mut source,
+        "        let world = self.global_state.snapshot();\n",
+        "        let world = self.global_state.snapshot();\n        let dispatched_edit_generation = world.analyzed_shared.edit_generation();\n        let analyzed_shared = world.analyzed_shared.clone();\n",
+    )?;
+    replace_once(
+        &mut source,
+        "            match thread_result_to_response::<R>(req.id.clone(), result) {\n                Ok(response) => Task::Response(response),\n                Err(_cancelled) if ALLOW_RETRYING => Task::Retry(req),\n                Err(_cancelled) => {\n                    let error = on_cancelled();\n                    Task::Response(Response { id: req.id, result: None, error: Some(error) })\n                }\n            }\n",
+        "            match thread_result_to_response::<R>(req.id.clone(), result) {\n                Ok(response) => Task::Response(response),\n                Err(_cancelled) if ALLOW_RETRYING => Task::Retry(req),\n                Err(_cancelled)\n                    if analyzed_shared.edit_generation() == dispatched_edit_generation =>\n                {\n                    // The cancellation came from another session's write to the shared\n                    // world; this session's inputs are unchanged, so the request is\n                    // still meaningful and can be retried.\n                    Task::Retry(req)\n                }\n                Err(_cancelled) => {\n                    let error = on_cancelled();\n                    Task::Response(Response { id: req.id, result: None, error: Some(error) })\n                }\n            }\n",
+    )?;
+
+    fs::write(dispatch_rs, source)?;
     Ok(())
 }
 
@@ -929,7 +983,7 @@ const BRIDGE_MODULE: &str = r#"
 	    path::{Path, PathBuf},
 	    sync::{
 	        Arc, Condvar, Mutex, OnceLock, Weak,
-	        atomic::{AtomicBool, AtomicU32, Ordering},
+	        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 	    },
 	    thread,
 	    time::Duration,
@@ -940,9 +994,9 @@ const BRIDGE_MODULE: &str = r#"
 	use ide_db::{
 	    FxHashMap,
 	    base_db::{
-	        CrateGraphBuilder, DependencyBuilder, FileSet, ProcMacroPaths, SourceDatabase,
-	        SourceRoot, SourceRootId, all_crates,
-	        salsa::{Database, Durability},
+	        CrateGraphBuilder, DependencyBuilder, FileSet, LibraryRoots, LocalRoots,
+	        ProcMacroPaths, SourceDatabase, SourceRoot, SourceRootId, all_crates,
+	        salsa::{Database, Durability, Setter as _},
 	    },
 	};
 	use load_cargo::{
@@ -1831,6 +1885,9 @@ struct SharedAnalyzerRuntimeSession {
     world: Arc<Mutex<SharedWorld>>,
     id: u64,
     activity: Arc<AtomicBool>,
+    input_generation: Arc<AtomicU64>,
+    config_generation_seen: AtomicU64,
+    edit_generation: AtomicU64,
     workspace_indexes: Vec<usize>,
     excluded_paths: Vec<String>,
     line_endings: Mutex<SharedLineEndings>,
@@ -1889,7 +1946,7 @@ impl SharedAnalyzerRuntime {
         excluded_paths: Vec<String>,
         registry_lease: Option<SharedAnalyzerRegistryLease>,
     ) -> Self {
-        let (id, activity) = world
+        let (id, activity, input_generation) = world
             .lock()
             .expect("shared world mutex poisoned")
             .register_session();
@@ -1897,6 +1954,9 @@ impl SharedAnalyzerRuntime {
             world: Arc::clone(&world),
             id,
             activity,
+            input_generation,
+            config_generation_seen: AtomicU64::new(u64::MAX),
+            edit_generation: AtomicU64::new(0),
             workspace_indexes,
             excluded_paths,
             line_endings: Mutex::new(SharedLineEndings::default()),
@@ -1915,6 +1975,18 @@ impl SharedAnalyzerRuntime {
 
     pub(crate) fn set_busy(&self, busy: bool) {
         self.session.activity.store(busy, Ordering::SeqCst);
+    }
+
+    pub(crate) fn config_generation_changed(&self) -> bool {
+        let generation = self.session.input_generation.load(Ordering::SeqCst);
+        self.session
+            .config_generation_seen
+            .swap(generation, Ordering::SeqCst)
+            != generation
+    }
+
+    pub(crate) fn edit_generation(&self) -> u64 {
+        self.session.edit_generation.load(Ordering::SeqCst)
     }
 
     fn workspace_indexes(&self) -> &[usize] {
@@ -2093,18 +2165,53 @@ impl SharedAnalyzerRuntime {
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
         let sync = world.sync_session_overlay(self.session_id(), self.workspace_indexes(), files)?;
+        if sync.changed {
+            self.session.edit_generation.fetch_add(1, Ordering::SeqCst);
+        }
         self.refresh_session_cache(&world);
         Ok(sync)
+    }
+
+    pub(crate) fn overlay_needed(
+        &self,
+        files: &[(VfsPath, String, crate::line_index::LineEndings)],
+    ) -> anyhow::Result<bool> {
+        let world = self
+            .world
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
+        if world
+            .session_overlays
+            .get(&self.session_id())
+            .is_some_and(|overlay| !overlay.files_by_path.is_empty())
+        {
+            return Ok(true);
+        }
+
+        let db = world.host.raw_database();
+        for (path, text, _) in files {
+            let Some(base_file) = world
+                .base_file_for_vfs_path_in(self.workspace_indexes(), &normalize_vfs_path(path))
+            else {
+                continue;
+            };
+            if db.file_text(base_file).text(db).as_ref() != text.as_str() {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     pub(crate) fn prepare_overlay_files(
         &self,
         files: Vec<(VfsPath, String, crate::line_index::LineEndings)>,
     ) -> anyhow::Result<Vec<(VfsPath, VfsPath, String, crate::line_index::LineEndings)>> {
-        self.world
+        let world = self
+            .world
             .lock()
-            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
-            .prepare_session_overlay_files(self.workspace_indexes(), files)
+            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
+        world.prepare_session_overlay_files(self.workspace_indexes(), files)
     }
 }
 
@@ -2538,6 +2645,11 @@ pub struct SharedWorld {
     base_max_source_root: Option<u32>,
     session_overlays: BTreeMap<u64, ActiveSessionOverlay>,
     session_activity: BTreeMap<u64, Arc<AtomicBool>>,
+    input_generation: Arc<AtomicU64>,
+    applied_source_roots: Vec<SourceRoot>,
+    applied_local_roots: rustc_hash::FxHashSet<SourceRootId>,
+    applied_library_roots: rustc_hash::FxHashSet<SourceRootId>,
+    applied_overlay_files: rustc_hash::FxHashSet<FileId>,
     next_session_id: u64,
 }
 
@@ -2552,6 +2664,11 @@ impl SharedWorld {
             base_max_source_root: None,
             session_overlays: BTreeMap::new(),
             session_activity: BTreeMap::new(),
+            input_generation: Arc::new(AtomicU64::new(0)),
+            applied_source_roots: Vec::new(),
+            applied_local_roots: rustc_hash::FxHashSet::default(),
+            applied_library_roots: rustc_hash::FxHashSet::default(),
+            applied_overlay_files: rustc_hash::FxHashSet::default(),
             next_session_id: 1,
         }
     }
@@ -2645,6 +2762,18 @@ impl SharedWorld {
         loaded: PreparedWorkspaceLoad,
         reload: bool,
     ) -> anyhow::Result<usize> {
+        let result = self.commit_workspace_inner(loaded, reload);
+        if result.is_ok() {
+            self.input_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn commit_workspace_inner(
+        &mut self,
+        loaded: PreparedWorkspaceLoad,
+        reload: bool,
+    ) -> anyhow::Result<usize> {
         if let Some(&index) = self.workspace_indexes.get(&loaded.root_key) {
             if !reload {
                 return Ok(index);
@@ -2657,12 +2786,13 @@ impl SharedWorld {
                 .map(|(file_id, _)| file_id)
                 .collect::<Vec<_>>();
             self.loaded_workspaces[index] = workspace;
-            let mut change = self.base_input_change(file_texts);
+            let (source_roots, mut change) = self.base_input_change(file_texts);
             for file_id in removed_files {
                 change.change_file(file_id, None);
             }
 
             self.host.raw_database_mut().enable_proc_attr_macros();
+            self.apply_source_roots(source_roots);
             self.host.apply_change(change);
             self.refresh_base_inputs();
             let removed_overlay_files = self.recone_session_overlays()?;
@@ -2676,9 +2806,10 @@ impl SharedWorld {
         let index = self.loaded_workspaces.len();
         self.workspace_indexes.insert(root_key, index);
         self.loaded_workspaces.push(workspace);
-        let change = self.base_input_change(file_texts);
+        let (source_roots, change) = self.base_input_change(file_texts);
 
         self.host.raw_database_mut().enable_proc_attr_macros();
+        self.apply_source_roots(source_roots);
         self.host.apply_change(change);
         self.refresh_base_inputs();
         self.refresh_package_instances()?;
@@ -2712,7 +2843,10 @@ impl SharedWorld {
         )
     }
 
-    fn base_input_change(&self, file_texts: Vec<(FileId, String)>) -> ChangeWithProcMacros {
+    fn base_input_change(
+        &self,
+        file_texts: Vec<(FileId, String)>,
+    ) -> (Vec<SourceRoot>, ChangeWithProcMacros) {
         let mut change = ChangeWithProcMacros::default();
         let mut source_roots = Vec::new();
         let mut crate_graph = CrateGraphBuilder::default();
@@ -2733,24 +2867,75 @@ impl SharedWorld {
             }
         }
 
-        change.set_roots(source_roots);
         change.set_crate_graph(crate_graph);
         change.set_proc_macros(proc_macros);
         for (file_id, text) in file_texts {
             change.change_file(file_id, Some(text));
         }
 
-        change
+        (source_roots, change)
     }
 
-    fn register_session(&mut self) -> (u64, Arc<AtomicBool>) {
+    fn apply_source_roots(&mut self, roots: Vec<SourceRoot>) {
+        let db = self.host.raw_database_mut();
+        let mut local_roots = rustc_hash::FxHashSet::default();
+        let mut library_roots = rustc_hash::FxHashSet::default();
+        for (index, root) in roots.iter().enumerate() {
+            let root_id = SourceRootId(index as u32);
+            if root.is_library {
+                library_roots.insert(root_id);
+            } else {
+                local_roots.insert(root_id);
+            }
+        }
+
+        for (index, root) in roots.into_iter().enumerate() {
+            let root_id = SourceRootId(index as u32);
+            let previous = self.applied_source_roots.get(index);
+            if previous == Some(&root) {
+                continue;
+            }
+
+            let durability = if root.is_library {
+                Durability::MEDIUM
+            } else {
+                Durability::LOW
+            };
+            for file_id in root.iter() {
+                if previous.is_none_or(|previous| previous.path_for_file(&file_id).is_none()) {
+                    db.set_file_source_root_with_durability(file_id, root_id, durability);
+                }
+            }
+            db.set_source_root_with_durability(
+                root_id,
+                triomphe::Arc::new(root.clone()),
+                durability,
+            );
+            if index < self.applied_source_roots.len() {
+                self.applied_source_roots[index] = root;
+            } else {
+                self.applied_source_roots.push(root);
+            }
+        }
+
+        if self.applied_local_roots != local_roots {
+            LocalRoots::get(db).set_roots(db).to(local_roots.clone());
+            self.applied_local_roots = local_roots;
+        }
+        if self.applied_library_roots != library_roots {
+            LibraryRoots::get(db).set_roots(db).to(library_roots.clone());
+            self.applied_library_roots = library_roots;
+        }
+    }
+
+    fn register_session(&mut self) -> (u64, Arc<AtomicBool>, Arc<AtomicU64>) {
         let id = self.next_session_id;
         self.next_session_id += 1;
         self.session_overlays
             .insert(id, ActiveSessionOverlay::default());
         let activity = Arc::new(AtomicBool::new(true));
         self.session_activity.insert(id, Arc::clone(&activity));
-        (id, activity)
+        (id, activity, Arc::clone(&self.input_generation))
     }
 
     fn unregister_session(&mut self, session_id: u64) {
@@ -2988,6 +3173,38 @@ impl SharedWorld {
             });
         }
 
+        let same_file_set = old_overlay.open_files.len() == open_files.len()
+            && open_files
+                .keys()
+                .all(|key| old_overlay.open_files.contains_key(key));
+        if same_file_set {
+            let mut overlay = old_overlay;
+            let mut change = ChangeWithProcMacros::default();
+            for (key, (_, _, _, text, line_endings)) in open_files {
+                let open = overlay
+                    .open_files
+                    .get_mut(&key)
+                    .expect("overlay file set was checked");
+                if open.text == text {
+                    continue;
+                }
+                open.text = text.clone();
+                let file = overlay
+                    .files_by_path
+                    .get_mut(&key)
+                    .expect("overlay file set was checked");
+                file.text = text.clone();
+                file.line_endings = line_endings;
+                change.change_file(open.overlay_file, Some(text));
+            }
+            self.session_overlays.insert(session_id, overlay);
+            self.host.apply_change(change);
+            return Ok(SharedOverlaySync {
+                changed: true,
+                removed_files: Vec::new(),
+            });
+        }
+
         let kept_keys = open_files.keys().cloned().collect::<BTreeSet<_>>();
         let removed_file_ids = old_overlay
             .open_files
@@ -3005,6 +3222,13 @@ impl SharedWorld {
                 .get(&key)
                 .map(|file| file.overlay_file)
             .unwrap_or_else(|| self.allocate_overlay_file_id());
+            if old_overlay
+                .open_files
+                .get(&key)
+                .is_some_and(|old| old.text != text)
+            {
+                self.applied_overlay_files.remove(&overlay_file);
+            }
             overlay.open_files.insert(
                 key.clone(),
                 OpenOverlayFile {
@@ -3125,20 +3349,27 @@ impl SharedWorld {
     }
 
     fn rebuild_overlay_inputs(&mut self, removed_file_ids: Vec<FileId>) -> anyhow::Result<()> {
+        let source_roots = self.overlay_source_roots()?;
         let mut change = ChangeWithProcMacros::default();
-        change.set_roots(self.overlay_source_roots()?);
         change.set_crate_graph(self.overlay_crate_graph()?);
 
         for file_id in removed_file_ids {
+            self.applied_overlay_files.remove(&file_id);
             change.change_file(file_id, None);
         }
 
+        let mut added_files = Vec::new();
         for overlay in self.session_overlays.values() {
             for file in overlay.files_by_path.values() {
-                change.change_file(file.overlay_file, Some(file.text.clone()));
+                if !self.applied_overlay_files.contains(&file.overlay_file) {
+                    added_files.push(file.overlay_file);
+                    change.change_file(file.overlay_file, Some(file.text.clone()));
+                }
             }
         }
+        self.applied_overlay_files.extend(added_files);
 
+        self.apply_source_roots(source_roots);
         self.host.apply_change(change);
         Ok(())
     }
@@ -3753,6 +3984,7 @@ pub(crate) mod analyzed_session {
     impl crate::global_state::GlobalState {
         pub(crate) fn analyzed_process_shared_changes(&mut self) -> bool {
             let shared = self.analyzed_shared.clone();
+            let generation_changed = shared.config_generation_changed();
             let mut modified_ratoml_files = Vec::new();
             let mut workspace_structure_change = None;
             let mut changed = false;
@@ -3816,86 +4048,88 @@ pub(crate) mod analyzed_session {
                 }
             }
 
-            let open_files = self
-                .mem_docs
-                .iter()
-                .filter_map(|path| {
-                    let doc = self.mem_docs.get(path)?;
-                    let text = std::str::from_utf8(&doc.data).ok()?.to_owned();
-                    let (text, line_endings) = LineEndings::normalize(text);
-                    Some((path.clone(), text, line_endings))
-                })
-                .collect::<Vec<_>>();
-
-            let prepared_files = match shared.prepare_overlay_files(open_files) {
-                Ok(files) => files,
-                Err(error) => {
-                    tracing::error!("failed to prepare shared analyzer overlay: {error}");
-                    return false;
-                }
-            };
-            let mut overlay_files = Vec::new();
-            for (path, display_path, text, line_endings) in prepared_files {
-                overlay_files.push((path, display_path, text, line_endings));
-            }
-
-            let sync = match shared.sync_open_files(overlay_files) {
-                Ok(sync) => sync,
-                Err(error) => {
-                    tracing::error!("failed to sync shared analyzer overlay: {error}");
-                    return false;
-                }
-            };
-
-            if sync.changed {
-                changed = true;
-            }
-            for file_id in sync.removed_files {
-                self.diagnostics.clear_native_for(file_id);
-            }
-
-            let mut shared_ratoml_files = if self.workspaces.is_empty() {
-                Vec::new()
-            } else {
-                shared.ratoml_files()
-            };
-            if !self.workspaces.is_empty() {
-                shared_ratoml_files.extend(self.mem_docs.iter().filter_map(|path| {
-                    if path.name_and_extension() != Some(("rust-analyzer", Some("toml"))) {
-                        return None;
-                    }
-
-                    let doc = self.mem_docs.get(path)?;
-                    let text = std::str::from_utf8(&doc.data).ok()?.to_owned();
-                    let (source_root_id, is_library) = shared.source_root_for_path(path)?;
-                    Some((path.clone(), source_root_id, is_library, text))
-                }));
-            }
-            let user_config_path = (|| {
-                let mut path = Config::user_config_dir_path()?;
-                path.push("rust-analyzer.toml");
-                Some(path)
-            })();
-            let user_config_vfs_path =
-                user_config_path.as_ref().map(|path| VfsPath::from(path.clone()));
-            let user_config_text = user_config_vfs_path
-                .as_ref()
-                .and_then(|path| {
-                    self.mem_docs.get(path).and_then(|doc| {
-                        std::str::from_utf8(&doc.data).ok().map(ToOwned::to_owned)
+            if changed || generation_changed {
+                let open_files = self
+                    .mem_docs
+                    .iter()
+                    .filter_map(|path| {
+                        let doc = self.mem_docs.get(path)?;
+                        let text = std::str::from_utf8(&doc.data).ok()?.to_owned();
+                        let (text, line_endings) = LineEndings::normalize(text);
+                        Some((path.clone(), text, line_endings))
                     })
-                })
-                .or_else(|| {
-                    user_config_path
-                        .as_ref()
-                        .and_then(|path| fs::read_to_string(path).ok())
-                });
-            let shared_source_root_parent_map = Arc::new(shared.source_root_parent_map());
-            if !modified_ratoml_files.is_empty()
-                || !shared_ratoml_files.is_empty()
-                || user_config_text.is_some()
-                || !self.config.same_source_root_parent_map(&shared_source_root_parent_map)
-            {
+                    .collect::<Vec<_>>();
+
+                let overlay_needed = match shared.overlay_needed(&open_files) {
+                    Ok(needed) => needed,
+                    Err(error) => {
+                        tracing::error!("failed to check shared analyzer overlay: {error}");
+                        return false;
+                    }
+                };
+                if overlay_needed {
+                    let overlay_files = match shared.prepare_overlay_files(open_files) {
+                        Ok(files) => files,
+                        Err(error) => {
+                            tracing::error!(
+                                "failed to prepare shared analyzer overlay: {error}"
+                            );
+                            return false;
+                        }
+                    };
+                    let sync = match shared.sync_open_files(overlay_files) {
+                        Ok(sync) => sync,
+                        Err(error) => {
+                            tracing::error!("failed to sync shared analyzer overlay: {error}");
+                            return false;
+                        }
+                    };
+
+                    if sync.changed {
+                        changed = true;
+                    }
+                    for file_id in sync.removed_files {
+                        self.diagnostics.clear_native_for(file_id);
+                    }
+                }
+            }
+
+            let config_input_changed = generation_changed || !modified_ratoml_files.is_empty();
+            if config_input_changed && !self.workspaces.is_empty() {
+                let shared_ratoml_files = {
+                    let mut files = shared.ratoml_files();
+                    files.extend(self.mem_docs.iter().filter_map(|path| {
+                        if path.name_and_extension() != Some(("rust-analyzer", Some("toml"))) {
+                            return None;
+                        }
+
+                        let doc = self.mem_docs.get(path)?;
+                        let text = std::str::from_utf8(&doc.data).ok()?.to_owned();
+                        let (source_root_id, is_library) = shared.source_root_for_path(path)?;
+                        Some((path.clone(), source_root_id, is_library, text))
+                    }));
+                    files
+                };
+                let user_config_path = (|| {
+                    let mut path = Config::user_config_dir_path()?;
+                    path.push("rust-analyzer.toml");
+                    Some(path)
+                })();
+                let user_config_vfs_path =
+                    user_config_path.as_ref().map(|path| VfsPath::from(path.clone()));
+                let user_config_text = user_config_vfs_path
+                    .as_ref()
+                    .and_then(|path| {
+                        self.mem_docs.get(path).and_then(|doc| {
+                            std::str::from_utf8(&doc.data).ok().map(ToOwned::to_owned)
+                        })
+                    })
+                    .or_else(|| {
+                        user_config_path
+                            .as_ref()
+                            .and_then(|path| fs::read_to_string(path).ok())
+                    });
+                let shared_source_root_parent_map = Arc::new(shared.source_root_parent_map());
                 let source_roots = {
                     let guard = self.vfs.read();
                     self.source_root_config.partition(&guard.0)
@@ -3917,7 +4151,6 @@ pub(crate) mod analyzed_session {
                 }
                 changed = true;
             }
-
             if !matches!(&workspace_structure_change, Some((.., true))) {
                 let modified_rust_files = self
                     .mem_docs
