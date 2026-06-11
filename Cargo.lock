@@ -588,6 +588,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "expect-test"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63af43ff4431e848fb47472a920f14fa71c24de13255a5692e93d4e90302acb0"
+dependencies = [
+ "dissimilar",
+ "once_cell",
+]
+
+[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1736,6 +1746,7 @@ dependencies = [
  "cov-mark",
  "dot",
  "either",
+ "expect-test",
  "itertools",
  "nohash-hasher",
  "oorandom",
@@ -1754,6 +1765,8 @@ dependencies = [
  "ra_ap_span",
  "ra_ap_stdx",
  "ra_ap_syntax",
+ "ra_ap_test_fixture",
+ "ra_ap_test_utils",
  "ra_ap_toolchain",
  "rustc-hash 2.1.2",
  "rustc_apfloat",
@@ -1878,6 +1891,7 @@ dependencies = [
  "cov-mark",
  "crossbeam-channel",
  "either",
+ "expect-test",
  "fst",
  "itertools",
  "line-index",
@@ -1892,6 +1906,8 @@ dependencies = [
  "ra_ap_span",
  "ra_ap_stdx",
  "ra_ap_syntax",
+ "ra_ap_test_fixture",
+ "ra_ap_test_utils",
  "ra_ap_vfs",
  "rayon",
  "rustc-hash 2.1.2",
@@ -2201,6 +2217,7 @@ dependencies = [
  "dhat",
  "dirs",
  "dissimilar",
+ "expect-test",
  "indexmap",
  "itertools",
  "lsp-server",
@@ -2220,6 +2237,7 @@ dependencies = [
  "ra_ap_ide_completion 0.0.334",
  "ra_ap_ide_db 0.0.334",
  "ra_ap_ide_ssr 0.0.334",
+ "ra_ap_intern",
  "ra_ap_load-cargo 0.0.334",
  "ra_ap_parser",
  "ra_ap_paths",
@@ -2229,6 +2247,8 @@ dependencies = [
  "ra_ap_rust-analyzer 0.0.334 (registry+https://github.com/rust-lang/crates.io-index)",
  "ra_ap_stdx",
  "ra_ap_syntax",
+ "ra_ap_test_fixture",
+ "ra_ap_test_utils",
  "ra_ap_toolchain",
  "ra_ap_vfs",
  "ra_ap_vfs-notify",

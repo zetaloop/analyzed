@@ -18,12 +18,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     verify_manifest_matches_bridge(&generated.join("Cargo.toml"))?;
     let generated_src = generated.join("src");
     patch_global_state_source(&generated_src.join("global_state.rs"))?;
+    patch_config_source(&generated_src.join("config.rs"))?;
     patch_flycheck_to_proto_source(&generated_src.join("diagnostics/flycheck_to_proto.rs"))?;
     patch_main_loop_source(&generated_src.join("main_loop.rs"))?;
     patch_reload_source(&generated_src.join("reload.rs"))?;
+    patch_test_tool_attributes(&generated_src)?;
     write_bridge_module(&generated_src.join("analyzed_bridge.rs"), &package.version)?;
     append_main_loop_session_module(&generated_src.join("main_loop.rs"))?;
     append_bridge_export(&generated_src.join("lib.rs"))?;
+    let slow_tests = generated.join("tests/slow-tests");
+    patch_slow_tests(&slow_tests)?;
+    let slow_tests_wrapper = write_slow_tests_wrapper(&slow_tests)?;
+    println!(
+        "cargo:rustc-env=ANALYZED_RA_SLOW_TESTS={}",
+        slow_tests_wrapper.display()
+    );
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())
 }
@@ -251,6 +260,27 @@ fn append_main_loop_session_module(main_loop_rs: &Path) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+fn patch_config_source(config_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(config_rs)?;
+    source = source.replace("ra_ap_rust_analyzer", "rust_analyzer");
+
+    for guard in [
+        "fn generate_package_json_config() {",
+        "fn generate_config_documentation() {",
+    ] {
+        replace_once(
+            &mut source,
+            &format!("    #[test]\n    {guard}"),
+            &format!(
+                "    #[test]\n    #[ignore = \"regenerates files from the rust-analyzer source tree\"]\n    {guard}"
+            ),
+        )?;
+    }
+
+    fs::write(config_rs, source)?;
+    Ok(())
+}
+
 fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(global_state_rs)?;
 
@@ -425,6 +455,80 @@ fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
 
     fs::write(reload_rs, source)?;
     Ok(())
+}
+
+fn patch_test_tool_attributes(src_dir: &Path) -> Result<(), Box<dyn Error>> {
+    for relative_path in ["cli/scip.rs", "lsp/to_proto.rs"] {
+        let path = src_dir.join(relative_path);
+        let source = fs::read_to_string(&path)?;
+        let source = source
+            .replace("#[ra_ap_rust_analyzer::rust_fixture] ", "")
+            .replace("#[ra_ap_rust_analyzer::rust_fixture]", "")
+            .replace("#[rust_analyzer::rust_fixture] ", "")
+            .replace("#[rust_analyzer::rust_fixture]", "");
+        fs::write(path, source)?;
+    }
+    Ok(())
+}
+
+fn patch_slow_tests(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
+    for name in ["main.rs", "ratoml.rs", "support.rs"] {
+        patch_slow_tests_imports(&slow_tests.join(name))?;
+    }
+    Ok(())
+}
+
+fn patch_slow_tests_imports(path: &Path) -> Result<(), Box<dyn Error>> {
+    let source = fs::read_to_string(path)?;
+    let source = source
+        .replace("use rust_analyzer::", "use ra_ap_rust_analyzer::")
+        .replace(" rust_analyzer::", " ra_ap_rust_analyzer::")
+        .replace("<rust_analyzer::", "<ra_ap_rust_analyzer::");
+    fs::write(path, source)?;
+    Ok(())
+}
+
+fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let main_rs = slow_tests.join("main.rs");
+    let mut body = String::new();
+    for line in fs::read_to_string(&main_rs)?.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//!")
+            || matches!(
+                trimmed,
+                "#![allow(clippy::disallowed_types)]"
+                    | "#![cfg_attr(feature = \"in-rust-tree\", feature(rustc_private))]"
+            )
+            || matches!(
+                trimmed,
+                "mod cli;" | "mod flycheck;" | "mod ratoml;" | "mod support;" | "mod testdir;"
+            )
+        {
+            continue;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+
+    let body_rs = slow_tests.join("analyzed-slow-tests-main.rs");
+    fs::write(&body_rs, body)?;
+    let wrapper_rs = slow_tests.join("analyzed-slow-tests.rs");
+    fs::write(
+        &wrapper_rs,
+        format!(
+            "#[path = {:?}]\nmod cli;\n#[path = {:?}]\nmod flycheck;\n#[path = {:?}]\nmod ratoml;\n#[path = {:?}]\nmod support;\n#[path = {:?}]\nmod testdir;\ninclude!({:?});\n",
+            slow_tests.join("cli.rs").to_string_lossy().into_owned(),
+            slow_tests
+                .join("flycheck.rs")
+                .to_string_lossy()
+                .into_owned(),
+            slow_tests.join("ratoml.rs").to_string_lossy().into_owned(),
+            slow_tests.join("support.rs").to_string_lossy().into_owned(),
+            slow_tests.join("testdir.rs").to_string_lossy().into_owned(),
+            body_rs.to_string_lossy().into_owned(),
+        ),
+    )?;
+    Ok(wrapper_rs)
 }
 
 fn replace_once(

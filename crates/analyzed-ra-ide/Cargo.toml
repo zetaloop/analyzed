@@ -51,7 +51,10 @@ url = { version = "2.5.4" }
 toolchain = { version = "=0.0.334", package = "ra_ap_toolchain" }
 
 [dev-dependencies]
+expect-test = "1.5.1"
 ra_ap_ide = "=0.0.334"
+test-fixture = { version = "=0.0.334", package = "ra_ap_test_fixture" }
+test-utils = { version = "=0.0.334", package = "ra_ap_test_utils" }
 
 [lints.clippy]
 assigning_clones = "allow"

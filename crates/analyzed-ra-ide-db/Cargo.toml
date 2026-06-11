@@ -43,11 +43,14 @@ smallvec = { version = "1.15.1", features = ["const_new", "union", "const_generi
 span = { version = "=0.0.334", package = "ra_ap_span" }
 stdx = { version = "=0.0.334", package = "ra_ap_stdx" }
 syntax = { version = "=0.0.334", package = "ra_ap_syntax" }
+test-fixture = { version = "=0.0.334", package = "ra_ap_test_fixture" }
+test-utils = { version = "=0.0.334", package = "ra_ap_test_utils" }
 tracing = { version = "0.1.41", features = ["std", "attributes"], default-features = false }
 triomphe = { version = "0.1.14", features = ["std"], default-features = false }
 vfs = { version = "=0.0.334", package = "ra_ap_vfs" }
 
 [dev-dependencies]
+expect-test = "1.5.1"
 ra_ap_ide_db = "=0.0.334"
 
 [lints.clippy]
