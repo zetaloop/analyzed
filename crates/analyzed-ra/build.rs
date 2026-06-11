@@ -19,6 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let generated_src = generated.join("src");
     patch_global_state_source(&generated_src.join("global_state.rs"))?;
     patch_config_source(&generated_src.join("config.rs"))?;
+    patch_discover_source(&generated_src.join("discover.rs"))?;
     patch_flycheck_to_proto_source(&generated_src.join("diagnostics/flycheck_to_proto.rs"))?;
     patch_main_loop_source(&generated_src.join("main_loop.rs"))?;
     patch_reload_source(&generated_src.join("reload.rs"))?;
@@ -244,9 +245,10 @@ fn append_bridge_export(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 	    SharedAnalyzerCargoConfigKey, SharedAnalyzerConfig,
 	    SharedAnalyzerBackendSnapshot, SharedAnalyzerLoadKey,
 	    SharedAnalyzerProcMacroServerKey, SharedAnalyzerProvider, SharedAnalyzerRegistry,
-	    SharedAnalyzerSession, SharedAnalyzerWorldConfigKey, SharedAnalyzerWorldKey,
+	    SharedAnalyzerSession, SharedAnalyzerSnapshot, SharedAnalyzerWorldConfigKey, SharedAnalyzerWorldKey,
 	    SharedAnalyzerViewKey, SharedWorld, WorkspaceSummary, WorkspaceView,
-	    run_shared_rust_analyzer_lsp_session, rust_analyzer_lsp_boundary,
+	    run_shared_rust_analyzer_lsp_session, run_shared_rust_analyzer_lsp_session_with_config,
+	    rust_analyzer_lsp_boundary,
 	    rust_analyzer_private_boundary, shared_analyzer_registry,
 	};
 	"#,
@@ -282,58 +284,163 @@ fn patch_config_source(config_rs: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn patch_discover_source(discover_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(discover_rs)?;
+    replace_once(
+        &mut source,
+        "    Buildfile(#[serde(serialize_with = \"serialize_abs_pathbuf\")] AbsPathBuf),\n",
+        "",
+    )?;
+    fs::write(discover_rs, source)?;
+    Ok(())
+}
+
 fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(global_state_rs)?;
+
+    replace_once(&mut source, "    panic::AssertUnwindSafe,\n", "")?;
+    replace_once(&mut source, "    ops::Not as _,\n", "")?;
+    replace_once(
+        &mut source,
+        "use ide::{Analysis, AnalysisHost, Cancellable, FileId, SourceRootId};\n",
+        "use ide::{Analysis, Cancellable, FileId, SourceRootId};\n",
+    )?;
+    replace_once(
+        &mut source,
+        "/// The most interesting components are `vfs`, which stores a consistent\n/// snapshot of the file systems, and `analysis_host`, which stores our\n/// incremental salsa database.\n",
+        "/// The most interesting components are `vfs`, which stores a consistent\n/// snapshot of the file systems, and `analyzed_shared`, which stores our\n/// shared salsa database handle.\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    base_db::{Crate, ProcMacroPaths, SourceDatabase, salsa::Revision},\n",
+        "    base_db::{Crate, ProcMacroPaths},\n",
+    )?;
+    replace_once(&mut source, "use itertools::Itertools;\n", "")?;
+    replace_once(
+        &mut source,
+        "use parking_lot::{\n    MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard,\n    RwLockWriteGuard,\n};\n",
+        "use parking_lot::{Mutex, RwLock};\n",
+    )?;
+    replace_once(&mut source, "use stdx::thread;\n", "")?;
+    replace_once(
+        &mut source,
+        "use tracing::{Level, span, trace};\n",
+        "use tracing::{Level, span};\n",
+    )?;
+    replace_once(
+        &mut source,
+        "use vfs::{AbsPathBuf, AnchoredPathBuf, ChangeKind, Vfs, VfsPath};\n",
+        "use vfs::{AbsPathBuf, AnchoredPathBuf, VfsPath};\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    config::{Config, ConfigChange, ConfigErrors, RatomlFileKind},\n",
+        "    config::{Config, ConfigErrors},\n",
+    )?;
+    replace_once(&mut source, "    reload,\n", "")?;
 
     replace_once(
         &mut source,
         "    pub(crate) analysis_host: AnalysisHost,\n    pub(crate) diagnostics: DiagnosticCollection,\n",
-        "    pub(crate) analysis_host: AnalysisHost,\n    pub(crate) analyzed_provider: Option<crate::analyzed_bridge::SharedAnalyzerProvider>,\n    pub(crate) analyzed_shared: Option<crate::analyzed_bridge::SharedAnalyzerRuntime>,\n    pub(crate) diagnostics: DiagnosticCollection,\n",
+        "    pub(crate) analyzed_provider: crate::analyzed_bridge::SharedAnalyzerProvider,\n    pub(crate) analyzed_shared: crate::analyzed_bridge::SharedAnalyzerRuntime,\n    pub(crate) diagnostics: DiagnosticCollection,\n",
     )?;
     replace_once(
         &mut source,
         "    pub(crate) analysis: Analysis,\n    pub(crate) check_fixes: CheckFixes,\n",
-        "    pub(crate) analysis: Analysis,\n    pub(crate) analyzed_shared: Option<crate::analyzed_bridge::SharedAnalyzerRuntime>,\n    pub(crate) check_fixes: CheckFixes,\n",
+        "    pub(crate) analysis: Analysis,\n    pub(crate) analyzed_shared: crate::analyzed_bridge::SharedAnalyzerRuntime,\n    pub(crate) check_fixes: CheckFixes,\n",
     )?;
     replace_once(
         &mut source,
         "            analysis_host,\n            diagnostics: Default::default(),\n",
-        "            analysis_host,\n            analyzed_provider: None,\n            analyzed_shared: None,\n            diagnostics: Default::default(),\n",
+        "            analyzed_provider,\n            analyzed_shared: analyzed_snapshot.runtime,\n            diagnostics: Default::default(),\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    pub(crate) last_gc_revision: Revision,\n",
+        "",
+    )?;
+    replace_once(
+        &mut source,
+        "    pub(crate) cancellation_pool: thread::Pool,\n",
+        "",
+    )?;
+    replace_once(
+        &mut source,
+        "    pub(crate) fn new(sender: Sender<lsp_server::Message>, config: Config) -> GlobalState {\n",
+        "    pub(crate) fn new(\n        sender: Sender<lsp_server::Message>,\n        config: Config,\n        analyzed_provider: crate::analyzed_bridge::SharedAnalyzerProvider,\n        analyzed_snapshot: crate::analyzed_bridge::SharedAnalyzerSnapshot,\n    ) -> GlobalState {\n",
+    )?;
+    replace_once(
+        &mut source,
+        "        let mut analysis_host = AnalysisHost::new(config.lru_parse_query_capacity());\n        if let Some(capacities) = config.lru_query_capacities_config() {\n            analysis_host.update_lru_capacities(capacities);\n        }\n        let (flycheck_sender, flycheck_receiver) = unbounded();\n",
+        "        let (flycheck_sender, flycheck_receiver) = unbounded();\n",
+    )?;
+    replace_once(
+        &mut source,
+        "        let last_gc_revision = analysis_host.raw_database().nonce_and_revision().1;\n\n",
+        "",
+    )?;
+    replace_once(
+        &mut source,
+        "        let cancellation_pool = thread::Pool::new(1);\n\n",
+        "",
+    )?;
+    replace_once(&mut source, "            cancellation_pool,\n", "")?;
+    replace_once(
+        &mut source,
+        "            workspaces: Arc::from(Vec::new()),\n",
+        "            workspaces: Arc::new(analyzed_snapshot.workspaces.clone()),\n",
+    )?;
+    replace_once(
+        &mut source,
+        "            minicore: MiniCoreRustAnalyzerInternalOnly::default(),\n            last_gc_revision,\n",
+        "            minicore: MiniCoreRustAnalyzerInternalOnly::default(),\n",
     )?;
     replace_once(
         &mut source,
         "pub(crate) struct FetchWorkspaceResponse {\n    pub(crate) workspaces: Vec<anyhow::Result<ProjectWorkspace>>,\n    pub(crate) force_crate_graph_reload: bool,\n}\n",
-        "#[derive(Debug)]\npub(crate) struct FetchWorkspaceResponse {\n    pub(crate) workspaces: Vec<anyhow::Result<ProjectWorkspace>>,\n    pub(crate) force_crate_graph_reload: bool,\n    pub(crate) analyzed_shared: Option<crate::analyzed_bridge::SharedAnalyzerRuntime>,\n}\n",
+        "#[derive(Debug)]\npub(crate) struct FetchWorkspaceResponse {\n    pub(crate) workspaces: Vec<anyhow::Result<ProjectWorkspace>>,\n    pub(crate) force_crate_graph_reload: bool,\n    pub(crate) analyzed_shared: crate::analyzed_bridge::SharedAnalyzerRuntime,\n}\n",
     )?;
-    replace_once(
-        &mut source,
-        "    pub(crate) fn process_changes(&mut self) -> bool {\n        let _p = span!(Level::INFO, \"GlobalState::process_changes\").entered();\n",
-        "    pub(crate) fn process_changes(&mut self) -> bool {\n        let _p = span!(Level::INFO, \"GlobalState::process_changes\").entered();\n        if self.analyzed_shared.is_some() {\n            return self.analyzed_process_shared_changes();\n        }\n",
-    )?;
+    let process_changes_start = source
+        .find("    pub(crate) fn process_changes(&mut self) -> bool {\n")
+        .ok_or("could not find process_changes start")?;
+    let snapshot_start = source[process_changes_start..]
+        .find("    pub(crate) fn snapshot(&self) -> GlobalStateSnapshot {\n")
+        .map(|index| process_changes_start + index)
+        .ok_or("could not find snapshot start")?;
+    source.replace_range(
+        process_changes_start..snapshot_start,
+        "    pub(crate) fn process_changes(&mut self) -> bool {\n        let _p = span!(Level::INFO, \"GlobalState::process_changes\").entered();\n        self.analyzed_process_shared_changes()\n    }\n\n",
+    );
     replace_once(
         &mut source,
         "            workspaces: Arc::clone(&self.workspaces),\n            analysis: self.analysis_host.analysis(),\n            vfs: Arc::clone(&self.vfs),\n",
-        "            workspaces: Arc::clone(&self.workspaces),\n            analysis: self\n                .analyzed_shared\n                .as_ref()\n                .map_or_else(|| self.analysis_host.analysis(), |shared| shared.analysis()),\n            analyzed_shared: self.analyzed_shared.clone(),\n            vfs: Arc::clone(&self.vfs),\n",
+        "            workspaces: Arc::clone(&self.workspaces),\n            analysis: self.analyzed_shared.analysis(),\n            analyzed_shared: self.analyzed_shared.clone(),\n            vfs: Arc::clone(&self.vfs),\n",
     )?;
     replace_once(
         &mut source,
+        "    vfs: Arc<RwLock<(vfs::Vfs, FxHashMap<FileId, LineEndings>)>>,\n",
+        "",
+    )?;
+    replace_once(&mut source, "            vfs: Arc::clone(&self.vfs),\n", "")?;
+    replace_once(
+        &mut source,
         "    pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {\n        url_to_file_id(&self.vfs_read(), url)\n    }\n",
-        "    pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {\n        if let Some(shared) = &self.analyzed_shared {\n            return shared.url_to_file_id(url);\n        }\n        url_to_file_id(&self.vfs_read(), url)\n    }\n",
+        "    pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {\n        self.analyzed_shared.url_to_file_id(url)\n    }\n",
     )?;
     replace_once(
         &mut source,
         "    pub(crate) fn file_id_to_url(&self, id: FileId) -> Url {\n        file_id_to_url(&self.vfs_read(), id)\n    }\n",
-        "    pub(crate) fn file_id_to_url(&self, id: FileId) -> Url {\n        if let Some(shared) = &self.analyzed_shared\n            && let Some(url) = shared.file_id_to_url(id)\n        {\n            return url;\n        }\n        file_id_to_url(&self.vfs_read(), id)\n    }\n",
+        "    pub(crate) fn file_id_to_url(&self, id: FileId) -> Url {\n        self.analyzed_shared\n            .file_id_to_url(id)\n            .expect(\"shared analyzer file id must have a url\")\n    }\n",
     )?;
     replace_once(
         &mut source,
         "    pub(crate) fn vfs_path_to_file_id(&self, vfs_path: &VfsPath) -> anyhow::Result<Option<FileId>> {\n        vfs_path_to_file_id(&self.vfs_read(), vfs_path)\n    }\n",
-        "    pub(crate) fn vfs_path_to_file_id(&self, vfs_path: &VfsPath) -> anyhow::Result<Option<FileId>> {\n        if let Some(shared) = &self.analyzed_shared {\n            return shared.vfs_path_to_file_id(vfs_path);\n        }\n        vfs_path_to_file_id(&self.vfs_read(), vfs_path)\n    }\n",
+        "    pub(crate) fn vfs_path_to_file_id(&self, vfs_path: &VfsPath) -> anyhow::Result<Option<FileId>> {\n        self.analyzed_shared.vfs_path_to_file_id(vfs_path)\n    }\n",
     )?;
     replace_once(
         &mut source,
         "    pub(crate) fn file_line_index(&self, file_id: FileId) -> Cancellable<LineIndex> {\n        let endings = self.vfs.read().1[&file_id];\n        let index = self.analysis.file_line_index(file_id)?;\n",
-        "    pub(crate) fn file_line_index(&self, file_id: FileId) -> Cancellable<LineIndex> {\n        let endings = self\n            .analyzed_shared\n            .as_ref()\n            .and_then(|shared| shared.line_endings(file_id))\n            .unwrap_or_else(|| self.vfs.read().1[&file_id]);\n        let index = self.analysis.file_line_index(file_id)?;\n",
+        "    pub(crate) fn file_line_index(&self, file_id: FileId) -> Cancellable<LineIndex> {\n        let endings = self\n            .analyzed_shared\n            .line_endings(file_id)\n            .expect(\"shared analyzer line endings must be tracked\");\n        let index = self.analysis.file_line_index(file_id)?;\n",
     )?;
     replace_once(
         &mut source,
@@ -348,7 +455,7 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
     replace_once(
         &mut source,
         "    pub(crate) fn file_id_to_file_path(&self, file_id: FileId) -> vfs::VfsPath {\n        self.vfs_read().file_path(file_id).clone()\n    }\n",
-        "    pub(crate) fn file_id_to_file_path(&self, file_id: FileId) -> vfs::VfsPath {\n        if let Some(shared) = &self.analyzed_shared\n            && let Some(path) = shared.file_id_to_vfs_path(file_id)\n        {\n            return path;\n        }\n        self.vfs_read().file_path(file_id).clone()\n    }\n",
+        "    pub(crate) fn file_id_to_file_path(&self, file_id: FileId) -> vfs::VfsPath {\n        self.analyzed_shared\n            .file_id_to_vfs_path(file_id)\n            .expect(\"shared analyzer file id must have a path\")\n    }\n",
     )?;
     replace_once(
         &mut source,
@@ -358,8 +465,37 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
     replace_once(
         &mut source,
         "    pub(crate) fn file_exists(&self, file_id: FileId) -> bool {\n        self.vfs.read().0.exists(file_id)\n    }\n",
-        "    pub(crate) fn file_exists(&self, file_id: FileId) -> bool {\n        if let Some(shared) = &self.analyzed_shared\n            && let Some(exists) = shared.file_exists(file_id)\n        {\n            return exists;\n        }\n        self.vfs.read().0.exists(file_id)\n    }\n",
+        "    pub(crate) fn file_exists(&self, file_id: FileId) -> bool {\n        self.analyzed_shared.file_exists(file_id).unwrap_or(false)\n    }\n",
     )?;
+
+    replace_once(
+        &mut source,
+        "impl Drop for GlobalState {\n    fn drop(&mut self) {\n        self.analysis_host.trigger_cancellation();\n    }\n}\n",
+        "impl Drop for GlobalState {\n    fn drop(&mut self) {}\n}\n",
+    )?;
+
+    let enqueue_start = source
+        .find("    fn enqueue_workspace_fetch(&mut self, path: AbsPathBuf, force_crate_graph_reload: bool) {\n")
+        .ok_or("could not find enqueue_workspace_fetch start")?;
+    let debounce_start = source[enqueue_start..]
+        .find("    pub(crate) fn debounce_workspace_fetch(&mut self) {\n")
+        .map(|index| enqueue_start + index)
+        .ok_or("could not find debounce_workspace_fetch start")?;
+    source.replace_range(enqueue_start..debounce_start, "");
+
+    let vfs_read_start = source
+        .find("    fn vfs_read(&self) -> MappedRwLockReadGuard<'_, vfs::Vfs> {\n")
+        .ok_or("could not find vfs_read start")?;
+    let snapshot_url_start = source[vfs_read_start..]
+        .find("    /// Returns `None` if the file was excluded.\n    pub(crate) fn url_to_file_id")
+        .map(|index| vfs_read_start + index)
+        .ok_or("could not find snapshot url_to_file_id start")?;
+    source.replace_range(vfs_read_start..snapshot_url_start, "");
+
+    let free_url_start = source
+        .find("pub(crate) fn file_id_to_url(vfs: &vfs::Vfs, id: FileId) -> Url {\n")
+        .ok_or("could not find free file_id_to_url")?;
+    source.truncate(free_url_start);
 
     fs::write(global_state_rs, source)?;
     Ok(())
@@ -378,6 +514,11 @@ fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box
         "    let uri = url_from_abs_path(&file_name);\n",
         "    let uri = snap\n        .vfs_path_to_file_id(&VfsPath::from(file_name.clone()))\n        .ok()\n        .flatten()\n        .map(|file_id| snap.file_id_to_url(file_id))\n        .unwrap_or_else(|| url_from_abs_path(&file_name));\n",
     )?;
+    replace_once(
+        &mut source,
+        "        let state = GlobalState::new(\n            sender,\n            Config::new(\n                workspace_root.to_path_buf(),\n                ClientCapabilities::default(),\n                Vec::new(),\n                None,\n            ),\n        );\n",
+        "        let ra_config = Config::new(\n            workspace_root.to_path_buf(),\n            ClientCapabilities::default(),\n            Vec::new(),\n            None,\n        );\n        let registry = crate::analyzed_bridge::shared_analyzer_registry();\n        let provider = crate::analyzed_bridge::SharedAnalyzerProvider::new(move |key, config| {\n            registry.register(key, config)\n        });\n        let (key, shared_config) = crate::analyzed_bridge::shared_analyzer_context_from_config(&ra_config).unwrap();\n        let snapshot = provider.resolve(key, shared_config).unwrap().snapshot().unwrap();\n        let state = GlobalState::new(sender, ra_config, provider, snapshot);\n",
+    )?;
 
     fs::write(flycheck_to_proto_rs, source)?;
     Ok(())
@@ -388,9 +529,27 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
 
     replace_once(
         &mut source,
-        "    FetchWorkspace(ProjectWorkspaceProgress),\n    FetchBuildData(BuildDataProgress),\n",
-        "    FetchWorkspace(ProjectWorkspaceProgress),\n    AnalyzedFetchWorkspace(FetchWorkspaceResponse),\n    FetchBuildData(BuildDataProgress),\n",
+        "    GlobalState::new(connection.sender, config).run(connection.receiver)\n",
+        "    let _ = (config, connection);\n    anyhow::bail!(\"analyzed runs rust-analyzer through the shared daemon path\")\n",
     )?;
+    replace_once(
+        &mut source,
+        "use ide_db::base_db::{SourceDatabase, VfsPath};\n",
+        "use ide_db::base_db::VfsPath;\n",
+    )?;
+    replace_once(
+        &mut source,
+        "use lsp_types::{TextDocumentIdentifier, notification::Notification as _};\n",
+        "use lsp_types::TextDocumentIdentifier;\n",
+    )?;
+
+    replace_once(
+        &mut source,
+        "    FetchWorkspace(ProjectWorkspaceProgress),\n    FetchBuildData(BuildDataProgress),\n",
+        "    FetchWorkspace(ProjectWorkspaceProgress),\n    AnalyzedFetchWorkspace(FetchWorkspaceResponse),\n",
+    )?;
+    replace_once(&mut source, "    LoadProcMacros(ProcMacroProgress),\n", "")?;
+    replace_once(&mut source, "    Buildfile(AbsPathBuf),\n", "")?;
 
     replace_once(
         &mut source,
@@ -399,13 +558,68 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     )?;
     replace_once(
         &mut source,
+        "    global_state::{\n        FetchBuildDataResponse, FetchWorkspaceRequest, FetchWorkspaceResponse, GlobalState,\n    },\n",
+        "    global_state::{FetchWorkspaceRequest, FetchWorkspaceResponse, GlobalState},\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    reload::{BuildDataProgress, ProcMacroProgress, ProjectWorkspaceProgress},\n",
+        "    reload::ProjectWorkspaceProgress,\n",
+    )?;
+
+    let run_start = source
+        .find(
+            "    fn run(mut self, inbox: Receiver<lsp_server::Message>) -> anyhow::Result<()> {\n",
+        )
+        .ok_or("could not find standalone GlobalState::run start")?;
+    let register_start = source[run_start..]
+        .find("    fn register_did_save_capability")
+        .map(|index| run_start + index)
+        .ok_or("could not find register_did_save_capability start")?;
+    source.replace_range(run_start..register_start, "");
+    replace_once(
+        &mut source,
         "                        let resp = FetchWorkspaceResponse { workspaces, force_crate_graph_reload };\n",
         "                        let resp = FetchWorkspaceResponse {\n                            workspaces,\n                            force_crate_graph_reload,\n                            analyzed_shared: None,\n                        };\n",
     )?;
     replace_once(
         &mut source,
+        "                            analyzed_shared: None,\n",
+        "                            analyzed_shared: self.analyzed_shared.clone(),\n",
+    )?;
+    replace_once(
+        &mut source,
         "            Task::DiscoverLinkedProjects(arg) => {\n",
         "            Task::AnalyzedFetchWorkspace(resp) => {\n                self.fetch_workspaces_queue.op_completed(resp);\n                if let Err(e) = self.fetch_workspace_error() {\n                    error!(\"FetchWorkspaceError: {e}\");\n                }\n                self.wants_to_switch = Some(\"fetched workspace\".to_owned());\n                self.diagnostics.clear_check_all();\n                self.report_progress(\"Fetching\", Progress::End, None, None, None);\n            }\n            Task::DiscoverLinkedProjects(arg) => {\n",
+    )?;
+    let fetch_workspace_start = source
+        .find("            Task::FetchWorkspace(progress) => {\n")
+        .ok_or("could not find FetchWorkspace task arm")?;
+    let analyzed_fetch_start = source[fetch_workspace_start..]
+        .find("            Task::AnalyzedFetchWorkspace(resp) => {\n")
+        .map(|index| fetch_workspace_start + index)
+        .ok_or("could not find AnalyzedFetchWorkspace task arm")?;
+    source.replace_range(
+        fetch_workspace_start..analyzed_fetch_start,
+        "            Task::FetchWorkspace(ProjectWorkspaceProgress::Begin) => {\n                self.report_progress(\"Fetching\", Progress::Begin, None, None, None);\n            }\n",
+    );
+    let fetch_build_start = source
+        .find("            Task::FetchBuildData(progress) => {\n")
+        .ok_or("could not find FetchBuildData task arm")?;
+    let build_deps_start = source[fetch_build_start..]
+        .find("            Task::BuildDepsHaveChanged =>")
+        .map(|index| fetch_build_start + index)
+        .ok_or("could not find BuildDepsHaveChanged task arm")?;
+    source.replace_range(fetch_build_start..build_deps_start, "");
+    replace_once(
+        &mut source,
+        "                    let discover_path = match &arg {\n                        DiscoverProjectParam::Buildfile(it) => it,\n                        DiscoverProjectParam::Path(it) => it,\n                    };\n",
+        "                    let DiscoverProjectParam::Path(discover_path) = &arg;\n",
+    )?;
+    replace_once(
+        &mut source,
+        "                    let arg = match arg {\n                        DiscoverProjectParam::Buildfile(it) => DiscoverArgument::Buildfile(it),\n                        DiscoverProjectParam::Path(it) => DiscoverArgument::Path(it),\n                    };\n",
+        "                    let DiscoverProjectParam::Path(path) = arg;\n                    let arg = DiscoverArgument::Path(path);\n",
     )?;
 
     replace_once(
@@ -435,7 +649,48 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
         "        let db = self.analysis_host.raw_database();\n        let generation = self.diagnostics.next_generation();\n        let subscriptions = {\n            let vfs = &self.vfs.read().0;\n            self.mem_docs\n                .iter()\n                .map(|path| vfs.file_id(path).unwrap())\n                .filter_map(|(file_id, excluded)| {\n                    (excluded == vfs::FileExcluded::No).then_some(file_id)\n                })\n                .filter(|&file_id| {\n                    let source_root_id = db.file_source_root(file_id).source_root_id(db);\n                    let source_root = db.source_root(source_root_id).source_root(db);\n                    // Only publish diagnostics for files in the workspace, not from crates.io deps\n                    // or the sysroot.\n                    // While theoretically these should never have errors, we have quite a few false\n                    // positives particularly in the stdlib, and those diagnostics would stay around\n                    // forever if we emitted them here.\n                    !source_root.is_library\n                })\n                .collect::<std::sync::Arc<_>>()\n        };\n",
         "        let generation = self.diagnostics.next_generation();\n        let subscriptions = if let Some(shared) = &self.analyzed_shared {\n            let file_ids = self\n                .mem_docs\n                .iter()\n                .filter_map(|path| shared.vfs_path_to_file_id(path).ok().flatten())\n                .collect::<Vec<_>>();\n            let snap = self.snapshot();\n            file_ids\n                .into_iter()\n                .filter(|&file_id| {\n                    snap.analysis\n                        .is_library_file(file_id)\n                        .is_ok_and(|is_library| !is_library)\n                })\n                .collect::<std::sync::Arc<_>>()\n        } else {\n            let db = self.analysis_host.raw_database();\n            let vfs = &self.vfs.read().0;\n            self.mem_docs\n                .iter()\n                .map(|path| vfs.file_id(path).unwrap())\n                .filter_map(|(file_id, excluded)| {\n                    (excluded == vfs::FileExcluded::No).then_some(file_id)\n                })\n                .filter(|&file_id| {\n                    let source_root_id = db.file_source_root(file_id).source_root_id(db);\n                    let source_root = db.source_root(source_root_id).source_root(db);\n                    // Only publish diagnostics for files in the workspace, not from crates.io deps\n                    // or the sysroot.\n                    // While theoretically these should never have errors, we have quite a few false\n                    // positives particularly in the stdlib, and those diagnostics would stay around\n                    // forever if we emitted them here.\n                    !source_root.is_library\n                })\n                .collect::<std::sync::Arc<_>>()\n        };\n",
     )?;
-
+    replace_once(
+        &mut source,
+        "                    sender\n                        .send(Task::Diagnostics(DiagnosticsTaskKind::Syntax(generation, diags)))\n                        .unwrap();\n",
+        "                    let _ = sender\n                        .send(Task::Diagnostics(DiagnosticsTaskKind::Syntax(generation, diags)));\n",
+    )?;
+    replace_once(
+        &mut source,
+        "                        sender\n                            .send(Task::Diagnostics(DiagnosticsTaskKind::Semantic(\n                                generation, diags,\n                            )))\n                            .unwrap();\n",
+        "                        let _ = sender.send(Task::Diagnostics(DiagnosticsTaskKind::Semantic(\n                            generation, diags,\n                        )));\n",
+    )?;
+    let diagnostics_start = source
+        .find("        let generation = self.diagnostics.next_generation();\n        let subscriptions = if let Some(shared) = &self.analyzed_shared {\n")
+        .ok_or("could not find shared diagnostics subscriptions")?;
+    let diagnostics_end = source[diagnostics_start..]
+        .find("\n        tracing::trace!(\"updating notifications for {:?}\", subscriptions);\n")
+        .map(|index| diagnostics_start + index)
+        .ok_or("could not find diagnostics subscription end")?;
+    source.replace_range(
+        diagnostics_start..diagnostics_end,
+        "        let generation = self.diagnostics.next_generation();\n        let shared = &self.analyzed_shared;\n        let file_ids = self\n            .mem_docs\n            .iter()\n            .filter_map(|path| shared.vfs_path_to_file_id(path).ok().flatten())\n            .collect::<Vec<_>>();\n        let snap = self.snapshot();\n        let subscriptions = file_ids\n            .into_iter()\n            .filter(|&file_id| {\n                snap.analysis\n                    .is_library_file(file_id)\n                    .is_ok_and(|is_library| !is_library)\n            })\n            .collect::<std::sync::Arc<_>>();",
+    );
+    let update_tests_start = source
+        .find("    fn update_tests(&mut self) {\n")
+        .ok_or("could not find update_tests start")?;
+    let update_status_start = source[update_tests_start..]
+        .find("    fn update_status_or_notify(&mut self) {\n")
+        .map(|index| update_tests_start + index)
+        .ok_or("could not find update_status_or_notify start")?;
+    source.replace_range(
+        update_tests_start..update_status_start,
+        "    fn update_tests(&mut self) {\n        if !self.vfs_done {\n            return;\n        }\n        let snapshot = self.snapshot();\n        let subscriptions = self\n            .mem_docs\n            .iter()\n            .filter_map(|path| self.analyzed_shared.vfs_path_to_file_id(path).ok().flatten())\n            .filter(|&file_id| {\n                snapshot\n                    .analysis\n                    .is_library_file(file_id)\n                    .is_ok_and(|is_library| !is_library)\n            })\n            .collect::<Vec<_>>();\n        tracing::trace!(\"updating tests for {:?}\", subscriptions);\n\n        self.task_pool.handle.spawn(ThreadIntent::LatencySensitive, {\n            move || {\n                let tests = subscriptions\n                    .iter()\n                    .copied()\n                    .filter_map(|f| snapshot.analysis.discover_tests_in_file(f).ok())\n                    .flatten()\n                    .collect::<Vec<_>>();\n\n                Task::DiscoverTest(lsp_ext::DiscoverTestResults {\n                    tests: tests\n                        .into_iter()\n                        .filter_map(|t| {\n                            let line_index = t.file.and_then(|f| snapshot.file_line_index(f).ok());\n                            to_proto::test_item(&snapshot, t, line_index.as_ref())\n                        })\n                        .collect(),\n                    scope: None,\n                    scope_file: Some(\n                        subscriptions\n                            .into_iter()\n                            .map(|f| TextDocumentIdentifier { uri: to_proto::url(&snapshot, f) })\n                            .collect(),\n                    ),\n                })\n            }\n        });\n    }\n\n",
+    );
+    replace_once(
+        &mut source,
+        "                            self.analysis_host.trigger_garbage_collection();\n",
+        "                            crate::analyzed_bridge::shared_analyzer_registry().mark_gc_dirty();\n",
+    )?;
+    replace_once(
+        &mut source,
+        "            let current_revision = self.analysis_host.raw_database().nonce_and_revision().1;\n            // no work is currently being done, now we can block a bit and clean up our garbage\n            if self.task_pool.handle.is_empty()\n                && self.fmt_pool.handle.is_empty()\n                && current_revision != self.last_gc_revision\n            {\n                self.analysis_host.trigger_garbage_collection();\n                self.last_gc_revision = current_revision;\n            }\n",
+        "            if self.task_pool.handle.is_empty() && self.fmt_pool.handle.is_empty() {\n                crate::analyzed_bridge::shared_analyzer_registry().mark_gc_dirty();\n            }\n",
+    )?;
     fs::write(main_loop_rs, source)?;
     Ok(())
 }
@@ -445,15 +700,93 @@ fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
 
     replace_once(
         &mut source,
-        "        info!(%cause, \"will fetch workspaces\");\n\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, {\n",
-        "        info!(%cause, \"will fetch workspaces\");\n\n        if let Some(provider) = self.analyzed_provider.clone() {\n            let shared_context = crate::analyzed_bridge::shared_analyzer_context_from_config(&self.config);\n            self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {\n                sender.send(Task::FetchWorkspace(ProjectWorkspaceProgress::Begin)).unwrap();\n                let response = match shared_context {\n                    Ok((key, config)) => provider\n                        .resolve(key, config)\n                        .and_then(|session| session.snapshot())\n                        .map(|snapshot| FetchWorkspaceResponse {\n                            workspaces: snapshot.workspaces.into_iter().map(Ok).collect(),\n                            force_crate_graph_reload,\n                            analyzed_shared: Some(snapshot.runtime),\n                        })\n                        .unwrap_or_else(|error| FetchWorkspaceResponse {\n                            workspaces: vec![Err(error)],\n                            force_crate_graph_reload,\n                            analyzed_shared: None,\n                        }),\n                    Err(error) => FetchWorkspaceResponse {\n                        workspaces: vec![Err(error)],\n                        force_crate_graph_reload,\n                        analyzed_shared: None,\n                    },\n                };\n                sender.send(Task::AnalyzedFetchWorkspace(response)).unwrap();\n            });\n            return;\n        }\n\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, {\n",
+        "use hir::{ChangeWithProcMacros, ProcMacrosBuilder, db::DefDatabase};\n",
+        "use hir::ChangeWithProcMacros;\n",
     )?;
     replace_once(
         &mut source,
-        "        let Some(FetchWorkspaceResponse { workspaces, force_crate_graph_reload }) =\n            self.fetch_workspaces_queue.last_op_result()\n        else {\n            return;\n        };\n",
-        "        let Some(FetchWorkspaceResponse {\n            workspaces,\n            force_crate_graph_reload,\n            analyzed_shared,\n        }) = self.fetch_workspaces_queue.last_op_result()\n        else {\n            return;\n        };\n        if let Some(shared) = analyzed_shared.clone() {\n            self.analyzed_shared = Some(shared);\n        }\n",
+        "    base_db::{CrateGraphBuilder, ProcMacroLoadingError, ProcMacroPaths, salsa::Durability},\n",
+        "    base_db::{CrateGraphBuilder, ProcMacroPaths},\n",
+    )?;
+    replace_once(
+        &mut source,
+        "use load_cargo::{ProjectFolders, load_proc_macro};\n",
+        "use load_cargo::ProjectFolders;\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    config::{Config, FilesWatcher, LinkedProject},\n",
+        "    config::{Config, FilesWatcher},\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    main_loop::{DiscoverProjectParam, Task},\n",
+        "    main_loop::Task,\n",
+    )?;
+    replace_once(
+        &mut source,
+        "    ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, WorkspaceBuildScripts, project_json,\n",
+        "    ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, project_json,\n",
+    )?;
+    replace_once(
+        &mut source,
+        "use tracing::{debug, info};\n",
+        "use tracing::info;\n",
+    )?;
+    replace_once(
+        &mut source,
+        "pub(crate) enum ProjectWorkspaceProgress {\n    Begin,\n    Report(String),\n    End(Vec<anyhow::Result<ProjectWorkspace>>, bool),\n}\n\n#[derive(Debug)]\npub(crate) enum BuildDataProgress {\n    Begin,\n    Report(String),\n    End((Arc<Vec<ProjectWorkspace>>, Vec<anyhow::Result<WorkspaceBuildScripts>>)),\n}\n\n#[derive(Debug)]\npub(crate) enum ProcMacroProgress {\n    Begin,\n    Report(String),\n    End(ChangeWithProcMacros),\n}\n",
+        "pub(crate) enum ProjectWorkspaceProgress {\n    Begin,\n}\n",
     )?;
 
+    replace_once(
+        &mut source,
+        "        if self.config.lru_parse_query_capacity() != old_config.lru_parse_query_capacity() {\n            self.analysis_host.update_lru_capacity(self.config.lru_parse_query_capacity());\n        }\n        if self.config.lru_query_capacities_config() != old_config.lru_query_capacities_config() {\n            self.analysis_host.update_lru_capacities(\n                &self.config.lru_query_capacities_config().cloned().unwrap_or_default(),\n            );\n        }\n\n",
+        "",
+    )?;
+    replace_once(
+        &mut source,
+        "        if self.analysis_host.raw_database().expand_proc_attr_macros()\n            != self.config.expand_proc_attr_macros()\n        {\n            self.analysis_host.raw_database_mut().set_expand_proc_attr_macros_with_durability(\n                self.config.expand_proc_attr_macros(),\n                Durability::HIGH,\n            );\n        }\n\n",
+        "",
+    )?;
+    replace_once(
+        &mut source,
+        "        info!(%cause, \"will fetch workspaces\");\n\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, {\n",
+        "        info!(%cause, \"will fetch workspaces\");\n        let _ = path;\n\n        let provider = self.analyzed_provider.clone();\n        let shared_context = crate::analyzed_bridge::shared_analyzer_context_from_config(&self.config);\n        let current_shared = self.analyzed_shared.clone();\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {\n            sender.send(Task::FetchWorkspace(ProjectWorkspaceProgress::Begin)).unwrap();\n            let response = match shared_context {\n                Ok((key, config)) => provider\n                    .resolve(key, config)\n                    .and_then(|session| session.snapshot())\n                    .map(|snapshot| FetchWorkspaceResponse {\n                        workspaces: snapshot.workspaces.into_iter().map(Ok).collect(),\n                        force_crate_graph_reload,\n                        analyzed_shared: snapshot.runtime,\n                    })\n                    .unwrap_or_else(|error| FetchWorkspaceResponse {\n                        workspaces: vec![Err(error)],\n                        force_crate_graph_reload,\n                        analyzed_shared: current_shared.clone(),\n                    }),\n                Err(error) => FetchWorkspaceResponse {\n                    workspaces: vec![Err(error)],\n                    force_crate_graph_reload,\n                    analyzed_shared: current_shared.clone(),\n                },\n            };\n            sender.send(Task::AnalyzedFetchWorkspace(response)).unwrap();\n        });\n        return;\n\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, {\n",
+    )?;
+    let fallback_start = source
+        .find("        return;\n\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, {\n")
+        .ok_or("could not find standalone workspace fetch fallback")?;
+    let switch_start = source[fallback_start..]
+        .find("    pub(crate) fn switch_workspaces")
+        .map(|index| fallback_start + index)
+        .ok_or("could not find switch_workspaces start")?;
+    source.replace_range(fallback_start..switch_start, "    }\n\n");
+    replace_once(
+        &mut source,
+        "        let Some(FetchWorkspaceResponse { workspaces, force_crate_graph_reload }) =\n            self.fetch_workspaces_queue.last_op_result()\n        else {\n            return;\n        };\n",
+        "        let Some(FetchWorkspaceResponse {\n            workspaces,\n            force_crate_graph_reload,\n            analyzed_shared,\n        }) = self.fetch_workspaces_queue.last_op_result()\n        else {\n            return;\n        };\n        self.analyzed_shared = analyzed_shared.clone();\n",
+    )?;
+    replace_once(
+        &mut source,
+        "        info!(?cause, \"recreating the crate graph\");\n        self.recreate_crate_graph(cause, switching_from_empty_workspace);\n\n        info!(\"did switch workspaces\");\n",
+        "        info!(?cause, \"using shared crate graph\");\n        let _ = switching_from_empty_workspace;\n        self.finish_loading_crate_graph();\n\n        info!(\"did switch workspaces\");\n",
+    )?;
+    let recreate_start = source
+        .find("    fn recreate_crate_graph(&mut self, cause: String, initial_build: bool) {\n")
+        .ok_or("could not find recreate_crate_graph start")?;
+    let finish_start = source[recreate_start..]
+        .find("    pub(crate) fn finish_loading_crate_graph(&mut self) {\n")
+        .map(|index| recreate_start + index)
+        .ok_or("could not find finish_loading_crate_graph start")?;
+    source.replace_range(
+        recreate_start..finish_start,
+        "    fn recreate_crate_graph(&mut self, cause: String, initial_build: bool) {\n        let _ = (cause, initial_build);\n        self.finish_loading_crate_graph();\n    }\n\n    pub(crate) fn fetch_build_data(&mut self, cause: Cause) {\n        let _ = cause;\n    }\n\n    pub(crate) fn fetch_proc_macros(\n        &mut self,\n        cause: Cause,\n        change: ChangeWithProcMacros,\n        paths: Vec<ProcMacroPaths>,\n    ) {\n        let _ = (cause, change, paths);\n        self.fetch_proc_macros_queue.op_completed(true);\n    }\n\n",
+    );
+    let eq_ignore_start = source
+        .find("/// Similar to [`str::eq_ignore_ascii_case`] but instead of ignoring\n")
+        .ok_or("could not find eq_ignore_underscore start")?;
+    source.truncate(eq_ignore_start);
     fs::write(reload_rs, source)?;
     Ok(())
 }
@@ -476,6 +809,7 @@ fn patch_slow_tests(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
     for name in ["main.rs", "ratoml.rs", "support.rs"] {
         patch_slow_tests_imports(&slow_tests.join(name))?;
     }
+    patch_slow_tests_support(&slow_tests.join("support.rs"))?;
     Ok(())
 }
 
@@ -485,6 +819,18 @@ fn patch_slow_tests_imports(path: &Path) -> Result<(), Box<dyn Error>> {
         .replace("use rust_analyzer::", "use ra_ap_rust_analyzer::")
         .replace(" rust_analyzer::", " ra_ap_rust_analyzer::")
         .replace("<rust_analyzer::", "<ra_ap_rust_analyzer::");
+    fs::write(path, source)?;
+    Ok(())
+}
+
+fn patch_slow_tests_support(path: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(path)?;
+    replace_once(&mut source, "    lsp, main_loop,\n", "    lsp,\n")?;
+    replace_once(
+        &mut source,
+        "            .spawn(move || main_loop(config, connection).unwrap())\n",
+        "            .spawn(move || {\n                ra_ap_rust_analyzer::run_shared_rust_analyzer_lsp_session_with_config(\n                    config,\n                    connection,\n                )\n                .unwrap()\n            })\n",
+    )?;
     fs::write(path, source)?;
     Ok(())
 }
@@ -559,26 +905,29 @@ const BRIDGE_MODULE: &str = r#"
 	    path::{Path, PathBuf},
 	    sync::{
 	        Arc, Condvar, Mutex, OnceLock, Weak,
-	        atomic::{AtomicBool, Ordering},
+	        atomic::{AtomicBool, AtomicU32, Ordering},
 	    },
 	    thread,
 	    time::Duration,
 	};
 
-	use hir::{ChangeWithProcMacros, collect_ty_garbage};
+	use hir::{ChangeWithProcMacros, ProcMacrosBuilder, collect_ty_garbage};
 	use ide::{Analysis, AnalysisHost, FileId, RootDatabase};
-	use ide_db::base_db::{
-	    CrateGraphBuilder, DependencyBuilder, FileSet, SourceDatabase, SourceRoot, SourceRootId,
-	    all_crates,
-	    salsa::{Database, Durability},
+	use ide_db::{
+	    FxHashMap,
+	    base_db::{
+	        CrateGraphBuilder, DependencyBuilder, FileSet, ProcMacroPaths, SourceDatabase,
+	        SourceRoot, SourceRootId, all_crates,
+	        salsa::{Database, Durability},
+	    },
 	};
 	use load_cargo::{
-	    AnalyzedWorkspaceLoad, LoadCargoConfig, ProcMacroServerChoice,
+	    AnalyzedProcMacroLoad, AnalyzedWorkspaceLoad, LoadCargoConfig, ProcMacroServerChoice,
 	    analyzed_load_workspace_change,
 	};
 	use lsp_types::Url;
 	use proc_macro_api::ProcMacroClient;
-	use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace};
+	use project_model::{CargoConfig, ManifestPath, ProjectWorkspace};
 	use serde::Serialize;
 	use vfs::{AbsPathBuf, Vfs, VfsPath};
 
@@ -627,6 +976,20 @@ pub fn run_shared_rust_analyzer_lsp_session(
     provider: SharedAnalyzerProvider,
 ) -> anyhow::Result<()> {
     crate::main_loop::analyzed_session::run_shared_lsp_session(connection, provider)
+}
+
+pub fn run_shared_rust_analyzer_lsp_session_with_config(
+    config: crate::config::Config,
+    connection: lsp_server::Connection,
+) -> anyhow::Result<()> {
+    let registry = shared_analyzer_registry();
+    let provider = SharedAnalyzerProvider::new(move |key, config| registry.register(key, config));
+
+    crate::main_loop::analyzed_session::run_shared_lsp_session_with_config(
+        config,
+        connection,
+        provider,
+    )
 }
 
 #[derive(Clone)]
@@ -702,7 +1065,7 @@ struct SharedAnalyzerViewEntry {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SharedAnalyzerWorkspaceLoadKey {
     world: SharedAnalyzerWorldKey,
-    root: String,
+    project: String,
 }
 
 struct SharedAnalyzerWorkspaceLoad {
@@ -745,11 +1108,21 @@ impl SharedAnalyzerRegistry {
         let world = self.world(&key.shared_world)?;
         let mut workspaces = Vec::new();
 
-        for root in config.workspace_roots() {
+        for project in config.projects() {
             workspaces.push(self.ensure_workspace_loaded(
                 key.shared_world.clone(),
                 Arc::clone(&world),
-                root,
+                shared_project_key(project),
+                SharedAnalyzerWorkspaceLoadSource::Project(project.clone()),
+                &config,
+            )?);
+        }
+        for file in config.detached_files() {
+            workspaces.push(self.ensure_workspace_loaded(
+                key.shared_world.clone(),
+                Arc::clone(&world),
+                shared_detached_file_key(file),
+                SharedAnalyzerWorkspaceLoadSource::DetachedFile(file.clone()),
                 &config,
             )?);
         }
@@ -803,26 +1176,25 @@ impl SharedAnalyzerRegistry {
         &self,
         world_key: SharedAnalyzerWorldKey,
         world: Arc<Mutex<SharedWorld>>,
-        root: &str,
+        load_key: String,
+        source: SharedAnalyzerWorkspaceLoadSource,
         config: &SharedAnalyzerConfig,
     ) -> anyhow::Result<usize> {
-        let root = AbsPathBuf::assert_utf8(std::fs::canonicalize(root)?);
-        let root_key = root.to_string();
         if let Some(index) = world
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
-            .workspace_index(&root_key)
+            .workspace_index(&load_key)
         {
             return Ok(index);
         }
 
-        let load_key = SharedAnalyzerWorkspaceLoadKey {
+        let registry_load_key = SharedAnalyzerWorkspaceLoadKey {
             world: world_key,
-            root: root_key,
+            project: load_key,
         };
         let (load, leader) = {
             let mut state = self.state()?;
-            match state.loads.entry(load_key.clone()) {
+            match state.loads.entry(registry_load_key.clone()) {
                 Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
                 Entry::Vacant(entry) => {
                     let load = Arc::new(SharedAnalyzerWorkspaceLoad::new());
@@ -833,15 +1205,15 @@ impl SharedAnalyzerRegistry {
         };
 
         if leader {
-            let result = SharedWorld::prepare_cargo_workspace_load(&root, config)
+            let result = SharedWorld::prepare_workspace_load(source, config)
                 .and_then(|loaded| {
                     world
                         .lock()
                         .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
-                        .commit_cargo_workspace(loaded)
+                        .commit_workspace(loaded)
                 });
             load.finish(result);
-            self.state()?.loads.remove(&load_key);
+            self.state()?.loads.remove(&registry_load_key);
         }
 
         load.wait()
@@ -1076,7 +1448,14 @@ pub enum SharedAnalyzerProcMacroServerKey {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SharedAnalyzerViewKey {
     pub workspace_roots: Vec<String>,
+    pub projects: Vec<String>,
     pub analysis: SharedAnalyzerAnalysisKey,
+}
+
+#[derive(Clone)]
+enum SharedAnalyzerWorkspaceLoadSource {
+    Project(crate::config::LinkedProject),
+    DetachedFile(ManifestPath),
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1095,6 +1474,18 @@ pub(crate) fn shared_analyzer_context_from_config(
         .collect::<Vec<_>>();
     workspace_roots.sort();
     workspace_roots.dedup();
+    let projects = config.linked_or_discovered_projects();
+    let detached_files = config
+        .detached_files()
+        .iter()
+        .cloned()
+        .map(ManifestPath::try_from)
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    let mut project_keys = projects.iter().map(shared_project_key).collect::<Vec<_>>();
+    project_keys.extend(detached_files.iter().map(shared_detached_file_key));
+    project_keys.sort();
+    project_keys.dedup();
     let cargo_config = config.cargo(None);
     let load = shared_load_config_from_config(config)?;
     let analysis = SharedAnalyzerAnalysisKey {
@@ -1117,6 +1508,7 @@ pub(crate) fn shared_analyzer_context_from_config(
         },
         workspace_view: SharedAnalyzerViewKey {
             workspace_roots: workspace_roots.clone(),
+            projects: project_keys,
             analysis,
         },
     };
@@ -1125,6 +1517,8 @@ pub(crate) fn shared_analyzer_context_from_config(
         backend_key,
         Arc::new(SharedAnalyzerConfig {
             workspace_roots,
+            projects,
+            detached_files,
             cargo_config,
             load,
         }),
@@ -1133,6 +1527,8 @@ pub(crate) fn shared_analyzer_context_from_config(
 
 pub struct SharedAnalyzerConfig {
     workspace_roots: Vec<String>,
+    projects: Vec<crate::config::LinkedProject>,
+    detached_files: Vec<ManifestPath>,
     pub(crate) cargo_config: CargoConfig,
     pub(crate) load: SharedLoadConfig,
 }
@@ -1141,6 +1537,25 @@ impl SharedAnalyzerConfig {
     pub fn workspace_roots(&self) -> &[String] {
         &self.workspace_roots
     }
+
+    fn projects(&self) -> &[crate::config::LinkedProject] {
+        &self.projects
+    }
+
+    fn detached_files(&self) -> &[ManifestPath] {
+        &self.detached_files
+    }
+}
+
+fn shared_project_key(project: &crate::config::LinkedProject) -> String {
+    match project {
+        crate::config::LinkedProject::ProjectManifest(manifest) => format!("manifest:{manifest}"),
+        crate::config::LinkedProject::InlineProjectJson(project) => format!("json:{project:?}"),
+    }
+}
+
+fn shared_detached_file_key(file: &ManifestPath) -> String {
+    format!("detached:{file}")
 }
 
 #[derive(Clone)]
@@ -1264,7 +1679,7 @@ pub struct SharedAnalyzerSession {
 
 impl SharedAnalyzerSession {
     pub fn new(world: Arc<Mutex<SharedWorld>>, view: WorkspaceView) -> Self {
-        let runtime = SharedAnalyzerRuntime::new(Arc::clone(&world));
+        let runtime = SharedAnalyzerRuntime::new(Arc::clone(&world), &view);
 
         Self {
             world,
@@ -1279,7 +1694,8 @@ impl SharedAnalyzerSession {
         registry: Weak<SharedAnalyzerRegistry>,
         key: SharedAnalyzerBackendKey,
     ) -> Self {
-        let runtime = SharedAnalyzerRuntime::new_registered(Arc::clone(&world), registry, key);
+        let runtime =
+            SharedAnalyzerRuntime::new_registered(Arc::clone(&world), &view, registry, key);
 
         Self {
             world,
@@ -1312,7 +1728,9 @@ pub struct SharedAnalyzerRuntime {
 struct SharedAnalyzerRuntimeSession {
     world: Arc<Mutex<SharedWorld>>,
     id: u64,
-    line_endings: Mutex<BTreeMap<FileId, crate::line_index::LineEndings>>,
+    workspace_indexes: Vec<usize>,
+    line_endings: Mutex<SharedLineEndings>,
+    file_mappings: Mutex<SharedFileMappings>,
     registry_lease: Option<SharedAnalyzerRegistryLease>,
 }
 
@@ -1338,23 +1756,26 @@ impl std::fmt::Debug for SharedAnalyzerRuntime {
 }
 
 impl SharedAnalyzerRuntime {
-    fn new(world: Arc<Mutex<SharedWorld>>) -> Self {
-        Self::new_with_registry(world, None)
+    fn new(world: Arc<Mutex<SharedWorld>>, view: &WorkspaceView) -> Self {
+        Self::new_with_registry(world, view.workspace_indexes().collect(), None)
     }
 
     fn new_registered(
         world: Arc<Mutex<SharedWorld>>,
+        view: &WorkspaceView,
         registry: Weak<SharedAnalyzerRegistry>,
         key: SharedAnalyzerBackendKey,
     ) -> Self {
         Self::new_with_registry(
             world,
+            view.workspace_indexes().collect(),
             Some(SharedAnalyzerRegistryLease { registry, key }),
         )
     }
 
     fn new_with_registry(
         world: Arc<Mutex<SharedWorld>>,
+        workspace_indexes: Vec<usize>,
         registry_lease: Option<SharedAnalyzerRegistryLease>,
     ) -> Self {
         let id = world
@@ -1364,15 +1785,48 @@ impl SharedAnalyzerRuntime {
         let session = Arc::new(SharedAnalyzerRuntimeSession {
             world: Arc::clone(&world),
             id,
-            line_endings: Mutex::new(BTreeMap::new()),
+            workspace_indexes,
+            line_endings: Mutex::new(SharedLineEndings::default()),
+            file_mappings: Mutex::new(SharedFileMappings::default()),
             registry_lease,
         });
 
-        Self { world, session }
+        let runtime = Self { world, session };
+        runtime.refresh_session_cache_from_world();
+        runtime
     }
 
     fn session_id(&self) -> u64 {
         self.session.id
+    }
+
+    fn workspace_indexes(&self) -> &[usize] {
+        &self.session.workspace_indexes
+    }
+
+    fn refresh_session_cache_from_world(&self) {
+        let world = self
+            .world
+            .lock()
+            .expect("shared world mutex poisoned");
+        self.refresh_session_cache(&world);
+    }
+
+    fn refresh_session_cache(&self, world: &SharedWorld) {
+        let line_endings =
+            world.line_endings_for_session(self.session_id(), self.workspace_indexes());
+        let file_mappings =
+            world.file_mappings_for_session(self.session_id(), self.workspace_indexes());
+        *self
+            .session
+            .line_endings
+            .lock()
+            .expect("shared analyzer line endings mutex poisoned") = line_endings;
+        *self
+            .session
+            .file_mappings
+            .lock()
+            .expect("shared analyzer file mappings mutex poisoned") = file_mappings;
     }
 
     pub(crate) fn analysis(&self) -> Analysis {
@@ -1380,13 +1834,9 @@ impl SharedAnalyzerRuntime {
             .world
             .lock()
             .expect("shared world mutex poisoned");
-        let visible_files = world.visible_crate_roots_for_session(self.session_id());
-        let line_endings = world.line_endings_for_session(self.session_id());
-        *self
-            .session
-            .line_endings
-            .lock()
-            .expect("shared analyzer line endings mutex poisoned") = line_endings;
+        let visible_files =
+            world.visible_crate_roots_for_session(self.session_id(), self.workspace_indexes());
+        self.refresh_session_cache(&world);
         world
             .host
             .analyzed_analysis_with_visible_files(Arc::new(visible_files))
@@ -1400,10 +1850,11 @@ impl SharedAnalyzerRuntime {
     pub(crate) fn vfs_path_to_file_id(&self, path: &VfsPath) -> anyhow::Result<Option<FileId>> {
         let path = normalize_vfs_path(path);
         Ok(self
-            .world
+            .session
+            .file_mappings
             .lock()
-            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
-            .file_id_for_vfs_path(self.session_id(), &path))
+            .expect("shared analyzer file mappings mutex poisoned")
+            .file_id(&path))
     }
 
     pub(crate) fn file_id_to_url(&self, file_id: FileId) -> Option<Url> {
@@ -1413,10 +1864,11 @@ impl SharedAnalyzerRuntime {
     }
 
     pub(crate) fn file_id_to_vfs_path(&self, file_id: FileId) -> Option<VfsPath> {
-        self.world
+        self.session
+            .file_mappings
             .lock()
-            .expect("shared world mutex poisoned")
-            .vfs_path_for_file_id(self.session_id(), file_id)
+            .expect("shared analyzer file mappings mutex poisoned")
+            .path(file_id)
     }
 
     pub(crate) fn line_endings(&self, file_id: FileId) -> Option<crate::line_index::LineEndings> {
@@ -1424,15 +1876,69 @@ impl SharedAnalyzerRuntime {
             .line_endings
             .lock()
             .expect("shared analyzer line endings mutex poisoned")
-            .get(&file_id)
-            .copied()
+            .get(file_id)
     }
 
     pub(crate) fn file_exists(&self, file_id: FileId) -> Option<bool> {
+        self.session
+            .file_mappings
+            .lock()
+            .expect("shared analyzer file mappings mutex poisoned")
+            .exists(file_id)
+    }
+
+    pub(crate) fn ratoml_files(
+        &self,
+    ) -> Vec<(VfsPath, SourceRootId, bool, String)> {
+        let world = self
+            .world
+            .lock()
+            .expect("shared world mutex poisoned");
+        let db = world.host.raw_database();
+        let mut files = Vec::new();
+
+        for workspace in world.loaded_workspaces_in(self.workspace_indexes()) {
+            for (file_id, path) in workspace._vfs.iter() {
+                if !workspace._vfs.exists(file_id)
+                    || path.name_and_extension() != Some(("rust-analyzer", Some("toml")))
+                {
+                    continue;
+                }
+                let source_root_id = db.file_source_root(file_id).source_root_id(db);
+                let source_root = db.source_root(source_root_id).source_root(db);
+                let text = db.file_text(file_id).text(db).to_string();
+                files.push((path.clone(), source_root_id, source_root.is_library, text));
+            }
+        }
+
+        if let Some(overlay) = world.session_overlays.get(&self.session_id()) {
+            for file in overlay.files_by_path.values() {
+                if file.display_path.name_and_extension() == Some(("rust-analyzer", Some("toml"))) {
+                    files.push((
+                        file.display_path.clone(),
+                        file.base_source_root,
+                        false,
+                        file.text.clone(),
+                    ));
+                }
+            }
+        }
+
+        files
+    }
+
+    pub(crate) fn source_root_parent_map(&self) -> FxHashMap<SourceRootId, SourceRootId> {
         self.world
             .lock()
             .expect("shared world mutex poisoned")
-            .file_exists(self.session_id(), file_id)
+            .source_root_parent_map(self.workspace_indexes())
+    }
+
+    pub(crate) fn source_root_for_path(&self, path: &VfsPath) -> Option<(SourceRootId, bool)> {
+        self.world
+            .lock()
+            .expect("shared world mutex poisoned")
+            .source_root_for_path(self.workspace_indexes(), path)
     }
 
     pub(crate) fn sync_open_files(
@@ -1444,10 +1950,13 @@ impl SharedAnalyzerRuntime {
             crate::line_index::LineEndings,
         )>,
     ) -> anyhow::Result<SharedOverlaySync> {
-        self.world
+        let mut world = self
+            .world
             .lock()
-            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
-            .sync_session_overlay(self.session_id(), files)
+            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
+        let sync = world.sync_session_overlay(self.session_id(), self.workspace_indexes(), files)?;
+        self.refresh_session_cache(&world);
+        Ok(sync)
     }
 
     pub(crate) fn prepare_overlay_files(
@@ -1457,7 +1966,7 @@ impl SharedAnalyzerRuntime {
         self.world
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
-            .prepare_session_overlay_files(files)
+            .prepare_session_overlay_files(self.workspace_indexes(), files)
     }
 }
 
@@ -1474,6 +1983,104 @@ fn normalize_vfs_path(path: &VfsPath) -> VfsPath {
 
 fn path_key(path: &VfsPath) -> String {
     normalize_vfs_path(path).to_string()
+}
+
+fn allocate_shared_file_id() -> FileId {
+    const MAX_ANALYZED_FILE_ID: u32 = 0x007F_FFFF;
+    static NEXT_FILE_ID: AtomicU32 = AtomicU32::new(0);
+
+    let file_id = NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        file_id <= MAX_ANALYZED_FILE_ID,
+        "shared analyzer file id overflowed"
+    );
+
+    FileId::from_raw(file_id)
+}
+
+#[derive(Clone, Default)]
+struct SharedLineEndings {
+    workspaces: Vec<Arc<BTreeMap<FileId, crate::line_index::LineEndings>>>,
+    overlay: BTreeMap<FileId, crate::line_index::LineEndings>,
+}
+
+impl SharedLineEndings {
+    fn get(&self, file_id: FileId) -> Option<crate::line_index::LineEndings> {
+        for line_endings in &self.workspaces {
+            if let Some(line_endings) = line_endings.get(&file_id) {
+                return Some(*line_endings);
+            }
+        }
+
+        self.overlay.get(&file_id).copied()
+    }
+}
+
+#[derive(Clone, Default)]
+struct SharedFileMappings {
+    workspaces: Vec<Arc<LoadedWorkspaceFiles>>,
+    overlay_by_path: BTreeMap<String, FileId>,
+    overlay_by_file: BTreeMap<FileId, VfsPath>,
+}
+
+impl SharedFileMappings {
+    fn file_id(&self, path: &VfsPath) -> Option<FileId> {
+        let key = path_key(path);
+        if let Some(file_id) = self.overlay_by_path.get(&key).copied() {
+            return Some(file_id);
+        }
+
+        self.workspaces
+            .iter()
+            .find_map(|workspace| workspace.file_id(path).map(|(file_id, _)| file_id))
+    }
+
+    fn path(&self, file_id: FileId) -> Option<VfsPath> {
+        if let Some(path) = self.overlay_by_file.get(&file_id) {
+            return Some(path.clone());
+        }
+
+        self.workspaces
+            .iter()
+            .find_map(|workspace| workspace.path(file_id).cloned())
+    }
+
+    fn exists(&self, file_id: FileId) -> Option<bool> {
+        if self.overlay_by_file.contains_key(&file_id) {
+            return Some(true);
+        }
+
+        self.workspaces.iter().find_map(|workspace| {
+            workspace
+                .contains_file(file_id)
+                .then(|| workspace.exists(file_id))
+        })
+    }
+}
+
+fn common_path_prefix_len(left: &str, right: &str) -> usize {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut index = 0;
+    let mut last_separator = 0;
+    let end = left.len().min(right.len());
+
+    while index < end && left[index] == right[index] {
+        if left[index] == b'/' {
+            last_separator = index + 1;
+        }
+        index += 1;
+    }
+
+    if index == end
+        && (left.len() == right.len()
+            || left.get(index) == Some(&b'/')
+            || right.get(index) == Some(&b'/'))
+    {
+        return index;
+    }
+
+    last_separator
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1549,13 +2156,10 @@ impl SessionOverlay {
         }
     }
 
-    pub fn materialize_files(&mut self, first_file_id: FileId) {
-        let mut next_file_id = first_file_id.index();
-
+    pub fn materialize_files(&mut self) {
         for file in &mut self.files {
             if file.session_file.is_none() {
-                file.session_file = Some(FileId::from_raw(next_file_id));
-                next_file_id += 1;
+                file.session_file = Some(allocate_shared_file_id());
             }
         }
     }
@@ -1650,23 +2254,23 @@ struct ActiveSessionOverlay {
 }
 
 impl ActiveSessionOverlay {
-    fn overlay_file_for_path(&self, key: &str) -> Option<FileId> {
-        self.open_files.get(key).map(|file| file.overlay_file)
-    }
-
-    fn file_path(&self, file_id: FileId) -> Option<VfsPath> {
-        self.path_by_file
-            .get(&file_id)
-            .and_then(|key| self.files_by_path.get(key))
-            .map(|file| file.display_path.clone())
-    }
-
-    fn contains_file(&self, file_id: FileId) -> bool {
-        self.path_by_file.contains_key(&file_id)
-    }
-
     fn file_ids(&self) -> impl Iterator<Item = FileId> + '_ {
         self.path_by_file.keys().copied()
+    }
+
+    fn file_mappings(&self) -> (BTreeMap<String, FileId>, BTreeMap<FileId, VfsPath>) {
+        let by_path = self
+            .files_by_path
+            .iter()
+            .map(|(key, file)| (key.clone(), file.overlay_file))
+            .collect();
+        let by_file = self
+            .files_by_path
+            .values()
+            .map(|file| (file.overlay_file, file.display_path.clone()))
+            .collect();
+
+        (by_path, by_file)
     }
 }
 
@@ -1686,11 +2290,84 @@ struct ActiveOverlayFile {
     line_endings: crate::line_index::LineEndings,
 }
 
+struct LoadedWorkspaceInput {
+    source_roots: Vec<SourceRoot>,
+    crate_graph: CrateGraphBuilder,
+    proc_macros: Vec<AnalyzedProcMacroLoad>,
+}
+
+struct LoadedWorkspaceFile {
+    path: VfsPath,
+    exists: bool,
+}
+
+struct LoadedWorkspaceFiles {
+    files_by_id: BTreeMap<FileId, LoadedWorkspaceFile>,
+    file_ids_by_path: BTreeMap<String, FileId>,
+}
+
+impl LoadedWorkspaceFiles {
+    fn from_vfs(vfs: &Vfs, file_id_map: &FxHashMap<FileId, FileId>) -> Self {
+        let mut files_by_id = BTreeMap::new();
+        let mut file_ids_by_path = BTreeMap::new();
+
+        for (old_file_id, path) in vfs.iter() {
+            let Some(&file_id) = file_id_map.get(&old_file_id) else {
+                continue;
+            };
+            files_by_id.insert(
+                file_id,
+                LoadedWorkspaceFile {
+                    path: path.clone(),
+                    exists: vfs.exists(old_file_id),
+                },
+            );
+            file_ids_by_path.insert(path_key(path), file_id);
+        }
+
+        Self {
+            files_by_id,
+            file_ids_by_path,
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (FileId, &VfsPath)> {
+        self.files_by_id
+            .iter()
+            .map(|(&file_id, file)| (file_id, &file.path))
+    }
+
+    fn file_id(&self, path: &VfsPath) -> Option<(FileId, ())> {
+        self.file_ids_by_path
+            .get(&path_key(path))
+            .copied()
+            .map(|file_id| (file_id, ()))
+    }
+
+    fn exists(&self, file_id: FileId) -> bool {
+        self.files_by_id
+            .get(&file_id)
+            .is_some_and(|file| file.exists)
+    }
+
+    fn contains_file(&self, file_id: FileId) -> bool {
+        self.files_by_id.contains_key(&file_id)
+    }
+
+    fn path(&self, file_id: FileId) -> Option<&VfsPath> {
+        self.files_by_id
+            .get(&file_id)
+            .map(|file| &file.path)
+    }
+}
+
 struct LoadedWorkspace {
     summary: WorkspaceSummary,
     workspace: ProjectWorkspace,
-    _vfs: Vfs,
-    line_endings: BTreeMap<FileId, crate::line_index::LineEndings>,
+    input: LoadedWorkspaceInput,
+    _vfs: Arc<LoadedWorkspaceFiles>,
+    line_endings: Arc<BTreeMap<FileId, crate::line_index::LineEndings>>,
+    source_root_parent_map: FxHashMap<SourceRootId, SourceRootId>,
     _proc_macro_client: Option<ProcMacroClient>,
 }
 
@@ -1716,7 +2393,6 @@ pub struct SharedWorld {
     base_crates: Vec<ide::Crate>,
     base_max_source_root: Option<u32>,
     session_overlays: BTreeMap<u64, ActiveSessionOverlay>,
-    next_overlay_file_id: u32,
     next_session_id: u64,
 }
 
@@ -1730,33 +2406,54 @@ impl SharedWorld {
             base_crates: Vec::new(),
             base_max_source_root: None,
             session_overlays: BTreeMap::new(),
-            next_overlay_file_id: 0,
             next_session_id: 1,
         }
     }
 
-    pub fn load_cargo_workspace(
-        &mut self,
-        root: impl AsRef<Path>,
-        config: &SharedAnalyzerConfig,
-    ) -> anyhow::Result<usize> {
-        let loaded = Self::prepare_cargo_workspace_load(root, config)?;
-        self.commit_cargo_workspace(loaded)
+    fn workspace_index(&self, load_key: &str) -> Option<usize> {
+        self.workspace_indexes.get(load_key).copied()
     }
 
-    fn workspace_index(&self, root_key: &str) -> Option<usize> {
-        self.workspace_indexes.get(root_key).copied()
-    }
-
-    fn prepare_cargo_workspace_load(
-        root: impl AsRef<Path>,
+    fn prepare_workspace_load(
+        source: SharedAnalyzerWorkspaceLoadSource,
         config: &SharedAnalyzerConfig,
     ) -> anyhow::Result<PreparedWorkspaceLoad> {
-        let root = AbsPathBuf::assert_utf8(std::fs::canonicalize(root)?);
-        let root_key = root.to_string();
-        let manifest = ProjectManifest::discover_single(&root)?;
-        let manifest_path = manifest.manifest_path().clone();
-        let workspace = ProjectWorkspace::load(manifest, &config.cargo_config, &|_| {})?;
+        match source {
+            SharedAnalyzerWorkspaceLoadSource::Project(project) => {
+                let load_key = shared_project_key(&project);
+                let workspace = match project {
+                    crate::config::LinkedProject::ProjectManifest(manifest) => {
+                        ProjectWorkspace::load(manifest, &config.cargo_config, &|_| {})?
+                    }
+                    crate::config::LinkedProject::InlineProjectJson(project) => {
+                        ProjectWorkspace::load_inline(project, &config.cargo_config, &|_| {})
+                    }
+                };
+                Self::prepare_loaded_workspace(load_key, workspace, config)
+            }
+            SharedAnalyzerWorkspaceLoadSource::DetachedFile(file) => {
+                let load_key = shared_detached_file_key(&file);
+                let workspace = ProjectWorkspace::load_detached_files(
+                    vec![file],
+                    &config.cargo_config,
+                )
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::format_err!("detached file did not produce a workspace"))??;
+                Self::prepare_loaded_workspace(load_key, workspace, config)
+            }
+        }
+    }
+
+    fn prepare_loaded_workspace(
+        load_key: String,
+        workspace: ProjectWorkspace,
+        config: &SharedAnalyzerConfig,
+    ) -> anyhow::Result<PreparedWorkspaceLoad> {
+        let manifest_path = workspace
+            .manifest()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| workspace.workspace_root().to_string());
         let summary_root = workspace.workspace_root().to_string();
         let packages = workspace.n_packages();
         let workspace_for_session = workspace.clone();
@@ -1764,6 +2461,7 @@ impl SharedWorld {
             workspace,
             &config.cargo_config.extra_env,
             &config.load.to_load_cargo_config(),
+            |_| allocate_shared_file_id(),
         )?;
         let files = loaded.vfs.iter().count();
         let line_endings = loaded
@@ -1778,10 +2476,10 @@ impl SharedWorld {
         let proc_macro_server = loaded.proc_macro_server.is_some();
 
         Ok(PreparedWorkspaceLoad {
-            root_key,
+            root_key: load_key,
             summary: WorkspaceSummary {
                 root: summary_root,
-                manifest: manifest_path.to_string(),
+                manifest: manifest_path,
                 packages,
                 files,
                 proc_macro_server,
@@ -1792,7 +2490,7 @@ impl SharedWorld {
         })
     }
 
-    fn commit_cargo_workspace(
+    fn commit_workspace(
         &mut self,
         loaded: PreparedWorkspaceLoad,
     ) -> anyhow::Result<usize> {
@@ -1800,23 +2498,95 @@ impl SharedWorld {
             return Ok(*index);
         }
 
+        let root_key = loaded.root_key.clone();
+        let (workspace, file_texts) = self.remap_workspace_load(loaded);
+        let change = self.base_input_change_with(&workspace, file_texts)?;
+
         self.host.raw_database_mut().enable_proc_attr_macros();
-        self.host.apply_change(loaded.loaded.change);
+        self.host.apply_change(change);
 
         let index = self.loaded_workspaces.len();
-        self.loaded_workspaces.push(LoadedWorkspace {
-            summary: loaded.summary,
-            workspace: loaded.workspace,
-            _vfs: loaded.loaded.vfs,
-            line_endings: loaded.line_endings,
-            _proc_macro_client: loaded.loaded.proc_macro_server,
-        });
-        self.workspace_indexes.insert(loaded.root_key, index);
+        self.workspace_indexes.insert(root_key, index);
+        self.loaded_workspaces.push(workspace);
         self.refresh_base_inputs();
         self.refresh_package_instances()?;
         shared_analyzer_registry().mark_gc_dirty();
 
         Ok(index)
+    }
+
+    fn remap_workspace_load(
+        &self,
+        loaded: PreparedWorkspaceLoad,
+    ) -> (LoadedWorkspace, Vec<(FileId, String)>) {
+        let source_root_offset = self.base_max_source_root.map_or(0, |source_root| source_root + 1);
+        let files = LoadedWorkspaceFiles::from_vfs(&loaded.loaded.vfs, &loaded.loaded.file_id_map);
+        let file_texts = loaded.loaded.file_texts.clone();
+        let line_endings = Arc::new(loaded.line_endings.into_iter().collect());
+        let source_root_parent_map = loaded
+            .loaded
+            .source_root_parent_map
+            .into_iter()
+            .map(|(source_root, parent)| {
+                (
+                    SourceRootId(source_root.0 + source_root_offset),
+                    SourceRootId(parent.0 + source_root_offset),
+                )
+            })
+            .collect();
+
+        (
+            LoadedWorkspace {
+                summary: loaded.summary,
+                workspace: loaded.workspace,
+                input: LoadedWorkspaceInput {
+                    source_roots: loaded.loaded.source_roots,
+                    crate_graph: loaded.loaded.crate_graph,
+                    proc_macros: loaded.loaded.proc_macros,
+                },
+                _vfs: Arc::new(files),
+                line_endings,
+                source_root_parent_map,
+                _proc_macro_client: loaded.loaded.proc_macro_server,
+            },
+            file_texts,
+        )
+    }
+
+    fn base_input_change_with(
+        &self,
+        workspace: &LoadedWorkspace,
+        file_texts: Vec<(FileId, String)>,
+    ) -> anyhow::Result<ChangeWithProcMacros> {
+        let mut change = ChangeWithProcMacros::default();
+        let mut source_roots = Vec::new();
+        let mut crate_graph = CrateGraphBuilder::default();
+        let mut proc_macros = ProcMacrosBuilder::default();
+
+        for input in self
+            .loaded_workspaces
+            .iter()
+            .map(|workspace| &workspace.input)
+            .chain(std::iter::once(&workspace.input))
+        {
+            source_roots.extend(input.source_roots.iter().cloned());
+            let mut proc_macro_paths = ProcMacroPaths::default();
+            let crate_id_map = crate_graph.extend(input.crate_graph.clone(), &mut proc_macro_paths);
+            for (crate_id, proc_macro) in &input.proc_macros {
+                if let Some(crate_id) = crate_id_map.get(crate_id).copied() {
+                    proc_macros.insert(crate_id, proc_macro.clone());
+                }
+            }
+        }
+
+        change.set_roots(source_roots);
+        change.set_crate_graph(crate_graph);
+        change.set_proc_macros(proc_macros);
+        for (file_id, text) in file_texts {
+            change.change_file(file_id, Some(text));
+        }
+
+        Ok(change)
     }
 
     fn register_session(&mut self) -> u64 {
@@ -1872,6 +2642,15 @@ impl SharedWorld {
             .collect()
     }
 
+    fn loaded_workspaces_in<'a>(
+        &'a self,
+        workspaces: &'a [usize],
+    ) -> impl Iterator<Item = &'a LoadedWorkspace> + 'a {
+        workspaces
+            .iter()
+            .filter_map(|&index| self.loaded_workspaces.get(index))
+    }
+
     fn synthetic_write(&mut self) {
         self.host
             .raw_database_mut()
@@ -1903,77 +2682,107 @@ impl SharedWorld {
         anyhow::bail!("workspace file is not loaded: {path}")
     }
 
-    pub fn file_id_for_vfs_path(&self, session_id: u64, path: &VfsPath) -> Option<FileId> {
-        let key = path_key(path);
-        if let Some(file_id) = self
-            .session_overlays
-            .get(&session_id)
-            .and_then(|overlay| overlay.overlay_file_for_path(&key))
-        {
-            return Some(file_id);
-        }
-
-        self.loaded_workspaces
-            .iter()
-            .find_map(|workspace| workspace._vfs.file_id(path).map(|(file_id, _)| file_id))
-    }
-
-    pub fn vfs_path_for_file_id(&self, session_id: u64, file_id: FileId) -> Option<VfsPath> {
-        if let Some(path) = self
-            .session_overlays
-            .get(&session_id)
-            .and_then(|overlay| overlay.file_path(file_id))
-        {
-            return Some(path);
-        }
-
-        self.loaded_workspaces
-            .iter()
-            .find_map(|workspace| workspace._vfs.iter().find_map(|(id, path)| (id == file_id).then(|| path.clone())))
-    }
-
-    pub(crate) fn line_endings_for_session(
+    fn line_endings_for_session(
         &self,
         session_id: u64,
-    ) -> BTreeMap<FileId, crate::line_index::LineEndings> {
-        let mut line_endings = BTreeMap::new();
+        workspaces: &[usize],
+    ) -> SharedLineEndings {
+        let workspaces = self
+            .loaded_workspaces_in(workspaces)
+            .map(|workspace| Arc::clone(&workspace.line_endings))
+            .collect();
+        let mut overlay_line_endings = BTreeMap::new();
 
-        for workspace in &self.loaded_workspaces {
-            line_endings.extend(workspace.line_endings.iter().map(|(&file_id, &line_endings)| {
-                (file_id, line_endings)
-            }));
-        }
-
-        if let Some(overlay) = self.session_overlays.get(&session_id) {
-            line_endings.extend(overlay.files_by_path.values().map(|file| {
+        if let Some(session_overlay) = self.session_overlays.get(&session_id) {
+            overlay_line_endings.extend(session_overlay.files_by_path.values().map(|file| {
                 (file.overlay_file, file.line_endings)
             }));
         }
 
-        line_endings
+        SharedLineEndings {
+            workspaces,
+            overlay: overlay_line_endings,
+        }
     }
 
-    pub fn file_exists(&self, session_id: u64, file_id: FileId) -> Option<bool> {
-        if self
+    fn file_mappings_for_session(
+        &self,
+        session_id: u64,
+        workspaces: &[usize],
+    ) -> SharedFileMappings {
+        let workspaces = self
+            .loaded_workspaces_in(workspaces)
+            .map(|workspace| Arc::clone(&workspace._vfs))
+            .collect();
+        let (overlay_by_path, overlay_by_file) = self
             .session_overlays
             .get(&session_id)
-            .is_some_and(|overlay| overlay.contains_file(file_id))
-        {
-            return Some(true);
+            .map(ActiveSessionOverlay::file_mappings)
+            .unwrap_or_default();
+
+        SharedFileMappings {
+            workspaces,
+            overlay_by_path,
+            overlay_by_file,
+        }
+    }
+
+    pub(crate) fn source_root_parent_map(
+        &self,
+        workspaces: &[usize],
+    ) -> FxHashMap<SourceRootId, SourceRootId> {
+        self.loaded_workspaces_in(workspaces)
+            .flat_map(|workspace| {
+                workspace
+                    .source_root_parent_map
+                    .iter()
+                    .map(|(&source_root, &parent)| (source_root, parent))
+            })
+            .collect()
+    }
+
+    pub(crate) fn source_root_for_path(
+        &self,
+        workspaces: &[usize],
+        path: &VfsPath,
+    ) -> Option<(SourceRootId, bool)> {
+        let path = normalize_vfs_path(path);
+        if let Some(file_id) = self.base_file_for_vfs_path_in(workspaces, &path) {
+            let db = self.host.raw_database();
+            let source_root_id = db.file_source_root(file_id).source_root_id(db);
+            let source_root = db.source_root(source_root_id).source_root(db);
+            return Some((source_root_id, source_root.is_library));
         }
 
-        self.loaded_workspaces.iter().find_map(|workspace| {
-            workspace
-                ._vfs
-                .iter()
-                .any(|(id, _)| id == file_id)
-                .then(|| workspace._vfs.exists(file_id))
-        })
+        let path = path_key(&path);
+        let mut best = None::<(usize, SourceRootId, bool)>;
+        for workspace in self.loaded_workspaces_in(workspaces) {
+            for (file_id, file_path) in workspace._vfs.iter() {
+                let len = common_path_prefix_len(&path, &path_key(file_path));
+                if len == 0 {
+                    continue;
+                }
+
+                let replace = match best {
+                    Some((best_len, _, _)) => len > best_len,
+                    None => true,
+                };
+                if replace {
+                    let db = self.host.raw_database();
+                    let source_root_id = db.file_source_root(file_id).source_root_id(db);
+                    let source_root = db.source_root(source_root_id).source_root(db);
+                    best = Some((len, source_root_id, source_root.is_library));
+                }
+            }
+        }
+
+        best.map(|(_, source_root_id, is_library)| (source_root_id, is_library))
     }
 
     pub(crate) fn sync_session_overlay(
         &mut self,
         session_id: u64,
+        workspaces: &[usize],
         files: Vec<(
             VfsPath,
             VfsPath,
@@ -1985,7 +2794,7 @@ impl SharedWorld {
             .into_iter()
             .filter_map(|(path, display_path, text, line_endings)| {
                 let key = path_key(&path);
-                self.base_file_for_vfs_path(&normalize_vfs_path(&path))
+                self.base_file_for_vfs_path_in(workspaces, &normalize_vfs_path(&path))
                     .and_then(|base_file| {
                         let db = self.host.raw_database();
                         let base_text = db.file_text(base_file).text(db);
@@ -2032,7 +2841,7 @@ impl SharedWorld {
                 .open_files
                 .get(&key)
                 .map(|file| file.overlay_file)
-                .unwrap_or_else(|| self.allocate_overlay_file_id());
+            .unwrap_or_else(|| self.allocate_overlay_file_id());
             overlay.open_files.insert(
                 key.clone(),
                 OpenOverlayFile {
@@ -2063,6 +2872,7 @@ impl SharedWorld {
 
     pub(crate) fn prepare_session_overlay_files(
         &self,
+        workspaces: &[usize],
         files: Vec<(VfsPath, String, crate::line_index::LineEndings)>,
     ) -> anyhow::Result<Vec<(VfsPath, VfsPath, String, crate::line_index::LineEndings)>> {
         let open_files = files
@@ -2077,7 +2887,7 @@ impl SharedWorld {
 
         for (path, _, _) in open_files.values() {
             let source_path = normalize_vfs_path(path);
-            let Some(base_file) = self.base_file_for_vfs_path(&source_path) else {
+            let Some(base_file) = self.base_file_for_vfs_path_in(workspaces, &source_path) else {
                 continue;
             };
 
@@ -2102,13 +2912,12 @@ impl SharedWorld {
                 continue;
             }
 
-            let Some(base_file) = self.base_file_for_vfs_path(&path) else {
+            let Some(base_file) = self.base_file_for_vfs_path_in(workspaces, &path) else {
                 continue;
             };
             let text = db.file_text(base_file).text(db).to_string();
             let line_endings = self
-                .loaded_workspaces
-                .iter()
+                .loaded_workspaces_in(workspaces)
                 .find_map(|workspace| workspace.line_endings.get(&base_file).copied())
                 .unwrap_or_else(|| {
                     let (_, line_endings) =
@@ -2298,16 +3107,7 @@ impl SharedWorld {
     }
 
     fn allocate_overlay_file_id(&mut self) -> FileId {
-        const MAX_ANALYZED_FILE_ID: u32 = 0x007F_FFFF;
-
-        let file_id = self.next_overlay_file_id;
-        assert!(
-            file_id <= MAX_ANALYZED_FILE_ID,
-            "shared analyzer overlay file id overflowed"
-        );
-        self.next_overlay_file_id += 1;
-
-        FileId::from_raw(file_id)
+        allocate_shared_file_id()
     }
 
     fn refresh_base_inputs(&mut self) {
@@ -2325,7 +3125,6 @@ impl SharedWorld {
             .collect();
 
         self.base_max_source_root = None;
-        let mut max_file_id = None::<u32>;
         for workspace in &self.loaded_workspaces {
             for (file_id, _) in workspace._vfs.iter() {
                 let source_root = db.file_source_root(file_id).source_root_id(db);
@@ -2333,29 +3132,33 @@ impl SharedWorld {
                     self.base_max_source_root
                         .map_or(source_root.0, |max| max.max(source_root.0)),
                 );
-                max_file_id = Some(max_file_id.map_or(file_id.index(), |max| max.max(file_id.index())));
             }
-        }
-
-        if let Some(next_file_id) = max_file_id.map(|file_id| file_id + 1) {
-            self.next_overlay_file_id = self.next_overlay_file_id.max(next_file_id);
         }
     }
 
     fn visible_crate_roots_for_session(
         &self,
         session_id: u64,
+        workspaces: &[usize],
     ) -> rustc_hash::FxHashSet<FileId> {
         let db = self.host.raw_database();
         let overlay = self.session_overlays.get(&session_id);
         let overlay_base_crates = overlay
             .map(|overlay| overlay.crates.keys().copied().collect::<BTreeSet<_>>())
             .unwrap_or_default();
+        let view_workspaces = self
+            .loaded_workspaces_in(workspaces)
+            .collect::<Vec<_>>();
         let mut visible_files = rustc_hash::FxHashSet::default();
 
         for krate in &self.base_crates {
-            if !overlay_base_crates.contains(krate) {
-                visible_files.insert(krate.data(db).root_file_id);
+            let root_file = krate.data(db).root_file_id;
+            if view_workspaces
+                .iter()
+                .any(|workspace| workspace._vfs.contains_file(root_file))
+                && !overlay_base_crates.contains(krate)
+            {
+                visible_files.insert(root_file);
             }
         }
 
@@ -2366,9 +3169,8 @@ impl SharedWorld {
         visible_files
     }
 
-    fn base_file_for_vfs_path(&self, path: &VfsPath) -> Option<FileId> {
-        self.loaded_workspaces
-            .iter()
+    fn base_file_for_vfs_path_in(&self, workspaces: &[usize], path: &VfsPath) -> Option<FileId> {
+        self.loaded_workspaces_in(workspaces)
             .find_map(|workspace| workspace._vfs.file_id(path).map(|(file_id, _)| file_id))
     }
 
@@ -2386,10 +3188,6 @@ impl SharedWorld {
         let path = path_for_file(db, file_id)?;
 
         Ok((file_id, VfsPath::new_real_path(path)))
-    }
-
-    pub fn next_session_file_id(&self) -> FileId {
-        FileId::from_raw(self.next_overlay_file_id)
     }
 
     pub fn package_instances(&self) -> impl Iterator<Item = &PackageInstance> {
@@ -2439,6 +3237,7 @@ impl SharedWorld {
 
     fn refresh_package_instances(&mut self) -> anyhow::Result<()> {
         let db = self.host.raw_database();
+        self.package_instances.clear();
 
         for krate in self.base_crates.iter().copied() {
             let key = package_instance_key(db, krate)?;
@@ -2516,7 +3315,7 @@ impl WorkspaceView {
             }
         }
 
-        overlay.materialize_files(world.next_session_file_id());
+        overlay.materialize_files();
 
         Ok(overlay)
     }
@@ -2551,17 +3350,19 @@ fn package_instance_key(db: &RootDatabase, krate: ide::Crate) -> anyhow::Result<
 const MAIN_LOOP_SESSION_MODULE: &str = r#"
 
 pub(crate) mod analyzed_session {
-    use std::{env, sync::Once};
+    use std::{env, fs, sync::Once};
 
     use crossbeam_channel::{Receiver, Sender};
     use ide::FileId;
+    use ide_db::{FxHashMap, base_db::{SourceRoot, SourceRootId}};
     use lsp_server::{Connection, Message};
     use lsp_types::Url;
     use paths::Utf8PathBuf;
-    use vfs::AbsPathBuf;
+    use triomphe::Arc;
+    use vfs::{AbsPathBuf, ChangeKind, VfsPath};
 
     use crate::{
-        analyzed_bridge::{SharedAnalyzerProvider, patch_path_prefix},
+        analyzed_bridge::{SharedAnalyzerProvider, SharedAnalyzerSnapshot, patch_path_prefix},
         config::{Config, ConfigChange, ConfigErrors},
         from_json, server_capabilities, version,
         global_state::FetchWorkspaceRequest,
@@ -2573,21 +3374,15 @@ pub(crate) mod analyzed_session {
     }
 
     impl RustAnalyzerSession {
-        pub(crate) fn new(sender: Sender<Message>, config: crate::config::Config) -> Self {
-            Self {
-                state: crate::global_state::GlobalState::new(sender, config),
-            }
-        }
-
-        pub(crate) fn new_with_shared_provider(
+        pub(crate) fn new(
             sender: Sender<Message>,
             config: crate::config::Config,
             provider: SharedAnalyzerProvider,
+            snapshot: SharedAnalyzerSnapshot,
         ) -> Self {
-            let mut session = Self::new(sender, config);
-            session.state.analyzed_provider = Some(provider);
-
-            session
+            Self {
+                state: crate::global_state::GlobalState::new(sender, config, provider, snapshot),
+            }
         }
 
         pub(crate) fn run_shared(self, receiver: Receiver<Message>) -> anyhow::Result<()> {
@@ -2601,7 +3396,7 @@ pub(crate) mod analyzed_session {
     ) -> anyhow::Result<()> {
         let (initialize_id, initialize_params) = connection.initialize_start()?;
         tracing::info!("InitializeParams: {}", initialize_params);
-        let mut config = config_from_initialize_params(&connection, &initialize_params)?;
+        let config = config_from_initialize_params(&connection, &initialize_params)?;
         let initialize_result = lsp_types::InitializeResult {
             capabilities: server_capabilities(&config),
             server_info: Some(lsp_types::ServerInfo {
@@ -2613,6 +3408,14 @@ pub(crate) mod analyzed_session {
 
         connection.initialize_finish(initialize_id, serde_json::to_value(initialize_result)?)?;
 
+        run_shared_lsp_session_with_config(config, connection, provider)
+    }
+
+    pub(crate) fn run_shared_lsp_session_with_config(
+        mut config: Config,
+        connection: Connection,
+        provider: SharedAnalyzerProvider,
+    ) -> anyhow::Result<()> {
         if config.discover_workspace_config().is_none()
             && !config.has_linked_projects()
             && config.detached_files().is_empty()
@@ -2621,16 +3424,17 @@ pub(crate) mod analyzed_session {
         }
 
         initialize_rayon();
+        let (key, shared_config) =
+            crate::analyzed_bridge::shared_analyzer_context_from_config(&config)?;
+        let snapshot = provider.resolve(key, shared_config)?.snapshot()?;
         let Connection { sender, receiver } = connection;
-        RustAnalyzerSession::new_with_shared_provider(sender, config, provider).run_shared(receiver)
+        RustAnalyzerSession::new(sender, config, provider, snapshot).run_shared(receiver)
     }
 
     fn run_shared_state(
         mut state: crate::global_state::GlobalState,
         inbox: Receiver<Message>,
     ) -> anyhow::Result<()> {
-        state.update_status_or_notify();
-
         if state.config.did_save_text_document_dynamic_registration() {
             let additional_patterns = state
                 .config
@@ -2653,6 +3457,7 @@ pub(crate) mod analyzed_session {
                 state.fetch_workspaces(cause, path, force_crate_graph_reload);
             }
         }
+        state.update_status_or_notify();
 
         while let Ok(event) = state.next_event(&inbox) {
             let Some(event) = event else {
@@ -2677,9 +3482,69 @@ pub(crate) mod analyzed_session {
 
     impl crate::global_state::GlobalState {
         pub(crate) fn analyzed_process_shared_changes(&mut self) -> bool {
-            let Some(shared) = self.analyzed_shared.clone() else {
-                return false;
-            };
+            let shared = self.analyzed_shared.clone();
+            let mut modified_ratoml_files = Vec::new();
+            let mut workspace_structure_change = None;
+            let mut changed = false;
+
+            {
+                let mut guard = self.vfs.write();
+                let changed_files = guard.0.take_changes();
+                if !changed_files.is_empty() {
+                    changed = true;
+                }
+
+                let additional_files = self
+                    .config
+                    .discover_workspace_config()
+                    .map(|cfg| cfg.files_to_watch.iter().map(String::as_str).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let (vfs, line_endings_map) = &mut *guard;
+
+                for file in changed_files.into_values() {
+                    let vfs_path = vfs.file_path(file.file_id).clone();
+                    let file_kind = file.kind();
+                    let file_exists = file.exists();
+                    let file_is_created_or_deleted = file.is_created_or_deleted();
+                    let text = match file.change {
+                        vfs::Change::Create(bytes, _) | vfs::Change::Modify(bytes, _) => {
+                            String::from_utf8(bytes).ok().map(|text| {
+                                let (text, line_endings) = LineEndings::normalize(text);
+                                line_endings_map.insert(file.file_id, line_endings);
+                                text
+                            })
+                        }
+                        vfs::Change::Delete => None,
+                    };
+
+                    if let Some(("rust-analyzer", Some("toml"))) =
+                        vfs_path.name_and_extension()
+                    {
+                        modified_ratoml_files.push((file_kind, vfs_path.clone(), text.clone()));
+                    }
+
+                    if let Some(path) = vfs_path.as_path() {
+                        if file_is_created_or_deleted {
+                            workspace_structure_change
+                                .get_or_insert((path.to_path_buf(), false))
+                                .1 |= self.crate_graph_file_dependencies.contains(&vfs_path);
+                        } else if crate::reload::should_refresh_for_change(
+                            path,
+                            file_kind,
+                            &additional_files,
+                        ) {
+                            workspace_structure_change
+                                .get_or_insert((path.to_path_buf(), false));
+                        }
+                    }
+
+                    if !file_exists
+                        && let Ok(Some(file_id)) = shared.vfs_path_to_file_id(&vfs_path)
+                    {
+                        self.diagnostics.clear_native_for(file_id);
+                    }
+                }
+            }
 
             let open_files = self
                 .mem_docs
@@ -2712,61 +3577,196 @@ pub(crate) mod analyzed_session {
                 }
             };
 
-            self.vfs.write().0.take_changes();
-
-            if !sync.changed {
-                return false;
+            if sync.changed {
+                changed = true;
+                crate::analyzed_bridge::shared_analyzer_registry().mark_gc_dirty();
             }
 
-            let modified_rust_files = self
-                .mem_docs
-                .iter()
-                .filter(|path| {
-                    path.as_path()
-                        .is_some_and(|path| path.extension() == Some("rs"))
-                })
-                .filter_map(|path| shared.vfs_path_to_file_id(path).ok().flatten())
-                .collect::<Vec<_>>();
+            let mut shared_ratoml_files = shared.ratoml_files();
+            shared_ratoml_files.extend(self.mem_docs.iter().filter_map(|path| {
+                if path.name_and_extension() != Some(("rust-analyzer", Some("toml"))) {
+                    return None;
+                }
 
-            if !modified_rust_files.is_empty() {
+                let doc = self.mem_docs.get(path)?;
+                let text = std::str::from_utf8(&doc.data).ok()?.to_owned();
+                let (source_root_id, is_library) = shared.source_root_for_path(path)?;
+                Some((path.clone(), source_root_id, is_library, text))
+            }));
+            let user_config_path = (|| {
+                let mut path = Config::user_config_dir_path()?;
+                path.push("rust-analyzer.toml");
+                Some(path)
+            })();
+            let user_config_vfs_path =
+                user_config_path.as_ref().map(|path| VfsPath::from(path.clone()));
+            let user_config_text = user_config_vfs_path
+                .as_ref()
+                .and_then(|path| {
+                    self.mem_docs.get(path).and_then(|doc| {
+                        std::str::from_utf8(&doc.data).ok().map(ToOwned::to_owned)
+                    })
+                })
+                .or_else(|| {
+                    user_config_path
+                        .as_ref()
+                        .and_then(|path| fs::read_to_string(path).ok())
+                });
+            let shared_source_root_parent_map = Arc::new(shared.source_root_parent_map());
+            if !modified_ratoml_files.is_empty()
+                || !shared_ratoml_files.is_empty()
+                || user_config_text.is_some()
+                || !self.config.same_source_root_parent_map(&shared_source_root_parent_map)
+            {
+                let source_roots = {
+                    let guard = self.vfs.read();
+                    self.source_root_config.partition(&guard.0)
+                };
+                let config_change = self.analyzed_config_change_from_ratoml(
+                    modified_ratoml_files,
+                    &source_roots,
+                    shared_ratoml_files,
+                    user_config_text,
+                    shared_source_root_parent_map,
+                );
+                let (config, errors, should_update) = self.config.apply_change(config_change);
+                self.config_errors = (!errors.is_empty()).then_some(errors);
+
+                if should_update {
+                    self.update_configuration(config);
+                } else {
+                    self.config = Arc::new(config);
+                }
+                changed = true;
+            }
+
+            if !matches!(&workspace_structure_change, Some((.., true))) {
+                let modified_rust_files = self
+                    .mem_docs
+                    .iter()
+                    .filter(|path| {
+                        path.as_path()
+                            .is_some_and(|path| path.extension() == Some("rs"))
+                    })
+                    .filter_map(|path| shared.vfs_path_to_file_id(path).ok().flatten())
+                    .collect::<Vec<_>>();
                 _ = self
                     .deferred_task_queue
                     .sender
                     .send(crate::main_loop::DeferredTask::CheckProcMacroSources(modified_rust_files));
             }
 
-            true
+            if let Some((path, force_crate_graph_reload)) = workspace_structure_change {
+                self.fetch_workspaces_queue.request_op(
+                    "workspace structure changed".to_owned(),
+                    FetchWorkspaceRequest { path: Some(path), force_crate_graph_reload },
+                );
+            }
+
+            changed
+        }
+
+        fn analyzed_config_change_from_ratoml(
+            &self,
+            modified_ratoml_files: Vec<(ChangeKind, VfsPath, Option<String>)>,
+            source_roots: &[SourceRoot],
+            shared_ratoml_files: Vec<(VfsPath, SourceRootId, bool, String)>,
+            user_config_text: Option<String>,
+            shared_source_root_parent_map: Arc<FxHashMap<SourceRootId, SourceRootId>>,
+        ) -> ConfigChange {
+            let user_config_path = (|| {
+                let mut path = Config::user_config_dir_path()?;
+                path.push("rust-analyzer.toml");
+                Some(path)
+            })();
+            let user_config_abs_path = user_config_path.as_deref();
+            let workspace_ratoml_paths = self
+                .workspaces
+                .iter()
+                .map(|workspace| {
+                    VfsPath::from({
+                        let mut path = workspace.workspace_root().to_owned();
+                        path.push("rust-analyzer.toml");
+                        path
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut change = ConfigChange::default();
+            let mut ratoml_files = shared_ratoml_files
+                .into_iter()
+                .map(|(path, source_root_id, is_library, text)| {
+                    (path, source_root_id, is_library, Some(Arc::<str>::from(text)))
+                })
+                .collect::<Vec<_>>();
+            let mut user_config_changed = false;
+
+            for (_kind, vfs_path, text) in modified_ratoml_files {
+                let text = text.map(Arc::<str>::from);
+                if vfs_path.as_path() == user_config_abs_path {
+                    change.change_user_config(text.clone());
+                    user_config_changed = true;
+                }
+
+                let Some((source_root_id, source_root)) =
+                    source_root_for_path(source_roots, &vfs_path)
+                else {
+                    continue;
+                };
+                ratoml_files.push((vfs_path, source_root_id, source_root.is_library, text));
+            }
+
+            if !user_config_changed
+                && let Some(text) = user_config_text
+            {
+                change.change_user_config(Some(Arc::<str>::from(text)));
+            }
+
+            for (vfs_path, source_root_id, is_library, text) in ratoml_files {
+                if is_library {
+                    continue;
+                }
+
+                let entry = if workspace_ratoml_paths.contains(&vfs_path) {
+                    change.change_workspace_ratoml(source_root_id, vfs_path.clone(), text.clone())
+                } else {
+                    change.change_ratoml(source_root_id, vfs_path.clone(), text.clone())
+                };
+
+                if let Some((kind, old_path, old_text)) = entry
+                    && old_path < vfs_path
+                {
+                    match kind {
+                        crate::config::RatomlFileKind::Crate => {
+                            change.change_ratoml(source_root_id, old_path, old_text);
+                        }
+                        crate::config::RatomlFileKind::Workspace => {
+                            change.change_workspace_ratoml(source_root_id, old_path, old_text);
+                        }
+                    }
+                }
+            }
+
+            change.change_source_root_parent_map(shared_source_root_parent_map);
+            change
         }
 
         pub(crate) fn analyzed_file_id_to_url(&self, file_id: FileId) -> Url {
-            if let Some(shared) = &self.analyzed_shared
-                && let Some(url) = shared.file_id_to_url(file_id)
-            {
-                return url;
-            }
-
-            crate::global_state::file_id_to_url(&self.vfs.read().0, file_id)
+            self.analyzed_shared
+                .file_id_to_url(file_id)
+                .expect("shared analyzer file id must have a url")
         }
 
         pub(crate) fn analyzed_url_to_file_id(
             &self,
             url: &Url,
         ) -> anyhow::Result<Option<FileId>> {
-            if let Some(shared) = &self.analyzed_shared {
-                return shared.url_to_file_id(url);
-            }
-
-            crate::global_state::url_to_file_id(&self.vfs.read().0, url)
+            self.analyzed_shared.url_to_file_id(url)
         }
 
         pub(crate) fn analyzed_filter_diagnostics(
             &self,
             diagnostics: Vec<lsp_types::Diagnostic>,
         ) -> Vec<lsp_types::Diagnostic> {
-            if self.analyzed_shared.is_none() {
-                return diagnostics;
-            }
-
             let rustc_diagnostics = diagnostics
                 .iter()
                 .filter(|diagnostic| diagnostic.source.as_deref() == Some("rustc"))
@@ -2794,6 +3794,17 @@ pub(crate) mod analyzed_session {
         });
 
         (diagnostic.range, code)
+    }
+
+    fn source_root_for_path<'a>(
+        source_roots: &'a [SourceRoot],
+        path: &VfsPath,
+    ) -> Option<(SourceRootId, &'a SourceRoot)> {
+        source_roots.iter().enumerate().find_map(|(index, source_root)| {
+            source_root
+                .file_for_path(path)
+                .map(|_| (SourceRootId(index as u32), source_root))
+        })
     }
 
     fn config_from_initialize_params(

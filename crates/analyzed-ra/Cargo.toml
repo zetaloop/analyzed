@@ -85,7 +85,6 @@ windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug", 
 
 [dev-dependencies]
 expect-test = "1.5.1"
-intern = { version = "=0.0.334", package = "ra_ap_intern", features = ["prevent-gc"] }
 rust-analyzer = { version = "=0.0.334", package = "ra_ap_rust-analyzer" }
 test-fixture = { version = "=0.0.334", package = "ra_ap_test_fixture" }
 test-utils = { version = "=0.0.334", package = "ra_ap_test_utils" }

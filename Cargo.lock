@@ -2237,7 +2237,6 @@ dependencies = [
  "ra_ap_ide_completion 0.0.334",
  "ra_ap_ide_db 0.0.334",
  "ra_ap_ide_ssr 0.0.334",
- "ra_ap_intern",
  "ra_ap_load-cargo 0.0.334",
  "ra_ap_parser",
  "ra_ap_paths",
