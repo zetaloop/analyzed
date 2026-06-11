@@ -330,8 +330,8 @@ fn handle_lsp_session(
 ) -> anyhow::Result<()> {
     let (connection, threads) = lsp_stream_connection(stream)?;
     let registry = shared_analyzer_registry();
-    let provider = SharedAnalyzerProvider::new(move |key, shared_config| {
-        registry.register(key, shared_config)
+    let provider = SharedAnalyzerProvider::new(move |key, shared_config, reload_path| {
+        registry.register(key, shared_config, reload_path)
     });
     let result = ra_ap_rust_analyzer::run_shared_rust_analyzer_lsp_session(connection, provider);
     let join_result = threads.join();
