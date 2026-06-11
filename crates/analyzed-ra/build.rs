@@ -242,11 +242,12 @@ fn append_bridge_export(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 	    PackageInstance, PackageInstanceKey, RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary,
 	    SessionOverlay, SessionOverlayCrate, SessionOverlayFile, SharedAnalyzerBackendKey,
 	    SharedAnalyzerCargoConfigKey, SharedAnalyzerConfig,
-	    SharedAnalyzerLoadKey, SharedAnalyzerProcMacroServerKey, SharedAnalyzerProvider,
+	    SharedAnalyzerBackendSnapshot, SharedAnalyzerLoadKey,
+	    SharedAnalyzerProcMacroServerKey, SharedAnalyzerProvider, SharedAnalyzerRegistry,
 	    SharedAnalyzerSession, SharedAnalyzerWorldConfigKey, SharedAnalyzerWorldKey,
 	    SharedAnalyzerViewKey, SharedWorld, WorkspaceSummary, WorkspaceView,
 	    run_shared_rust_analyzer_lsp_session, rust_analyzer_lsp_boundary,
-	    rust_analyzer_private_boundary,
+	    rust_analyzer_private_boundary, shared_analyzer_registry,
 	};
 	"#,
     )?;
@@ -556,16 +557,25 @@ const BRIDGE_MODULE: &str = r#"
 	    collections::{BTreeMap, BTreeSet, btree_map::Entry},
 	    env,
 	    path::{Path, PathBuf},
-	    sync::{Arc, Mutex},
+	    sync::{
+	        Arc, Condvar, Mutex, OnceLock, Weak,
+	        atomic::{AtomicBool, Ordering},
+	    },
+	    thread,
+	    time::Duration,
 	};
 
-	use hir::ChangeWithProcMacros;
+	use hir::{ChangeWithProcMacros, collect_ty_garbage};
 	use ide::{Analysis, AnalysisHost, FileId, RootDatabase};
 	use ide_db::base_db::{
 	    CrateGraphBuilder, DependencyBuilder, FileSet, SourceDatabase, SourceRoot, SourceRootId,
 	    all_crates,
+	    salsa::{Database, Durability},
 	};
-	use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_into_db};
+	use load_cargo::{
+	    AnalyzedWorkspaceLoad, LoadCargoConfig, ProcMacroServerChoice,
+	    analyzed_load_workspace_change,
+	};
 	use lsp_types::Url;
 	use proc_macro_api::ProcMacroClient;
 	use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace};
@@ -653,13 +663,365 @@ impl SharedAnalyzerProvider {
     }
 }
 
-#[derive(Clone, Debug)]
+pub fn shared_analyzer_registry() -> Arc<SharedAnalyzerRegistry> {
+    static REGISTRY: OnceLock<Arc<SharedAnalyzerRegistry>> = OnceLock::new();
+    Arc::clone(REGISTRY.get_or_init(|| Arc::new(SharedAnalyzerRegistry::new())))
+}
+
+#[derive(Debug, Serialize)]
+pub struct SharedAnalyzerBackendSnapshot {
+    pub key: SharedAnalyzerBackendKey,
+    pub client_sessions: usize,
+    pub overlay_sessions: usize,
+    pub overlay_files: usize,
+    pub workspace_loads: Vec<WorkspaceSummary>,
+}
+
+pub struct SharedAnalyzerRegistry {
+    state: Mutex<SharedAnalyzerRegistryState>,
+    gc: SharedAnalyzerGcCoordinator,
+}
+
+#[derive(Default)]
+struct SharedAnalyzerRegistryState {
+    worlds: BTreeMap<SharedAnalyzerWorldKey, SharedAnalyzerWorldEntry>,
+    views: BTreeMap<SharedAnalyzerBackendKey, SharedAnalyzerViewEntry>,
+    loads: BTreeMap<SharedAnalyzerWorkspaceLoadKey, Arc<SharedAnalyzerWorkspaceLoad>>,
+}
+
+struct SharedAnalyzerWorldEntry {
+    client_sessions: usize,
+    world: Arc<Mutex<SharedWorld>>,
+}
+
+struct SharedAnalyzerViewEntry {
+    client_sessions: usize,
+    view: WorkspaceView,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SharedAnalyzerWorkspaceLoadKey {
+    world: SharedAnalyzerWorldKey,
+    root: String,
+}
+
+struct SharedAnalyzerWorkspaceLoad {
+    result: Mutex<Option<Result<usize, String>>>,
+    ready: Condvar,
+}
+
+struct SharedAnalyzerRegistryLease {
+    registry: Weak<SharedAnalyzerRegistry>,
+    key: SharedAnalyzerBackendKey,
+}
+
+struct SharedAnalyzerGcCoordinator {
+    dirty: Arc<AtomicBool>,
+}
+
+impl SharedAnalyzerRegistry {
+    fn new() -> Self {
+        let gc = SharedAnalyzerGcCoordinator::spawn();
+
+        Self {
+            state: Mutex::new(SharedAnalyzerRegistryState::default()),
+            gc,
+        }
+    }
+
+    fn state(
+        &self,
+    ) -> anyhow::Result<std::sync::MutexGuard<'_, SharedAnalyzerRegistryState>> {
+        self.state
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared analyzer registry mutex is poisoned: {error}"))
+    }
+
+    pub fn register(
+        self: &Arc<Self>,
+        key: SharedAnalyzerBackendKey,
+        config: Arc<SharedAnalyzerConfig>,
+    ) -> anyhow::Result<SharedAnalyzerSession> {
+        let world = self.world(&key.shared_world)?;
+        let mut workspaces = Vec::new();
+
+        for root in config.workspace_roots() {
+            workspaces.push(self.ensure_workspace_loaded(
+                key.shared_world.clone(),
+                Arc::clone(&world),
+                root,
+                &config,
+            )?);
+        }
+
+        let view = WorkspaceView::new(workspaces);
+        {
+            let mut state = self.state()?;
+            state
+                .worlds
+                .get_mut(&key.shared_world)
+                .expect("shared world was registered")
+                .client_sessions += 1;
+            match state.views.entry(key.clone()) {
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().client_sessions += 1;
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(SharedAnalyzerViewEntry {
+                        client_sessions: 1,
+                        view: view.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(SharedAnalyzerSession::new_registered(
+            world,
+            view,
+            Arc::downgrade(self),
+            key,
+        ))
+    }
+
+    fn world(
+        &self,
+        key: &SharedAnalyzerWorldKey,
+    ) -> anyhow::Result<Arc<Mutex<SharedWorld>>> {
+        let mut state = self.state()?;
+        let entry = match state.worlds.entry(key.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(SharedAnalyzerWorldEntry {
+                client_sessions: 0,
+                world: Arc::new(Mutex::new(SharedWorld::new())),
+            }),
+        };
+
+        Ok(Arc::clone(&entry.world))
+    }
+
+    fn ensure_workspace_loaded(
+        &self,
+        world_key: SharedAnalyzerWorldKey,
+        world: Arc<Mutex<SharedWorld>>,
+        root: &str,
+        config: &SharedAnalyzerConfig,
+    ) -> anyhow::Result<usize> {
+        let root = AbsPathBuf::assert_utf8(std::fs::canonicalize(root)?);
+        let root_key = root.to_string();
+        if let Some(index) = world
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
+            .workspace_index(&root_key)
+        {
+            return Ok(index);
+        }
+
+        let load_key = SharedAnalyzerWorkspaceLoadKey {
+            world: world_key,
+            root: root_key,
+        };
+        let (load, leader) = {
+            let mut state = self.state()?;
+            match state.loads.entry(load_key.clone()) {
+                Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
+                Entry::Vacant(entry) => {
+                    let load = Arc::new(SharedAnalyzerWorkspaceLoad::new());
+                    entry.insert(Arc::clone(&load));
+                    (load, true)
+                }
+            }
+        };
+
+        if leader {
+            let result = SharedWorld::prepare_cargo_workspace_load(&root, config)
+                .and_then(|loaded| {
+                    world
+                        .lock()
+                        .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
+                        .commit_cargo_workspace(loaded)
+                });
+            load.finish(result);
+            self.state()?.loads.remove(&load_key);
+        }
+
+        load.wait()
+    }
+
+    pub fn unregister(&self, key: &SharedAnalyzerBackendKey) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+
+        if let Some(entry) = state.views.get_mut(key) {
+            entry.client_sessions = entry.client_sessions.saturating_sub(1);
+            if entry.client_sessions == 0 {
+                state.views.remove(key);
+            }
+        }
+
+        if let Some(entry) = state.worlds.get_mut(&key.shared_world) {
+            entry.client_sessions = entry.client_sessions.saturating_sub(1);
+            if entry.client_sessions == 0 {
+                state.worlds.remove(&key.shared_world);
+            }
+        }
+    }
+
+    pub fn backend_snapshots(&self) -> Vec<SharedAnalyzerBackendSnapshot> {
+        let entries = {
+            let Ok(state) = self.state.lock() else {
+                return Vec::new();
+            };
+            state
+                .views
+                .iter()
+                .filter_map(|(key, entry)| {
+                    let world = state.worlds.get(&key.shared_world)?;
+                    Some((
+                        key.clone(),
+                        entry.client_sessions,
+                        Arc::clone(&world.world),
+                        entry.view.clone(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        entries
+            .into_iter()
+            .map(|(key, client_sessions, world, view)| {
+                let (overlay_sessions, overlay_files, workspace_loads) = world
+                    .lock()
+                    .map(|world| {
+                        (
+                            world.active_overlay_sessions(),
+                            world.overlay_files(),
+                            world.workspace_summaries(&view),
+                        )
+                    })
+                    .unwrap_or_default();
+
+                SharedAnalyzerBackendSnapshot {
+                    key,
+                    client_sessions,
+                    overlay_sessions,
+                    overlay_files,
+                    workspace_loads,
+                }
+            })
+            .collect()
+    }
+
+    pub fn workspace_loads(&self) -> Vec<WorkspaceSummary> {
+        self.backend_snapshots()
+            .into_iter()
+            .flat_map(|snapshot| snapshot.workspace_loads)
+            .collect()
+    }
+
+    pub(crate) fn mark_gc_dirty(&self) {
+        self.gc.mark_dirty();
+    }
+}
+
+impl SharedAnalyzerWorkspaceLoad {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn finish(&self, result: anyhow::Result<usize>) {
+        if let Ok(mut slot) = self.result.lock() {
+            *slot = Some(result.map_err(|error| format!("{error:#}")));
+            self.ready.notify_all();
+        }
+    }
+
+    fn wait(&self) -> anyhow::Result<usize> {
+        let mut slot = self
+            .result
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared analyzer load mutex is poisoned: {error}"))?;
+
+        loop {
+            if let Some(result) = &*slot {
+                return result
+                    .as_ref()
+                    .copied()
+                    .map_err(|error| anyhow::format_err!("{error}"));
+            }
+            slot = self
+                .ready
+                .wait(slot)
+                .map_err(|error| anyhow::format_err!("shared analyzer load mutex is poisoned: {error}"))?;
+        }
+    }
+}
+
+impl SharedAnalyzerGcCoordinator {
+    fn spawn() -> Self {
+        let dirty = Arc::new(AtomicBool::new(false));
+        let worker_dirty = Arc::clone(&dirty);
+
+        thread::Builder::new()
+            .name("shared analyzer gc".to_owned())
+            .spawn(move || loop {
+                if !worker_dirty.swap(false, Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+
+                thread::sleep(Duration::from_millis(200));
+                let registry = shared_analyzer_registry();
+                let worlds = {
+                    let Ok(state) = registry.state.lock() else {
+                        continue;
+                    };
+                    state
+                        .worlds
+                        .values()
+                        .map(|entry| Arc::clone(&entry.world))
+                        .collect::<Vec<_>>()
+                };
+
+                let mut guards = Vec::new();
+                for world in &worlds {
+                    match world.lock() {
+                        Ok(mut world) => {
+                            world.synthetic_write();
+                            guards.push(world);
+                        }
+                        Err(error) => {
+                            tracing::error!("shared world mutex is poisoned during gc: {error}");
+                            guards.clear();
+                            break;
+                        }
+                    }
+                }
+
+                if !guards.is_empty() {
+                    unsafe { collect_ty_garbage() };
+                }
+            })
+            .expect("failed to spawn shared analyzer gc thread");
+
+        Self { dirty }
+    }
+
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SharedAnalyzerBackendKey {
     pub shared_world: SharedAnalyzerWorldKey,
     pub workspace_view: SharedAnalyzerViewKey,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SharedAnalyzerWorldKey {
     pub rust_analyzer_version: String,
     pub toolchain: Option<String>,
@@ -669,12 +1031,12 @@ pub struct SharedAnalyzerWorldKey {
     pub load: SharedAnalyzerLoadKey,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SharedAnalyzerWorldConfigKey {
     pub cargo: SharedAnalyzerCargoConfigKey,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SharedAnalyzerCargoConfigKey {
     pub all_targets: bool,
     pub features: String,
@@ -695,7 +1057,7 @@ pub struct SharedAnalyzerCargoConfigKey {
     pub metadata_extra_args: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SharedAnalyzerLoadKey {
     pub load_out_dirs_from_check: bool,
     pub proc_macro_server: SharedAnalyzerProcMacroServerKey,
@@ -704,20 +1066,20 @@ pub struct SharedAnalyzerLoadKey {
     pub proc_macro_processes: u16,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum SharedAnalyzerProcMacroServerKey {
     None,
     Sysroot,
     Explicit(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SharedAnalyzerViewKey {
     pub workspace_roots: Vec<String>,
     pub analysis: SharedAnalyzerAnalysisKey,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SharedAnalyzerAnalysisKey {
     pub initialization_options: Option<String>,
     pub workspace_configuration: Option<String>,
@@ -911,6 +1273,21 @@ impl SharedAnalyzerSession {
         }
     }
 
+    fn new_registered(
+        world: Arc<Mutex<SharedWorld>>,
+        view: WorkspaceView,
+        registry: Weak<SharedAnalyzerRegistry>,
+        key: SharedAnalyzerBackendKey,
+    ) -> Self {
+        let runtime = SharedAnalyzerRuntime::new_registered(Arc::clone(&world), registry, key);
+
+        Self {
+            world,
+            view,
+            runtime,
+        }
+    }
+
     pub fn snapshot(&self) -> anyhow::Result<SharedAnalyzerSnapshot> {
         let world = self
             .world
@@ -936,12 +1313,18 @@ struct SharedAnalyzerRuntimeSession {
     world: Arc<Mutex<SharedWorld>>,
     id: u64,
     line_endings: Mutex<BTreeMap<FileId, crate::line_index::LineEndings>>,
+    registry_lease: Option<SharedAnalyzerRegistryLease>,
 }
 
 impl Drop for SharedAnalyzerRuntimeSession {
     fn drop(&mut self) {
         if let Ok(mut world) = self.world.lock() {
             world.unregister_session(self.id);
+        }
+        if let Some(lease) = &self.registry_lease
+            && let Some(registry) = lease.registry.upgrade()
+        {
+            registry.unregister(&lease.key);
         }
     }
 }
@@ -956,6 +1339,24 @@ impl std::fmt::Debug for SharedAnalyzerRuntime {
 
 impl SharedAnalyzerRuntime {
     fn new(world: Arc<Mutex<SharedWorld>>) -> Self {
+        Self::new_with_registry(world, None)
+    }
+
+    fn new_registered(
+        world: Arc<Mutex<SharedWorld>>,
+        registry: Weak<SharedAnalyzerRegistry>,
+        key: SharedAnalyzerBackendKey,
+    ) -> Self {
+        Self::new_with_registry(
+            world,
+            Some(SharedAnalyzerRegistryLease { registry, key }),
+        )
+    }
+
+    fn new_with_registry(
+        world: Arc<Mutex<SharedWorld>>,
+        registry_lease: Option<SharedAnalyzerRegistryLease>,
+    ) -> Self {
         let id = world
             .lock()
             .expect("shared world mutex poisoned")
@@ -964,6 +1365,7 @@ impl SharedAnalyzerRuntime {
             world: Arc::clone(&world),
             id,
             line_endings: Mutex::new(BTreeMap::new()),
+            registry_lease,
         });
 
         Self { world, session }
@@ -1298,6 +1700,14 @@ impl LoadedWorkspace {
     }
 }
 
+struct PreparedWorkspaceLoad {
+    root_key: String,
+    summary: WorkspaceSummary,
+    workspace: ProjectWorkspace,
+    loaded: AnalyzedWorkspaceLoad,
+    line_endings: BTreeMap<FileId, crate::line_index::LineEndings>,
+}
+
 pub struct SharedWorld {
     host: AnalysisHost,
     loaded_workspaces: Vec<LoadedWorkspace>,
@@ -1330,18 +1740,81 @@ impl SharedWorld {
         root: impl AsRef<Path>,
         config: &SharedAnalyzerConfig,
     ) -> anyhow::Result<usize> {
+        let loaded = Self::prepare_cargo_workspace_load(root, config)?;
+        self.commit_cargo_workspace(loaded)
+    }
+
+    fn workspace_index(&self, root_key: &str) -> Option<usize> {
+        self.workspace_indexes.get(root_key).copied()
+    }
+
+    fn prepare_cargo_workspace_load(
+        root: impl AsRef<Path>,
+        config: &SharedAnalyzerConfig,
+    ) -> anyhow::Result<PreparedWorkspaceLoad> {
         let root = AbsPathBuf::assert_utf8(std::fs::canonicalize(root)?);
         let root_key = root.to_string();
-        if let Some(index) = self.workspace_indexes.get(&root_key) {
+        let manifest = ProjectManifest::discover_single(&root)?;
+        let manifest_path = manifest.manifest_path().clone();
+        let workspace = ProjectWorkspace::load(manifest, &config.cargo_config, &|_| {})?;
+        let summary_root = workspace.workspace_root().to_string();
+        let packages = workspace.n_packages();
+        let workspace_for_session = workspace.clone();
+        let loaded = analyzed_load_workspace_change(
+            workspace,
+            &config.cargo_config.extra_env,
+            &config.load.to_load_cargo_config(),
+        )?;
+        let files = loaded.vfs.iter().count();
+        let line_endings = loaded
+            .file_texts
+            .iter()
+            .map(|(file_id, text)| {
+                let (_, line_endings) =
+                    crate::line_index::LineEndings::normalize(text.clone());
+                (*file_id, line_endings)
+            })
+            .collect();
+        let proc_macro_server = loaded.proc_macro_server.is_some();
+
+        Ok(PreparedWorkspaceLoad {
+            root_key,
+            summary: WorkspaceSummary {
+                root: summary_root,
+                manifest: manifest_path.to_string(),
+                packages,
+                files,
+                proc_macro_server,
+            },
+            workspace: workspace_for_session,
+            loaded,
+            line_endings,
+        })
+    }
+
+    fn commit_cargo_workspace(
+        &mut self,
+        loaded: PreparedWorkspaceLoad,
+    ) -> anyhow::Result<usize> {
+        if let Some(index) = self.workspace_indexes.get(&loaded.root_key) {
             return Ok(*index);
         }
 
-        let loaded = load_cargo_workspace_into_host(&mut self.host, root, config)?;
+        self.host.raw_database_mut().enable_proc_attr_macros();
+        self.host.apply_change(loaded.loaded.change);
+
         let index = self.loaded_workspaces.len();
-        self.loaded_workspaces.push(loaded);
-        self.workspace_indexes.insert(root_key, index);
+        self.loaded_workspaces.push(LoadedWorkspace {
+            summary: loaded.summary,
+            workspace: loaded.workspace,
+            _vfs: loaded.loaded.vfs,
+            line_endings: loaded.line_endings,
+            _proc_macro_client: loaded.loaded.proc_macro_server,
+        });
+        self.workspace_indexes.insert(loaded.root_key, index);
         self.refresh_base_inputs();
         self.refresh_package_instances()?;
+        shared_analyzer_registry().mark_gc_dirty();
 
         Ok(index)
     }
@@ -1390,6 +1863,19 @@ impl SharedWorld {
             workspaces,
             runtime,
         })
+    }
+
+    fn workspace_summaries(&self, view: &WorkspaceView) -> Vec<WorkspaceSummary> {
+        view.workspace_indexes()
+            .filter_map(|index| self.loaded_workspaces.get(index))
+            .map(|workspace| workspace.summary().clone())
+            .collect()
+    }
+
+    fn synthetic_write(&mut self) {
+        self.host
+            .raw_database_mut()
+            .synthetic_write(Durability::LOW);
     }
 
     pub fn workspace_file(&self, path: impl AsRef<Path>) -> anyhow::Result<(FileId, VfsPath)> {
@@ -2034,54 +2520,6 @@ impl WorkspaceView {
 
         Ok(overlay)
     }
-}
-
-fn load_cargo_workspace_into_host(
-    host: &mut AnalysisHost,
-    root: impl AsRef<Path>,
-    config: &SharedAnalyzerConfig,
-) -> anyhow::Result<LoadedWorkspace> {
-    let root = AbsPathBuf::assert_utf8(std::fs::canonicalize(root)?);
-    let manifest = ProjectManifest::discover_single(&root)?;
-    let manifest_path = manifest.manifest_path().clone();
-    let workspace = ProjectWorkspace::load(manifest, &config.cargo_config, &|_| {})?;
-    let root = workspace.workspace_root().to_string();
-    let packages = workspace.n_packages();
-    let workspace_for_session = workspace.clone();
-    let (vfs, proc_macro_client) = {
-        let db = host.raw_database_mut();
-        load_workspace_into_db(
-            workspace,
-            &config.cargo_config.extra_env,
-            &config.load.to_load_cargo_config(),
-            db,
-        )?
-    };
-    let files = vfs.iter().count();
-    let line_endings = {
-        let db = host.raw_database();
-        vfs.iter()
-            .map(|(file_id, _)| {
-                let text = db.file_text(file_id).text(db).to_string();
-                let (_, line_endings) = crate::line_index::LineEndings::normalize(text);
-                (file_id, line_endings)
-            })
-            .collect()
-    };
-
-    Ok(LoadedWorkspace {
-        summary: WorkspaceSummary {
-            root,
-            manifest: manifest_path.to_string(),
-            packages,
-            files,
-            proc_macro_server: proc_macro_client.is_some(),
-        },
-        workspace: workspace_for_session,
-        _vfs: vfs,
-        line_endings,
-        _proc_macro_client: proc_macro_client,
-    })
 }
 
 fn path_for_file(db: &RootDatabase, file_id: FileId) -> anyhow::Result<String> {

@@ -1,12 +1,11 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     env, fs,
     io::{BufReader, ErrorKind},
     os::unix::net::UnixStream,
     path::Path,
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -23,9 +22,7 @@ use analyzed_ipc::{
 use crossbeam_channel::unbounded;
 use daemonize::Daemonize;
 use lsp_server::{Connection, Message};
-use ra_ap_rust_analyzer::{
-    SharedAnalyzerConfig, SharedAnalyzerProvider, SharedAnalyzerSession, SharedWorld, WorkspaceView,
-};
+use ra_ap_rust_analyzer::{SharedAnalyzerProvider, shared_analyzer_registry};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -215,7 +212,6 @@ impl DaemonRuntime {
                     .map_or(0, |duration| duration.as_secs()),
                 client_sessions: AtomicUsize::new(0),
                 next_session_id: AtomicUsize::new(1),
-                backends: Mutex::new(BackendRegistry::default()),
                 stopping: AtomicBool::new(false),
             }),
         }
@@ -227,18 +223,22 @@ struct ServiceState {
     started_at_unix_seconds: u64,
     client_sessions: AtomicUsize,
     next_session_id: AtomicUsize,
-    backends: Mutex<BackendRegistry>,
     stopping: AtomicBool,
 }
 
 impl ServiceState {
     fn snapshot(&self) -> DaemonSnapshot {
-        let backends = self
-            .backends
-            .lock()
-            .expect("backend registry mutex poisoned");
-        let backend_sessions = backends.snapshots();
-        let workspace_loads = backends.workspace_loads();
+        let registry = shared_analyzer_registry();
+        let backend_sessions = registry
+            .backend_snapshots()
+            .into_iter()
+            .map(backend_snapshot_from_shared)
+            .collect::<Vec<_>>();
+        let workspace_loads = registry
+            .workspace_loads()
+            .into_iter()
+            .map(workspace_snapshot_from_shared)
+            .collect::<Vec<_>>();
 
         DaemonSnapshot {
             pid: self.pid,
@@ -258,244 +258,6 @@ impl ServiceState {
             daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
             rust_analyzer_version: RUST_ANALYZER_VERSION.to_owned(),
             socket_path: paths.socket_path.to_string_lossy().into_owned(),
-        }
-    }
-
-    fn resolve_backend_session(
-        self: &Arc<Self>,
-        key: BackendKey,
-        shared_config: Arc<SharedAnalyzerConfig>,
-    ) -> anyhow::Result<SharedAnalyzerSession> {
-        let shared_session = self
-            .backends
-            .lock()
-            .map_err(|error| anyhow::format_err!("backend registry mutex is poisoned: {error}"))?
-            .register(key.clone(), shared_config)?;
-
-        Ok(shared_session)
-    }
-
-    fn unregister_backend_session(&self, key: &BackendKey) {
-        if let Ok(mut backends) = self.backends.lock() {
-            backends.unregister(key);
-        }
-    }
-}
-
-#[derive(Default)]
-struct BackendRegistry {
-    worlds: BTreeMap<SharedWorldKey, SharedWorldEntry>,
-    views: BTreeMap<BackendKey, WorkspaceViewEntry>,
-}
-
-impl BackendRegistry {
-    fn load(
-        &mut self,
-        key: &BackendKey,
-        shared_config: &Arc<SharedAnalyzerConfig>,
-    ) -> anyhow::Result<()> {
-        if let Entry::Vacant(entry) = self.worlds.entry(key.shared_world.clone()) {
-            entry.insert(SharedWorldEntry {
-                client_sessions: 0,
-                world: Arc::new(Mutex::new(SharedWorld::new())),
-            });
-        }
-
-        if !self.views.contains_key(key) {
-            let view = {
-                let world = self
-                    .worlds
-                    .get(&key.shared_world)
-                    .expect("shared world was loaded");
-                let mut world = world.world.lock().map_err(|error| {
-                    anyhow::format_err!("shared world mutex is poisoned: {error}")
-                })?;
-                let mut workspaces = Vec::new();
-
-                for root in shared_config.workspace_roots() {
-                    workspaces.push(world.load_cargo_workspace(Path::new(root), shared_config)?);
-                }
-
-                WorkspaceView::new(workspaces)
-            };
-            self.views.insert(
-                key.clone(),
-                WorkspaceViewEntry {
-                    client_sessions: 0,
-                    view,
-                },
-            );
-        }
-
-        Ok(())
-    }
-
-    fn register(
-        &mut self,
-        key: BackendKey,
-        shared_config: Arc<SharedAnalyzerConfig>,
-    ) -> anyhow::Result<SharedAnalyzerSession> {
-        self.load(&key, &shared_config)?;
-        self.worlds
-            .get_mut(&key.shared_world)
-            .expect("shared world was loaded")
-            .client_sessions += 1;
-        self.views
-            .get_mut(&key)
-            .expect("workspace view was loaded")
-            .client_sessions += 1;
-
-        self.shared_session(&key)
-    }
-
-    fn shared_session(&self, key: &BackendKey) -> anyhow::Result<SharedAnalyzerSession> {
-        let world = self
-            .worlds
-            .get(&key.shared_world)
-            .ok_or_else(|| anyhow::format_err!("shared world is not loaded"))?;
-        let view = self
-            .views
-            .get(key)
-            .ok_or_else(|| anyhow::format_err!("workspace view is not loaded"))?;
-
-        Ok(SharedAnalyzerSession::new(
-            Arc::clone(&world.world),
-            view.view.clone(),
-        ))
-    }
-
-    fn unregister(&mut self, key: &BackendKey) {
-        if let Some(entry) = self.views.get_mut(key) {
-            entry.client_sessions -= 1;
-            if entry.client_sessions == 0 {
-                self.views.remove(key);
-            }
-        }
-
-        if let Some(entry) = self.worlds.get_mut(&key.shared_world) {
-            entry.client_sessions -= 1;
-            if entry.client_sessions == 0 {
-                self.worlds.remove(&key.shared_world);
-            }
-        }
-    }
-
-    fn snapshots(&self) -> Vec<BackendSnapshot> {
-        self.views
-            .iter()
-            .filter_map(|(key, entry)| {
-                let world = self.worlds.get(&key.shared_world)?;
-                Some(BackendSnapshot {
-                    key: key.clone(),
-                    client_sessions: entry.client_sessions,
-                    overlay_sessions: active_overlay_sessions(&world.world),
-                    overlay_files: overlay_files(&world.world),
-                    workspace_loads: workspace_snapshots(&world.world, &entry.view),
-                })
-            })
-            .collect()
-    }
-
-    fn workspace_loads(&self) -> Vec<WorkspaceSnapshot> {
-        self.views
-            .iter()
-            .filter_map(|(key, entry)| {
-                let world = self.worlds.get(&key.shared_world)?;
-                Some(workspace_snapshots(&world.world, &entry.view))
-            })
-            .flatten()
-            .collect()
-    }
-}
-
-struct SharedWorldEntry {
-    client_sessions: usize,
-    world: Arc<Mutex<SharedWorld>>,
-}
-
-struct WorkspaceViewEntry {
-    client_sessions: usize,
-    view: WorkspaceView,
-}
-
-fn workspace_snapshots(
-    world: &Arc<Mutex<SharedWorld>>,
-    view: &WorkspaceView,
-) -> Vec<WorkspaceSnapshot> {
-    let world = world.lock().expect("shared world mutex poisoned");
-
-    view.workspace_summaries(&world)
-        .map(|summary| WorkspaceSnapshot {
-            root: summary.root.clone(),
-            manifest: summary.manifest.clone(),
-            packages: summary.packages,
-            files: summary.files,
-            proc_macro_server: summary.proc_macro_server,
-        })
-        .collect()
-}
-
-fn active_overlay_sessions(world: &Arc<Mutex<SharedWorld>>) -> usize {
-    world
-        .lock()
-        .expect("shared world mutex poisoned")
-        .active_overlay_sessions()
-}
-
-fn overlay_files(world: &Arc<Mutex<SharedWorld>>) -> usize {
-    world
-        .lock()
-        .expect("shared world mutex poisoned")
-        .overlay_files()
-}
-
-struct BackendSessionRefs {
-    state: Arc<ServiceState>,
-    keys: Mutex<BTreeSet<BackendKey>>,
-}
-
-impl BackendSessionRefs {
-    fn new(state: Arc<ServiceState>) -> Self {
-        Self {
-            state,
-            keys: Mutex::new(BTreeSet::new()),
-        }
-    }
-
-    fn resolve(
-        &self,
-        key: BackendKey,
-        shared_config: Arc<SharedAnalyzerConfig>,
-    ) -> anyhow::Result<SharedAnalyzerSession> {
-        let mut keys = self
-            .keys
-            .lock()
-            .map_err(|error| anyhow::format_err!("backend session mutex is poisoned: {error}"))?;
-        if keys.contains(&key) {
-            return self
-                .state
-                .backends
-                .lock()
-                .map_err(|error| {
-                    anyhow::format_err!("backend registry mutex is poisoned: {error}")
-                })?
-                .shared_session(&key);
-        }
-
-        let session = self
-            .state
-            .resolve_backend_session(key.clone(), shared_config)?;
-        keys.insert(key);
-        Ok(session)
-    }
-}
-
-impl Drop for BackendSessionRefs {
-    fn drop(&mut self) {
-        if let Ok(keys) = self.keys.get_mut() {
-            for key in keys.iter() {
-                self.state.unregister_backend_session(key);
-            }
         }
     }
 }
@@ -563,17 +325,15 @@ impl LspStreamThreads {
 
 fn handle_lsp_session(
     stream: UnixStream,
-    state: Arc<ServiceState>,
+    _state: Arc<ServiceState>,
     _session_id: usize,
 ) -> anyhow::Result<()> {
     let (connection, threads) = lsp_stream_connection(stream)?;
-    let backend_refs = Arc::new(BackendSessionRefs::new(Arc::clone(&state)));
-    let provider_backend_refs = Arc::clone(&backend_refs);
+    let registry = shared_analyzer_registry();
     let provider = SharedAnalyzerProvider::new(move |key, shared_config| {
-        provider_backend_refs.resolve(backend_key_from_shared(key), shared_config)
+        registry.register(key, shared_config)
     });
     let result = ra_ap_rust_analyzer::run_shared_rust_analyzer_lsp_session(connection, provider);
-    drop(backend_refs);
     let join_result = threads.join();
 
     match (result, join_result) {
@@ -633,6 +393,34 @@ fn validate_initialize(message: &Message) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn backend_snapshot_from_shared(
+    snapshot: ra_ap_rust_analyzer::SharedAnalyzerBackendSnapshot,
+) -> BackendSnapshot {
+    BackendSnapshot {
+        key: backend_key_from_shared(snapshot.key),
+        client_sessions: snapshot.client_sessions,
+        overlay_sessions: snapshot.overlay_sessions,
+        overlay_files: snapshot.overlay_files,
+        workspace_loads: snapshot
+            .workspace_loads
+            .into_iter()
+            .map(workspace_snapshot_from_shared)
+            .collect(),
+    }
+}
+
+fn workspace_snapshot_from_shared(
+    summary: ra_ap_rust_analyzer::WorkspaceSummary,
+) -> WorkspaceSnapshot {
+    WorkspaceSnapshot {
+        root: summary.root,
+        manifest: summary.manifest,
+        packages: summary.packages,
+        files: summary.files,
+        proc_macro_server: summary.proc_macro_server,
+    }
 }
 
 fn backend_key_from_shared(key: ra_ap_rust_analyzer::SharedAnalyzerBackendKey) -> BackendKey {
