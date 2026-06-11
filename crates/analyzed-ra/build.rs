@@ -245,7 +245,7 @@ fn append_bridge_export(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 	    SharedAnalyzerCargoConfigKey, SharedAnalyzerConfig,
 	    SharedAnalyzerBackendSnapshot, SharedAnalyzerLoadKey,
 	    SharedAnalyzerProcMacroServerKey, SharedAnalyzerProvider, SharedAnalyzerRegistry,
-	    SharedAnalyzerSession, SharedAnalyzerSnapshot, SharedAnalyzerWorldConfigKey, SharedAnalyzerWorldKey,
+	    SharedAnalyzerSession, SharedAnalyzerWorldConfigKey, SharedAnalyzerWorldKey,
 	    SharedAnalyzerViewKey, SharedWorld, WorkspaceSummary, WorkspaceView,
 	    run_shared_rust_analyzer_lsp_session, run_shared_rust_analyzer_lsp_session_with_config,
 	    rust_analyzer_lsp_boundary,
@@ -352,7 +352,7 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
     replace_once(
         &mut source,
         "            analysis_host,\n            diagnostics: Default::default(),\n",
-        "            analyzed_provider,\n            analyzed_shared: analyzed_snapshot.runtime,\n            diagnostics: Default::default(),\n",
+        "            analyzed_provider,\n            analyzed_shared,\n            diagnostics: Default::default(),\n",
     )?;
     replace_once(
         &mut source,
@@ -367,7 +367,7 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
     replace_once(
         &mut source,
         "    pub(crate) fn new(sender: Sender<lsp_server::Message>, config: Config) -> GlobalState {\n",
-        "    pub(crate) fn new(\n        sender: Sender<lsp_server::Message>,\n        config: Config,\n        analyzed_provider: crate::analyzed_bridge::SharedAnalyzerProvider,\n        analyzed_snapshot: crate::analyzed_bridge::SharedAnalyzerSnapshot,\n    ) -> GlobalState {\n",
+        "    pub(crate) fn new(\n        sender: Sender<lsp_server::Message>,\n        config: Config,\n        analyzed_provider: crate::analyzed_bridge::SharedAnalyzerProvider,\n        analyzed_shared: crate::analyzed_bridge::SharedAnalyzerRuntime,\n        analyzed_workspaces: Vec<ProjectWorkspace>,\n    ) -> GlobalState {\n",
     )?;
     replace_once(
         &mut source,
@@ -388,7 +388,7 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
     replace_once(
         &mut source,
         "            workspaces: Arc::from(Vec::new()),\n",
-        "            workspaces: Arc::new(analyzed_snapshot.workspaces.clone()),\n",
+        "            workspaces: Arc::new(analyzed_workspaces),\n",
     )?;
     replace_once(
         &mut source,
@@ -517,7 +517,7 @@ fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box
     replace_once(
         &mut source,
         "        let state = GlobalState::new(\n            sender,\n            Config::new(\n                workspace_root.to_path_buf(),\n                ClientCapabilities::default(),\n                Vec::new(),\n                None,\n            ),\n        );\n",
-        "        let ra_config = Config::new(\n            workspace_root.to_path_buf(),\n            ClientCapabilities::default(),\n            Vec::new(),\n            None,\n        );\n        let registry = crate::analyzed_bridge::shared_analyzer_registry();\n        let provider = crate::analyzed_bridge::SharedAnalyzerProvider::new(move |key, config| {\n            registry.register(key, config)\n        });\n        let (key, shared_config) = crate::analyzed_bridge::shared_analyzer_context_from_config(&ra_config).unwrap();\n        let snapshot = provider.resolve(key, shared_config).unwrap().snapshot().unwrap();\n        let state = GlobalState::new(sender, ra_config, provider, snapshot);\n",
+        "        let ra_config = Config::new(\n            workspace_root.to_path_buf(),\n            ClientCapabilities::default(),\n            Vec::new(),\n            None,\n        );\n        let registry = crate::analyzed_bridge::shared_analyzer_registry();\n        let provider = crate::analyzed_bridge::SharedAnalyzerProvider::new(move |key, config| {\n            registry.register(key, config)\n        });\n        let (key, shared_config) = crate::analyzed_bridge::shared_analyzer_context_from_config(&ra_config).unwrap();\n        let session = provider.resolve(key, shared_config).unwrap();\n        let analyzed_shared = session.runtime();\n        let analyzed_workspaces = session.workspaces().unwrap();\n        let state = GlobalState::new(sender, ra_config, provider, analyzed_shared, analyzed_workspaces);\n",
     )?;
 
     fs::write(flycheck_to_proto_rs, source)?;
@@ -752,7 +752,7 @@ fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
     replace_once(
         &mut source,
         "        info!(%cause, \"will fetch workspaces\");\n\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, {\n",
-        "        info!(%cause, \"will fetch workspaces\");\n        let _ = path;\n\n        let provider = self.analyzed_provider.clone();\n        let shared_context = crate::analyzed_bridge::shared_analyzer_context_from_config(&self.config);\n        let current_shared = self.analyzed_shared.clone();\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {\n            sender.send(Task::FetchWorkspace(ProjectWorkspaceProgress::Begin)).unwrap();\n            let response = match shared_context {\n                Ok((key, config)) => provider\n                    .resolve(key, config)\n                    .and_then(|session| session.snapshot())\n                    .map(|snapshot| FetchWorkspaceResponse {\n                        workspaces: snapshot.workspaces.into_iter().map(Ok).collect(),\n                        force_crate_graph_reload,\n                        analyzed_shared: snapshot.runtime,\n                    })\n                    .unwrap_or_else(|error| FetchWorkspaceResponse {\n                        workspaces: vec![Err(error)],\n                        force_crate_graph_reload,\n                        analyzed_shared: current_shared.clone(),\n                    }),\n                Err(error) => FetchWorkspaceResponse {\n                    workspaces: vec![Err(error)],\n                    force_crate_graph_reload,\n                    analyzed_shared: current_shared.clone(),\n                },\n            };\n            sender.send(Task::AnalyzedFetchWorkspace(response)).unwrap();\n        });\n        return;\n\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, {\n",
+        "        info!(%cause, \"will fetch workspaces\");\n        let _ = path;\n\n        let provider = self.analyzed_provider.clone();\n        let shared_context = crate::analyzed_bridge::shared_analyzer_context_from_config(&self.config);\n        let current_shared = self.analyzed_shared.clone();\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {\n            sender.send(Task::FetchWorkspace(ProjectWorkspaceProgress::Begin)).unwrap();\n            let response = match shared_context {\n                Ok((key, config)) => provider\n                    .resolve(key, config)\n                    .and_then(|session| {\n                        let analyzed_shared = session.runtime();\n                        let workspaces = session.workspaces()?;\n                        Ok(FetchWorkspaceResponse {\n                            workspaces: workspaces.into_iter().map(Ok).collect(),\n                            force_crate_graph_reload,\n                            analyzed_shared,\n                        })\n                    })\n                    .unwrap_or_else(|error| FetchWorkspaceResponse {\n                        workspaces: vec![Err(error)],\n                        force_crate_graph_reload,\n                        analyzed_shared: current_shared.clone(),\n                    }),\n                Err(error) => FetchWorkspaceResponse {\n                    workspaces: vec![Err(error)],\n                    force_crate_graph_reload,\n                    analyzed_shared: current_shared.clone(),\n                },\n            };\n            sender.send(Task::AnalyzedFetchWorkspace(response)).unwrap();\n        });\n        return;\n\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, {\n",
     )?;
     let fallback_start = source
         .find("        return;\n\n        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, {\n")
@@ -1704,19 +1704,18 @@ impl SharedAnalyzerSession {
         }
     }
 
-    pub fn snapshot(&self) -> anyhow::Result<SharedAnalyzerSnapshot> {
+    pub fn workspaces(&self) -> anyhow::Result<Vec<ProjectWorkspace>> {
         let world = self
             .world
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
 
-        world.snapshot(&self.view, self.runtime.clone())
+        Ok(world.workspaces(&self.view))
     }
-}
 
-pub struct SharedAnalyzerSnapshot {
-    pub(crate) workspaces: Vec<ProjectWorkspace>,
-    pub(crate) runtime: SharedAnalyzerRuntime,
+    pub fn runtime(&self) -> SharedAnalyzerRuntime {
+        self.runtime.clone()
+    }
 }
 
 #[derive(Clone)]
@@ -2615,24 +2614,11 @@ impl SharedWorld {
         self.loaded_workspaces.get(index).map(LoadedWorkspace::summary)
     }
 
-    pub fn snapshot(
-        &self,
-        view: &WorkspaceView,
-        runtime: SharedAnalyzerRuntime,
-    ) -> anyhow::Result<SharedAnalyzerSnapshot> {
-        let mut workspaces = Vec::new();
-
-        for index in view.workspace_indexes() {
-            let Some(workspace) = self.loaded_workspaces.get(index) else {
-                continue;
-            };
-            workspaces.push(workspace.workspace.clone());
-        }
-
-        Ok(SharedAnalyzerSnapshot {
-            workspaces,
-            runtime,
-        })
+    pub fn workspaces(&self, view: &WorkspaceView) -> Vec<ProjectWorkspace> {
+        view.workspace_indexes()
+            .filter_map(|index| self.loaded_workspaces.get(index))
+            .map(|workspace| workspace.workspace.clone())
+            .collect()
     }
 
     fn workspace_summaries(&self, view: &WorkspaceView) -> Vec<WorkspaceSummary> {
@@ -3362,7 +3348,7 @@ pub(crate) mod analyzed_session {
     use vfs::{AbsPathBuf, ChangeKind, VfsPath};
 
     use crate::{
-        analyzed_bridge::{SharedAnalyzerProvider, SharedAnalyzerSnapshot, patch_path_prefix},
+        analyzed_bridge::{SharedAnalyzerProvider, SharedAnalyzerRuntime, patch_path_prefix},
         config::{Config, ConfigChange, ConfigErrors},
         from_json, server_capabilities, version,
         global_state::FetchWorkspaceRequest,
@@ -3378,10 +3364,17 @@ pub(crate) mod analyzed_session {
             sender: Sender<Message>,
             config: crate::config::Config,
             provider: SharedAnalyzerProvider,
-            snapshot: SharedAnalyzerSnapshot,
+            analyzed_shared: SharedAnalyzerRuntime,
+            analyzed_workspaces: Vec<project_model::ProjectWorkspace>,
         ) -> Self {
             Self {
-                state: crate::global_state::GlobalState::new(sender, config, provider, snapshot),
+                state: crate::global_state::GlobalState::new(
+                    sender,
+                    config,
+                    provider,
+                    analyzed_shared,
+                    analyzed_workspaces,
+                ),
             }
         }
 
@@ -3426,9 +3419,12 @@ pub(crate) mod analyzed_session {
         initialize_rayon();
         let (key, shared_config) =
             crate::analyzed_bridge::shared_analyzer_context_from_config(&config)?;
-        let snapshot = provider.resolve(key, shared_config)?.snapshot()?;
+        let session = provider.resolve(key, shared_config)?;
+        let analyzed_shared = session.runtime();
+        let analyzed_workspaces = session.workspaces()?;
         let Connection { sender, receiver } = connection;
-        RustAnalyzerSession::new(sender, config, provider, snapshot).run_shared(receiver)
+        RustAnalyzerSession::new(sender, config, provider, analyzed_shared, analyzed_workspaces)
+            .run_shared(receiver)
     }
 
     fn run_shared_state(
