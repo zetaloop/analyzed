@@ -884,7 +884,13 @@ fn patch_test_tool_attributes(src_dir: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn patch_slow_tests(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
-    for name in ["main.rs", "ratoml.rs", "support.rs"] {
+    for name in [
+        "main.rs",
+        "ratoml.rs",
+        "support.rs",
+        "cli.rs",
+        "flycheck.rs",
+    ] {
         patch_slow_tests_imports(&slow_tests.join(name))?;
     }
     patch_slow_tests_support(&slow_tests.join("support.rs"))?;
@@ -896,7 +902,11 @@ fn patch_slow_tests_imports(path: &Path) -> Result<(), Box<dyn Error>> {
     let source = source
         .replace("use rust_analyzer::", "use ra_ap_rust_analyzer::")
         .replace(" rust_analyzer::", " ra_ap_rust_analyzer::")
-        .replace("<rust_analyzer::", "<ra_ap_rust_analyzer::");
+        .replace("<rust_analyzer::", "<ra_ap_rust_analyzer::")
+        .replace(
+            "use test_utils::skip_slow_tests;\n",
+            "fn skip_slow_tests() -> bool {\n    (std::env::var(\"CI\").is_err() && std::env::var(\"RUN_SLOW_TESTS\").is_err())\n        || std::env::var(\"SKIP_SLOW_TESTS\").is_ok()\n}\n",
+        );
     fs::write(path, source)?;
     Ok(())
 }
