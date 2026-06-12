@@ -1,7 +1,7 @@
 use std::{
     env,
     io::{self, BufReader},
-    os::unix::net::UnixStream,
+    path::PathBuf,
     process::{self, Child, Command, Stdio},
     sync::{
         Arc,
@@ -13,9 +13,10 @@ use std::{
 
 use analyzed_ipc::{
     AnalysisConfigKey, BackendKey, BackendSnapshot, CargoConfigKey, ClientInfo, DaemonRequest,
-    DaemonResponse, DaemonSnapshot, Hello, LspSession, ProcMacroServerKey, ProtocolError,
-    RuntimePaths, SharedWorldConfigKey, SharedWorldKey, SharedWorldLoadKey, StartupLock, Stop,
-    WorkspaceSnapshot, WorkspaceViewKey, bind_listener, read_json_line, write_json_line,
+    DaemonResponse, DaemonSnapshot, Hello, IpcStream, LspSession, ProcMacroServerKey,
+    ProtocolError, RuntimePaths, SharedWorldConfigKey, SharedWorldKey, SharedWorldLoadKey,
+    StartupLock, Stop, WorkspaceSnapshot, WorkspaceViewKey, accept_client, bind_listener,
+    read_json_line, write_json_line,
 };
 use crossbeam_channel::unbounded;
 use lsp_server::{Connection, Message};
@@ -79,7 +80,7 @@ pub fn stop(paths: RuntimePaths) -> analyzed_ipc::Result<Stop> {
     analyzed_ipc::request_stop(&paths)
 }
 
-pub fn connect_lsp_session(paths: RuntimePaths) -> anyhow::Result<UnixStream> {
+pub fn connect_lsp_session(paths: RuntimePaths) -> anyhow::Result<IpcStream> {
     ensure_daemon(paths.clone())?;
     Ok(analyzed_ipc::connect_lsp_session(&paths)?)
 }
@@ -100,7 +101,7 @@ pub fn ensure_daemon(paths: RuntimePaths) -> anyhow::Result<Hello> {
         .arg("daemon")
         .arg("--foreground")
         .arg("--startup-lock-owned")
-        .current_dir("/")
+        .current_dir(daemon_working_directory()?)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -134,6 +135,19 @@ pub fn ensure_daemon(paths: RuntimePaths) -> anyhow::Result<Hello> {
     }
 }
 
+#[cfg(unix)]
+fn daemon_working_directory() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from("/"))
+}
+
+#[cfg(windows)]
+fn daemon_working_directory() -> anyhow::Result<PathBuf> {
+    env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("SystemRoot is not set"))
+}
+
+#[cfg(unix)]
 fn spawn_daemon_command(mut command: Command) -> io::Result<Child> {
     use std::os::unix::process::CommandExt;
 
@@ -154,9 +168,59 @@ fn spawn_daemon_command(mut command: Command) -> io::Result<Child> {
     command.spawn()
 }
 
+#[cfg(windows)]
+fn spawn_daemon_command(mut command: Command) -> io::Result<Child> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | breakaway_flag());
+    command.spawn()
+}
+
+// Editors commonly place LSP servers in a kill-on-close job object. The
+// daemon outlives any single editor, so it must break away when the job
+// permits it. Whether breakaway is possible is decided by querying the job
+// up front; silent breakaway needs no flag, and a job that forbids breakaway
+// would reject the flag at spawn time.
+#[cfg(windows)]
+fn breakaway_flag() -> u32 {
+    use std::ptr;
+
+    use windows_sys::Win32::System::{
+        JobObjects::{
+            IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        },
+        Threading::{CREATE_BREAKAWAY_FROM_JOB, GetCurrentProcess},
+    };
+
+    unsafe {
+        let mut in_job = 0;
+        if IsProcessInJob(GetCurrentProcess(), ptr::null_mut(), &mut in_job) == 0 || in_job == 0 {
+            return 0;
+        }
+
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let queried = QueryInformationJobObject(
+            ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            (&raw mut info).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ptr::null_mut(),
+        );
+        if queried != 0
+            && info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK != 0
+        {
+            CREATE_BREAKAWAY_FROM_JOB
+        } else {
+            0
+        }
+    }
+}
+
 pub fn run_foreground(paths: RuntimePaths, startup_lock_owned: bool) -> anyhow::Result<()> {
     let state = ServiceState::load();
-    let listener = {
+    let mut listener = {
         let _lock = (!startup_lock_owned)
             .then(|| StartupLock::acquire(&paths))
             .transpose()?;
@@ -167,7 +231,7 @@ pub fn run_foreground(paths: RuntimePaths, startup_lock_owned: bool) -> anyhow::
     };
 
     loop {
-        let (stream, _) = listener.accept()?;
+        let stream = accept_client(&mut listener)?;
         let state = Arc::clone(&state);
         thread::spawn(move || {
             state.client_sessions.fetch_add(1, Ordering::SeqCst);
@@ -226,7 +290,7 @@ impl ServiceState {
 }
 
 fn handle_client(
-    mut stream: UnixStream,
+    mut stream: IpcStream,
     state: Arc<ServiceState>,
     session_id: usize,
 ) -> analyzed_ipc::Result<()> {
@@ -287,7 +351,7 @@ impl LspStreamThreads {
 }
 
 fn handle_lsp_session(
-    stream: UnixStream,
+    stream: IpcStream,
     _state: Arc<ServiceState>,
     _session_id: usize,
 ) -> anyhow::Result<()> {
@@ -306,7 +370,7 @@ fn handle_lsp_session(
     }
 }
 
-fn lsp_stream_connection(stream: UnixStream) -> anyhow::Result<(Connection, LspStreamThreads)> {
+fn lsp_stream_connection(stream: IpcStream) -> anyhow::Result<(Connection, LspStreamThreads)> {
     let reader_stream = stream.try_clone()?;
     let mut reader = BufReader::new(reader_stream);
     let initialize = Message::read(&mut reader)?.ok_or_else(|| {

@@ -1,19 +1,102 @@
 use std::{
     env,
-    fs::{self, File},
+    fs::File,
     io::{BufRead, BufReader, Write},
-    os::unix::fs::{FileTypeExt, PermissionsExt},
-    os::unix::net::{UnixListener, UnixStream},
-    path::{Path, PathBuf},
+    path::PathBuf,
+};
+
+#[cfg(unix)]
+use std::{
+    fs,
+    os::unix::{
+        fs::{FileTypeExt, PermissionsExt},
+        net::{UnixListener, UnixStream},
+    },
+    path::Path,
+};
+
+#[cfg(windows)]
+use std::{
+    ffi::OsStr,
+    io::Read,
+    os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    },
+    ptr,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{
+        ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE, WAIT_ABANDONED,
+        WAIT_OBJECT_0,
+    },
+    Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    },
+    System::{
+        Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
+        },
+        Threading::{CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject},
+    },
+};
+
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const RUST_ANALYZER_VERSION: &str = "0.0.334";
 
 pub type Result<T> = std::result::Result<T, IpcError>;
+
+#[cfg(unix)]
+pub type IpcListener = UnixListener;
+
+#[cfg(unix)]
+pub type IpcStream = UnixStream;
+
+#[cfg(windows)]
+pub struct IpcListener {
+    pipe_name: String,
+    pending: File,
+}
+
+#[cfg(windows)]
+pub struct IpcStream {
+    file: File,
+}
+
+#[cfg(windows)]
+impl IpcStream {
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Read for IpcStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buffer)
+    }
+}
+
+#[cfg(windows)]
+impl Write for IpcStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum IpcError {
@@ -23,18 +106,27 @@ pub enum IpcError {
     Json(#[from] serde_json::Error),
     #[error("socket path is occupied by a non-socket file: {0}")]
     OccupiedSocketPath(PathBuf),
-    #[error("{0} is not set, runtime directory is unavailable")]
-    RuntimeDirUnavailable(&'static str),
+    #[error("{0} is not set")]
+    MissingEnvironment(&'static str),
     #[error("{0}")]
     Protocol(String),
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug, Serialize)]
 pub struct RuntimePaths {
     pub runtime_dir: PathBuf,
     pub socket_path: PathBuf,
 }
 
+#[cfg(windows)]
+#[derive(Clone, Debug, Serialize)]
+pub struct RuntimePaths {
+    pub pipe_name: String,
+    pub startup_mutex_name: String,
+}
+
+#[cfg(unix)]
 impl RuntimePaths {
     pub fn discover() -> Result<Self> {
         let runtime_dir = runtime_root()?.join("analyzed");
@@ -49,6 +141,19 @@ impl RuntimePaths {
         fs::create_dir_all(&self.runtime_dir)?;
         fs::set_permissions(&self.runtime_dir, fs::Permissions::from_mode(0o700))?;
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl RuntimePaths {
+    pub fn discover() -> Result<Self> {
+        let username =
+            env::var("USERNAME").map_err(|_| IpcError::MissingEnvironment("USERNAME"))?;
+
+        Ok(Self {
+            pipe_name: format!(r"\\.\pipe\analyzed.{username}"),
+            startup_mutex_name: format!(r"Global\analyzed.{username}.startup"),
+        })
     }
 }
 
@@ -252,10 +357,12 @@ pub enum DaemonResponse {
     Error(ProtocolError),
 }
 
+#[cfg(unix)]
 pub struct StartupLock {
     _file: File,
 }
 
+#[cfg(unix)]
 impl StartupLock {
     pub fn acquire(paths: &RuntimePaths) -> Result<Self> {
         paths.ensure_runtime_dir()?;
@@ -263,6 +370,35 @@ impl StartupLock {
         file.lock()?;
 
         Ok(Self { _file: file })
+    }
+}
+
+#[cfg(windows)]
+pub struct StartupLock {
+    mutex: OwnedHandle,
+}
+
+#[cfg(windows)]
+impl StartupLock {
+    pub fn acquire(paths: &RuntimePaths) -> Result<Self> {
+        let name = wide_null(&paths.startup_mutex_name);
+        let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        let mutex = unsafe { OwnedHandle::from_raw_handle(handle) };
+        match unsafe { WaitForSingleObject(mutex.as_raw_handle(), INFINITE) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self { mutex }),
+            _ => Err(std::io::Error::last_os_error().into()),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StartupLock {
+    fn drop(&mut self) {
+        unsafe { ReleaseMutex(self.mutex.as_raw_handle()) };
     }
 }
 
@@ -286,8 +422,8 @@ pub fn request_stop(paths: &RuntimePaths) -> Result<Stop> {
     }
 }
 
-pub fn connect_lsp_session(paths: &RuntimePaths) -> Result<UnixStream> {
-    let mut stream = UnixStream::connect(&paths.socket_path)?;
+pub fn connect_lsp_session(paths: &RuntimePaths) -> Result<IpcStream> {
+    let mut stream = connect_stream(paths)?;
     write_json_line(&mut stream, &DaemonRequest::lsp())?;
 
     match read_json_line(&mut stream)? {
@@ -304,19 +440,39 @@ pub fn connect_lsp_session(paths: &RuntimePaths) -> Result<UnixStream> {
 }
 
 pub fn request(paths: &RuntimePaths, request: &DaemonRequest) -> Result<DaemonResponse> {
-    let mut stream = UnixStream::connect(&paths.socket_path)?;
+    let mut stream = connect_stream(paths)?;
     write_json_line(&mut stream, request)?;
     read_json_line(&mut stream)
 }
 
-pub fn bind_listener(paths: &RuntimePaths) -> Result<UnixListener> {
+#[cfg(unix)]
+pub fn bind_listener(paths: &RuntimePaths) -> Result<IpcListener> {
     paths.ensure_runtime_dir()?;
     remove_stale_socket(&paths.socket_path)?;
 
     Ok(UnixListener::bind(&paths.socket_path)?)
 }
 
-pub fn read_json_line<T>(stream: &mut UnixStream) -> Result<T>
+#[cfg(windows)]
+pub fn bind_listener(paths: &RuntimePaths) -> Result<IpcListener> {
+    Ok(IpcListener {
+        pending: create_pipe(&paths.pipe_name, true)?,
+        pipe_name: paths.pipe_name.clone(),
+    })
+}
+
+#[cfg(unix)]
+pub fn accept_client(listener: &mut IpcListener) -> Result<IpcStream> {
+    let (stream, _) = listener.accept()?;
+    Ok(stream)
+}
+
+#[cfg(windows)]
+pub fn accept_client(listener: &mut IpcListener) -> Result<IpcStream> {
+    listener.accept()
+}
+
+pub fn read_json_line<T>(stream: &mut IpcStream) -> Result<T>
 where
     T: DeserializeOwned,
 {
@@ -327,7 +483,7 @@ where
     Ok(serde_json::from_str(&line)?)
 }
 
-pub fn write_json_line<T>(stream: &mut UnixStream, value: &T) -> Result<()>
+pub fn write_json_line<T>(stream: &mut IpcStream, value: &T) -> Result<()>
 where
     T: Serialize,
 {
@@ -338,6 +494,17 @@ where
     Ok(())
 }
 
+#[cfg(unix)]
+fn connect_stream(paths: &RuntimePaths) -> Result<IpcStream> {
+    Ok(UnixStream::connect(&paths.socket_path)?)
+}
+
+#[cfg(windows)]
+fn connect_stream(paths: &RuntimePaths) -> Result<IpcStream> {
+    connect_pipe(&paths.pipe_name)
+}
+
+#[cfg(unix)]
 fn remove_stale_socket(path: &Path) -> Result<()> {
     if path.try_exists()? {
         let file_type = fs::symlink_metadata(path)?.file_type();
@@ -356,14 +523,127 @@ fn runtime_root() -> Result<PathBuf> {
     runtime_env("TMPDIR")
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn runtime_root() -> Result<PathBuf> {
     runtime_env("XDG_RUNTIME_DIR")
 }
 
+#[cfg(unix)]
 fn runtime_env(name: &'static str) -> Result<PathBuf> {
     env::var_os(name)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .ok_or(IpcError::RuntimeDirUnavailable(name))
+        .ok_or(IpcError::MissingEnvironment(name))
+}
+
+#[cfg(windows)]
+impl IpcListener {
+    fn accept(&mut self) -> Result<IpcStream> {
+        loop {
+            match connect_pending_pipe(&self.pending) {
+                Ok(()) => {
+                    let next = create_pipe(&self.pipe_name, false)?;
+                    return Ok(IpcStream {
+                        file: std::mem::replace(&mut self.pending, next),
+                    });
+                }
+                // The client connected and vanished before we picked the
+                // instance up. Stand up a replacement first so the pipe name
+                // never disappears, then retire the dead instance.
+                Err(IpcError::Io(error)) if error.raw_os_error() == Some(ERROR_NO_DATA as i32) => {
+                    let next = create_pipe(&self.pipe_name, false)?;
+                    self.pending = next;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_pipe(pipe_name: &str, first_instance: bool) -> Result<File> {
+    let pipe_name = wide_null(pipe_name);
+    let first_instance = if first_instance {
+        FILE_FLAG_FIRST_PIPE_INSTANCE
+    } else {
+        0
+    };
+    let handle = unsafe {
+        CreateNamedPipeW(
+            pipe_name.as_ptr(),
+            PIPE_ACCESS_DUPLEX | first_instance,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_UNLIMITED_INSTANCES,
+            65_536,
+            65_536,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(windows)]
+fn connect_pending_pipe(file: &File) -> Result<()> {
+    let connected = unsafe { ConnectNamedPipe(file.as_raw_handle(), ptr::null_mut()) };
+    if connected == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
+            return Err(error.into());
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn connect_pipe(pipe_name: &str) -> Result<IpcStream> {
+    let wide_name = wide_null(pipe_name);
+    let deadline = Instant::now() + Duration::from_secs(1);
+
+    loop {
+        let handle = unsafe {
+            CreateFileW(
+                wide_name.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                0,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            return Ok(IpcStream {
+                file: unsafe { File::from_raw_handle(handle) },
+            });
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) {
+            return Err(error.into());
+        }
+
+        // Every instance is momentarily taken; wait for the daemon to stand
+        // up the next one. This is the documented client side of the named
+        // pipe connect handshake.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(error.into());
+        }
+
+        unsafe { WaitNamedPipeW(wide_name.as_ptr(), remaining.as_millis().max(1) as u32) };
+    }
+}
+
+#[cfg(windows)]
+fn wide_null(value: &str) -> Vec<u16> {
+    OsStr::new(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }

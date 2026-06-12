@@ -64,6 +64,7 @@ fn cargo_home() -> Result<PathBuf, Box<dyn Error>> {
     env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".cargo")))
         .ok_or_else(|| "CARGO_HOME is unavailable".into())
 }
 
