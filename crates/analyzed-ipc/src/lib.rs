@@ -1,14 +1,12 @@
 use std::{
     env,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{BufRead, BufReader, Write},
     os::unix::fs::{FileTypeExt, PermissionsExt},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
 };
 
-use directories::ProjectDirs;
-use fs4::FileExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
@@ -25,8 +23,8 @@ pub enum IpcError {
     Json(#[from] serde_json::Error),
     #[error("socket path is occupied by a non-socket file: {0}")]
     OccupiedSocketPath(PathBuf),
-    #[error("runtime directory is unavailable")]
-    RuntimeDirUnavailable,
+    #[error("{0} is not set, runtime directory is unavailable")]
+    RuntimeDirUnavailable(&'static str),
     #[error("{0}")]
     Protocol(String),
 }
@@ -35,21 +33,14 @@ pub enum IpcError {
 pub struct RuntimePaths {
     pub runtime_dir: PathBuf,
     pub socket_path: PathBuf,
-    pub lock_path: PathBuf,
-    pub state_path: PathBuf,
 }
 
 impl RuntimePaths {
     pub fn discover() -> Result<Self> {
-        let runtime_dir = runtime_dir()?.join("analyzed");
-        let state_dir = ProjectDirs::from("dev", "zetaloop", "analyzed")
-            .map(|dirs| dirs.data_local_dir().to_path_buf())
-            .ok_or(IpcError::RuntimeDirUnavailable)?;
+        let runtime_dir = runtime_root()?.join("analyzed");
 
         Ok(Self {
             socket_path: runtime_dir.join("daemon.sock"),
-            lock_path: runtime_dir.join("daemon.lock"),
-            state_path: state_dir.join("daemon.json"),
             runtime_dir,
         })
     }
@@ -57,15 +48,6 @@ impl RuntimePaths {
     pub fn ensure_runtime_dir(&self) -> Result<()> {
         fs::create_dir_all(&self.runtime_dir)?;
         fs::set_permissions(&self.runtime_dir, fs::Permissions::from_mode(0o700))?;
-        Ok(())
-    }
-
-    pub fn ensure_state_dir(&self) -> Result<()> {
-        if let Some(parent) = self.state_path.parent() {
-            fs::create_dir_all(parent)?;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-        }
-
         Ok(())
     }
 }
@@ -277,13 +259,8 @@ pub struct StartupLock {
 impl StartupLock {
     pub fn acquire(paths: &RuntimePaths) -> Result<Self> {
         paths.ensure_runtime_dir()?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&paths.lock_path)?;
-        FileExt::lock(&file)?;
+        let file = File::open(&paths.runtime_dir)?;
+        file.lock()?;
 
         Ok(Self { _file: file })
     }
@@ -374,25 +351,19 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn runtime_dir() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-        return Ok(path);
-    }
+#[cfg(target_os = "macos")]
+fn runtime_root() -> Result<PathBuf> {
+    runtime_env("TMPDIR")
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        return Ok(env::temp_dir());
-    }
+#[cfg(not(target_os = "macos"))]
+fn runtime_root() -> Result<PathBuf> {
+    runtime_env("XDG_RUNTIME_DIR")
+}
 
-    #[cfg(target_os = "linux")]
-    {
-        return ProjectDirs::from("dev", "zetaloop", "analyzed")
-            .map(|dirs| dirs.cache_dir().join("run"))
-            .ok_or(IpcError::RuntimeDirUnavailable);
-    }
-
-    #[allow(unreachable_code)]
-    ProjectDirs::from("dev", "zetaloop", "analyzed")
-        .map(|dirs| dirs.cache_dir().join("run"))
-        .ok_or(IpcError::RuntimeDirUnavailable)
+fn runtime_env(name: &'static str) -> Result<PathBuf> {
+    env::var_os(name)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or(IpcError::RuntimeDirUnavailable(name))
 }

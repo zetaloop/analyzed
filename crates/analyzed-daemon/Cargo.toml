@@ -10,7 +10,6 @@ analyzed-ipc.workspace = true
 ra_ap_rust-analyzer.workspace = true
 anyhow.workspace = true
 crossbeam-channel.workspace = true
-daemonize.workspace = true
 lsp-server.workspace = true
 lsp-types.workspace = true
 serde.workspace = true

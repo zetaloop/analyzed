@@ -1,26 +1,23 @@
 use std::{
-    env, fs,
-    io::{BufReader, ErrorKind},
+    env,
+    io::{self, BufReader},
     os::unix::net::UnixStream,
-    path::Path,
-    process::{Command, Stdio},
+    process::{self, Child, Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use analyzed_ipc::{
     AnalysisConfigKey, BackendKey, BackendSnapshot, CargoConfigKey, ClientInfo, DaemonRequest,
     DaemonResponse, DaemonSnapshot, Hello, LspSession, ProcMacroServerKey, ProtocolError,
-    RUST_ANALYZER_VERSION, RuntimePaths, SharedWorldConfigKey, SharedWorldKey, SharedWorldLoadKey,
-    StartupLock, Stop, WorkspaceSnapshot, WorkspaceViewKey, bind_listener, read_json_line,
-    write_json_line,
+    RuntimePaths, SharedWorldConfigKey, SharedWorldKey, SharedWorldLoadKey, StartupLock, Stop,
+    WorkspaceSnapshot, WorkspaceViewKey, bind_listener, read_json_line, write_json_line,
 };
 use crossbeam_channel::unbounded;
-use daemonize::Daemonize;
 use lsp_server::{Connection, Message};
 use ra_ap_rust_analyzer::{SharedAnalyzerProvider, shared_analyzer_registry};
 use serde::Serialize;
@@ -82,18 +79,12 @@ pub fn stop(paths: RuntimePaths) -> analyzed_ipc::Result<Stop> {
     analyzed_ipc::request_stop(&paths)
 }
 
-pub fn connect_lsp_session(
-    paths: RuntimePaths,
-    workspace_root: impl AsRef<Path>,
-) -> anyhow::Result<UnixStream> {
-    ensure_daemon(paths.clone(), workspace_root)?;
+pub fn connect_lsp_session(paths: RuntimePaths) -> anyhow::Result<UnixStream> {
+    ensure_daemon(paths.clone())?;
     Ok(analyzed_ipc::connect_lsp_session(&paths)?)
 }
 
-pub fn ensure_daemon(
-    paths: RuntimePaths,
-    workspace_root: impl AsRef<Path>,
-) -> anyhow::Result<Hello> {
+pub fn ensure_daemon(paths: RuntimePaths) -> anyhow::Result<Hello> {
     if let Ok(hello) = analyzed_ipc::connect_hello(&paths) {
         return Ok(hello);
     }
@@ -108,18 +99,18 @@ pub fn ensure_daemon(
     command
         .arg("daemon")
         .arg("--foreground")
-        .arg("--workspace")
-        .arg(workspace_root.as_ref())
         .arg("--startup-lock-owned")
-        .arg("--daemonize")
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    let mut child = command.spawn()?;
+    let mut child = spawn_daemon_command(command)?;
     let mut child_exited = false;
+    let start = Instant::now();
+    let mut delay = Duration::from_millis(10);
 
-    for _ in 0..50 {
+    while start.elapsed() < Duration::from_secs(5) {
         if let Ok(hello) = analyzed_ipc::connect_hello(&paths) {
             return Ok(hello);
         }
@@ -132,89 +123,62 @@ pub fn ensure_daemon(
             child_exited = true;
         }
 
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(delay);
+        delay = delay.saturating_mul(2).min(Duration::from_millis(100));
     }
 
-    anyhow::bail!("daemon did not accept connections before the startup timeout")
+    if child_exited {
+        anyhow::bail!("daemon exited before accepting connections")
+    } else {
+        anyhow::bail!("daemon did not accept connections before the startup timeout")
+    }
 }
 
-pub fn run_foreground(
-    paths: RuntimePaths,
-    workspace_root: impl AsRef<Path>,
-    startup_lock_owned: bool,
-    daemonize: bool,
-) -> anyhow::Result<()> {
-    let _workspace_root = workspace_root;
+fn spawn_daemon_command(mut command: Command) -> io::Result<Child> {
+    use std::os::unix::process::CommandExt;
 
-    if daemonize {
-        Daemonize::new()
-            .working_directory(env::current_dir()?)
-            .start()?;
+    unsafe extern "C" {
+        fn setsid() -> i32;
     }
 
-    let runtime = DaemonRuntime::load();
-    let state = Arc::clone(&runtime.state);
+    unsafe {
+        command.pre_exec(|| {
+            if setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+
+            Ok(())
+        });
+    }
+
+    command.spawn()
+}
+
+pub fn run_foreground(paths: RuntimePaths, startup_lock_owned: bool) -> anyhow::Result<()> {
+    let state = ServiceState::load();
     let listener = {
         let _lock = (!startup_lock_owned)
             .then(|| StartupLock::acquire(&paths))
             .transpose()?;
-        paths.ensure_state_dir()?;
-        let listener = bind_listener(&paths)?;
-        write_state_file(&paths, &state.discovery(&paths))?;
-        listener
+        if !startup_lock_owned && let Ok(hello) = analyzed_ipc::connect_hello(&paths) {
+            anyhow::bail!("daemon is already running with pid {}", hello.pid);
+        }
+        bind_listener(&paths)?
     };
-    listener.set_nonblocking(true)?;
 
-    let mut sessions = Vec::new();
+    loop {
+        let (stream, _) = listener.accept()?;
+        let state = Arc::clone(&state);
+        thread::spawn(move || {
+            state.client_sessions.fetch_add(1, Ordering::SeqCst);
+            let session_id = state.next_session_id.fetch_add(1, Ordering::SeqCst);
+            let result = handle_client(stream, state.clone(), session_id);
+            state.client_sessions.fetch_sub(1, Ordering::SeqCst);
 
-    while !state.stopping.load(Ordering::SeqCst) {
-        reap_finished_sessions(&mut sessions);
-
-        match listener.accept() {
-            Ok((stream, _)) => {
-                stream.set_nonblocking(false)?;
-                let state = Arc::clone(&state);
-                sessions.push(thread::spawn(move || {
-                    state.client_sessions.fetch_add(1, Ordering::SeqCst);
-                    let session_id = state.next_session_id.fetch_add(1, Ordering::SeqCst);
-                    let result = handle_client(stream, state.clone(), session_id);
-                    state.client_sessions.fetch_sub(1, Ordering::SeqCst);
-
-                    if let Err(error) = result {
-                        eprintln!("{error}");
-                    }
-                }));
+            if let Err(error) = result {
+                eprintln!("{error}");
             }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-
-    join_client_sessions(sessions);
-    drop(runtime);
-
-    Ok(())
-}
-
-struct DaemonRuntime {
-    state: Arc<ServiceState>,
-}
-
-impl DaemonRuntime {
-    fn load() -> Self {
-        Self {
-            state: Arc::new(ServiceState {
-                pid: std::process::id(),
-                started_at_unix_seconds: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |duration| duration.as_secs()),
-                client_sessions: AtomicUsize::new(0),
-                next_session_id: AtomicUsize::new(1),
-                stopping: AtomicBool::new(false),
-            }),
-        }
+        });
     }
 }
 
@@ -223,10 +187,20 @@ struct ServiceState {
     started_at_unix_seconds: u64,
     client_sessions: AtomicUsize,
     next_session_id: AtomicUsize,
-    stopping: AtomicBool,
 }
 
 impl ServiceState {
+    fn load() -> Arc<Self> {
+        Arc::new(Self {
+            pid: process::id(),
+            started_at_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs()),
+            client_sessions: AtomicUsize::new(0),
+            next_session_id: AtomicUsize::new(1),
+        })
+    }
+
     fn snapshot(&self) -> DaemonSnapshot {
         let registry = shared_analyzer_registry();
         let backend_sessions = registry
@@ -247,17 +221,6 @@ impl ServiceState {
             backend_sessions,
             workspaces: workspace_loads.len(),
             workspace_loads,
-        }
-    }
-
-    fn discovery(&self, paths: &RuntimePaths) -> DaemonDiscovery {
-        DaemonDiscovery {
-            pid: self.pid,
-            started_at_unix_seconds: self.started_at_unix_seconds,
-            protocol_version: analyzed_ipc::PROTOCOL_VERSION,
-            daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
-            rust_analyzer_version: RUST_ANALYZER_VERSION.to_owned(),
-            socket_path: paths.socket_path.to_string_lossy().into_owned(),
         }
     }
 }
@@ -293,7 +256,6 @@ fn handle_client(
             })?;
         }
         DaemonRequest::Stop(_) => {
-            state.stopping.store(true, Ordering::SeqCst);
             write_json_line(
                 &mut stream,
                 &DaemonResponse::Stop(Stop {
@@ -301,6 +263,7 @@ fn handle_client(
                     pid: state.pid,
                 }),
             )?;
+            process::exit(0);
         }
     }
 
@@ -495,38 +458,4 @@ fn validate_client(client: &ClientInfo) -> Option<ProtocolError> {
             analyzed_ipc::PROTOCOL_VERSION
         ),
     })
-}
-
-fn reap_finished_sessions(sessions: &mut Vec<JoinHandle<()>>) {
-    let mut index = 0;
-
-    while index < sessions.len() {
-        if sessions[index].is_finished() {
-            let session = sessions.swap_remove(index);
-            let _ = session.join();
-        } else {
-            index += 1;
-        }
-    }
-}
-
-fn join_client_sessions(sessions: Vec<JoinHandle<()>>) {
-    for session in sessions {
-        let _ = session.join();
-    }
-}
-
-#[derive(Serialize)]
-struct DaemonDiscovery {
-    pid: u32,
-    started_at_unix_seconds: u64,
-    protocol_version: u32,
-    daemon_version: String,
-    rust_analyzer_version: String,
-    socket_path: String,
-}
-
-fn write_state_file(paths: &RuntimePaths, discovery: &DaemonDiscovery) -> anyhow::Result<()> {
-    fs::write(&paths.state_path, serde_json::to_vec_pretty(discovery)?)?;
-    Ok(())
 }

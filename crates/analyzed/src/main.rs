@@ -1,6 +1,5 @@
 use std::{
     io::{self, Read, Write},
-    path::PathBuf,
     process, thread,
 };
 
@@ -19,12 +18,8 @@ enum Command {
     Daemon {
         #[arg(long)]
         foreground: bool,
-        #[arg(long, default_value = ".")]
-        workspace: PathBuf,
         #[arg(long, hide = true)]
         startup_lock_owned: bool,
-        #[arg(long, hide = true)]
-        daemonize: bool,
     },
     Status,
     Stop,
@@ -37,11 +32,9 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Status) => print_status()?,
         Some(Command::Daemon {
             foreground,
-            workspace,
             startup_lock_owned,
-            daemonize,
         }) => {
-            run_daemon(foreground, workspace, startup_lock_owned, daemonize)?;
+            run_daemon(foreground, startup_lock_owned)?;
         }
         Some(Command::Stop) => {
             println!(
@@ -57,7 +50,7 @@ fn main() -> anyhow::Result<()> {
 
 fn run_stdio() -> anyhow::Result<()> {
     let paths = RuntimePaths::discover()?;
-    let mut daemon_reader = analyzed_daemon::connect_lsp_session(paths, PathBuf::from("."))?;
+    let mut daemon_reader = analyzed_daemon::connect_lsp_session(paths)?;
     let mut daemon_writer = daemon_reader.try_clone()?;
     thread::spawn(move || {
         let stdin = io::stdin();
@@ -91,20 +84,15 @@ fn print_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_daemon(
-    foreground: bool,
-    workspace: PathBuf,
-    startup_lock_owned: bool,
-    daemonize: bool,
-) -> anyhow::Result<()> {
+fn run_daemon(foreground: bool, startup_lock_owned: bool) -> anyhow::Result<()> {
     let paths = RuntimePaths::discover()?;
 
     if foreground {
-        analyzed_daemon::run_foreground(paths, workspace, startup_lock_owned, daemonize)?;
+        analyzed_daemon::run_foreground(paths, startup_lock_owned)?;
     } else {
         println!(
             "{}",
-            serde_json::to_string_pretty(&analyzed_daemon::ensure_daemon(paths, workspace)?)?
+            serde_json::to_string_pretty(&analyzed_daemon::ensure_daemon(paths)?)?
         );
     }
 
