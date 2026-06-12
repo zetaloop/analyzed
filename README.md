@@ -1,4 +1,4 @@
-# analyzed
+# <img height="80" alt="analyzed logo" src="./analyzed.svg" />
 
 A shared rust-analyzer daemon.
 
