@@ -304,7 +304,10 @@ fn handle_client(
         DaemonRequest::Hello(_) => {
             write_json_line(
                 &mut stream,
-                &DaemonResponse::Hello(Hello::with_state(state.snapshot())),
+                &DaemonResponse::Hello(Hello::with_state(
+                    state.snapshot(),
+                    ra_ap_rust_analyzer::RUST_ANALYZER_VERSION.to_owned(),
+                )),
             )?;
         }
         DaemonRequest::Lsp(_) => {

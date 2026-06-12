@@ -50,7 +50,6 @@ use windows_sys::Win32::{
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const RUST_ANALYZER_VERSION: &str = "0.0.334";
 
 pub type Result<T> = std::result::Result<T, IpcError>;
 
@@ -310,23 +309,15 @@ pub struct Hello {
 }
 
 impl Hello {
-    pub fn current(pid: u32) -> Self {
+    pub fn with_state(state: DaemonSnapshot, rust_analyzer_version: String) -> Self {
         Self {
             ok: true,
-            pid,
+            pid: state.pid,
             protocol_version: PROTOCOL_VERSION,
             daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
-            rust_analyzer_version: RUST_ANALYZER_VERSION.to_owned(),
+            rust_analyzer_version,
             capabilities: vec!["lsp".to_owned()],
-            state: None,
-        }
-    }
-
-    pub fn with_state(state: DaemonSnapshot) -> Self {
-        Self {
-            pid: state.pid,
             state: Some(state),
-            ..Self::current(0)
         }
     }
 }

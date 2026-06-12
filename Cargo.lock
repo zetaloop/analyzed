@@ -31,7 +31,6 @@ dependencies = [
  "analyzed-ipc",
  "anyhow",
  "clap",
- "ra_ap_rust-analyzer 0.0.334",
  "serde_json",
 ]
 
@@ -52,7 +51,6 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "lsp-server",
- "lsp-types",
  "ra_ap_rust-analyzer 0.0.334",
  "serde",
  "serde_json",

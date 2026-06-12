@@ -242,6 +242,7 @@ fn append_bridge_export(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 
 	pub mod analyzed_bridge;
 	pub use analyzed_bridge::{
+	    RUST_ANALYZER_VERSION,
 	    PackageInstance, PackageInstanceKey, RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary,
 	    SessionOverlay, SessionOverlayCrate, SessionOverlayFile, SharedAnalyzerBackendKey,
 	    SharedAnalyzerCargoConfigKey, SharedAnalyzerConfig,
@@ -1019,7 +1020,7 @@ const BRIDGE_MODULE: &str = r#"
 	use serde::Serialize;
 	use vfs::{AbsPathBuf, Vfs, VfsPath};
 
-const RUST_ANALYZER_VERSION: &str = "__ANALYZED_RA_VERSION__";
+pub const RUST_ANALYZER_VERSION: &str = "__ANALYZED_RA_VERSION__";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RustAnalyzerLspBoundary {
