@@ -1625,13 +1625,13 @@ pub(crate) fn shared_analyzer_context_from_config(
     let mut workspace_roots = config
         .workspace_roots()
         .iter()
-        .map(ToString::to_string)
+        .map(|root| path_key(&VfsPath::from(root.clone())))
         .collect::<Vec<_>>();
     workspace_roots.sort();
     workspace_roots.dedup();
     let mut excluded_paths = config
         .excluded()
-        .map(|path| path.to_string())
+        .map(|path| path_key(&VfsPath::from(path)))
         .collect::<Vec<_>>();
     excluded_paths.sort();
     excluded_paths.dedup();
@@ -2226,15 +2226,58 @@ impl SharedAnalyzerRuntime {
     }
 }
 
-fn normalize_vfs_path(path: &VfsPath) -> VfsPath {
+pub(crate) fn normalize_vfs_path(path: &VfsPath) -> VfsPath {
     let Some(path) = path.as_path() else {
         return path.clone();
     };
-    let Ok(path) = std::fs::canonicalize(path) else {
-        return VfsPath::from(path.to_path_buf());
-    };
 
-    VfsPath::from(AbsPathBuf::assert_utf8(path))
+    VfsPath::from(AbsPathBuf::assert_utf8(normalize_fs_path(path.as_ref())))
+}
+
+// Paths reach the shared world in mixed forms: cargo metadata and clients
+// report real paths while overlay-only files never hit the disk. Comparisons
+// only work if every form normalizes to the same string, so the deepest
+// existing ancestor is canonicalized (resolving symlinks and drive letter
+// case) and the in-memory remainder is appended verbatim. canonicalize on
+// Windows returns \\?\ verbatim paths, which no client-supplied path ever
+// carries, so the prefix is stripped back off.
+fn normalize_fs_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut remainder = Vec::new();
+    let mut current = path;
+
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(current) {
+            let mut normalized = strip_verbatim_prefix(canonical);
+            normalized.extend(remainder.iter().rev());
+            return normalized;
+        }
+
+        let (Some(parent), Some(name)) = (current.parent(), current.file_name()) else {
+            return path.to_path_buf();
+        };
+        remainder.push(name.to_owned());
+        current = parent;
+    }
+}
+
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return std::path::PathBuf::from(rest.to_owned());
+    }
+
+    path
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    path
 }
 
 fn path_key(path: &VfsPath) -> String {
@@ -4033,7 +4076,11 @@ pub(crate) mod analyzed_session {
                     if let Some(("rust-analyzer", Some("toml"))) =
                         vfs_path.name_and_extension()
                     {
-                        modified_ratoml_files.push((file_kind, vfs_path.clone(), text.clone()));
+                        modified_ratoml_files.push((
+                            file_kind,
+                            crate::analyzed_bridge::normalize_vfs_path(&vfs_path),
+                            text.clone(),
+                        ));
                     }
 
                     if let Some(path) = vfs_path.as_path() {
