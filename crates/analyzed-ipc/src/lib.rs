@@ -33,19 +33,20 @@ use thiserror::Error;
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{
-        ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE, WAIT_ABANDONED,
-        WAIT_OBJECT_0,
+        ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+        INVALID_HANDLE_VALUE, WAIT_ABANDONED, WAIT_OBJECT_0,
     },
     Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-        OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
     },
     System::{
+        IO::{GetOverlappedResult, OVERLAPPED},
         Pipes::{
             ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
         },
-        Threading::{CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject},
+        Threading::{CreateEventW, CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject},
     },
 };
 
@@ -63,38 +64,114 @@ pub type IpcStream = UnixStream;
 pub struct IpcListener {
     pipe_name: String,
     pending: File,
+    event: OwnedHandle,
 }
 
+// Synchronous named pipe operations serialize on the file object: a thread
+// blocked in ReadFile holds up a concurrent WriteFile on the same instance,
+// which deadlocks the full duplex LSP stream. All pipe handles are therefore
+// opened overlapped, and every stream carries its own event so reads and
+// writes proceed independently.
 #[cfg(windows)]
 pub struct IpcStream {
     file: File,
+    event: OwnedHandle,
 }
 
 #[cfg(windows)]
 impl IpcStream {
-    pub fn try_clone(&self) -> std::io::Result<Self> {
+    fn new(file: File) -> std::io::Result<Self> {
         Ok(Self {
-            file: self.file.try_clone()?,
+            file,
+            event: create_event()?,
         })
+    }
+
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Self::new(self.file.try_clone()?)
+    }
+
+    fn overlapped(&self) -> OVERLAPPED {
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.hEvent = self.event.as_raw_handle();
+        overlapped
+    }
+
+    fn finish(&self, overlapped: &mut OVERLAPPED, started: i32) -> std::io::Result<usize> {
+        if started == 0 {
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(code) if code == ERROR_IO_PENDING as i32 => {}
+                Some(code) if code == ERROR_BROKEN_PIPE as i32 => return Ok(0),
+                _ => return Err(error),
+            }
+        }
+
+        let mut transferred = 0;
+        let completed = unsafe {
+            GetOverlappedResult(self.file.as_raw_handle(), overlapped, &mut transferred, 1)
+        };
+        if completed == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                return Ok(0);
+            }
+
+            return Err(error);
+        }
+
+        Ok(transferred as usize)
     }
 }
 
 #[cfg(windows)]
 impl Read for IpcStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.file.read(buffer)
+        let mut overlapped = self.overlapped();
+        let started = unsafe {
+            ReadFile(
+                self.file.as_raw_handle(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                ptr::null_mut(),
+                &mut overlapped,
+            )
+        };
+
+        self.finish(&mut overlapped, started)
     }
 }
 
 #[cfg(windows)]
 impl Write for IpcStream {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.file.write(buffer)
+        let mut overlapped = self.overlapped();
+        let started = unsafe {
+            WriteFile(
+                self.file.as_raw_handle(),
+                buffer.as_ptr(),
+                buffer.len() as u32,
+                ptr::null_mut(),
+                &mut overlapped,
+            )
+        };
+
+        self.finish(&mut overlapped, started)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()
+        Ok(())
     }
+}
+
+#[cfg(windows)]
+fn create_event() -> std::io::Result<OwnedHandle> {
+    let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+    if event.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(unsafe { OwnedHandle::from_raw_handle(event) })
 }
 
 #[derive(Debug, Error)]
@@ -449,6 +526,7 @@ pub fn bind_listener(paths: &RuntimePaths) -> Result<IpcListener> {
     Ok(IpcListener {
         pending: create_pipe(&paths.pipe_name, true)?,
         pipe_name: paths.pipe_name.clone(),
+        event: create_event()?,
     })
 }
 
@@ -531,12 +609,10 @@ fn runtime_env(name: &'static str) -> Result<PathBuf> {
 impl IpcListener {
     fn accept(&mut self) -> Result<IpcStream> {
         loop {
-            match connect_pending_pipe(&self.pending) {
+            match connect_pending_pipe(&self.pending, &self.event) {
                 Ok(()) => {
                     let next = create_pipe(&self.pipe_name, false)?;
-                    return Ok(IpcStream {
-                        file: std::mem::replace(&mut self.pending, next),
-                    });
+                    return Ok(IpcStream::new(std::mem::replace(&mut self.pending, next))?);
                 }
                 // The client connected and vanished before we picked the
                 // instance up. Stand up a replacement first so the pipe name
@@ -562,7 +638,7 @@ fn create_pipe(pipe_name: &str, first_instance: bool) -> Result<File> {
     let handle = unsafe {
         CreateNamedPipeW(
             pipe_name.as_ptr(),
-            PIPE_ACCESS_DUPLEX | first_instance,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | first_instance,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
             65_536,
@@ -579,16 +655,31 @@ fn create_pipe(pipe_name: &str, first_instance: bool) -> Result<File> {
 }
 
 #[cfg(windows)]
-fn connect_pending_pipe(file: &File) -> Result<()> {
-    let connected = unsafe { ConnectNamedPipe(file.as_raw_handle(), ptr::null_mut()) };
-    if connected == 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
-            return Err(error.into());
-        }
+fn connect_pending_pipe(file: &File, event: &OwnedHandle) -> Result<()> {
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    overlapped.hEvent = event.as_raw_handle();
+
+    let connected = unsafe { ConnectNamedPipe(file.as_raw_handle(), &mut overlapped) };
+    if connected != 0 {
+        return Ok(());
     }
 
-    Ok(())
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == ERROR_PIPE_CONNECTED as i32 => Ok(()),
+        Some(code) if code == ERROR_IO_PENDING as i32 => {
+            let mut transferred = 0;
+            let completed = unsafe {
+                GetOverlappedResult(file.as_raw_handle(), &overlapped, &mut transferred, 1)
+            };
+            if completed == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+
+            Ok(())
+        }
+        _ => Err(error.into()),
+    }
 }
 
 #[cfg(windows)]
@@ -604,14 +695,12 @@ fn connect_pipe(pipe_name: &str) -> Result<IpcStream> {
                 0,
                 ptr::null_mut(),
                 OPEN_EXISTING,
-                0,
+                FILE_FLAG_OVERLAPPED,
                 ptr::null_mut(),
             )
         };
         if handle != INVALID_HANDLE_VALUE {
-            return Ok(IpcStream {
-                file: unsafe { File::from_raw_handle(handle) },
-            });
+            return Ok(IpcStream::new(unsafe { File::from_raw_handle(handle) })?);
         }
 
         let error = std::io::Error::last_os_error();
