@@ -900,17 +900,46 @@ fn patch_slow_tests(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
 
 fn patch_slow_tests_imports(path: &Path) -> Result<(), Box<dyn Error>> {
     let source = fs::read_to_string(path)?;
-    let source = source
+    let mut source = source
         .replace("use rust_analyzer::", "use ra_ap_rust_analyzer::")
         .replace(" rust_analyzer::", " ra_ap_rust_analyzer::")
         .replace("<rust_analyzer::", "<ra_ap_rust_analyzer::")
         .replace(
             "use test_utils::skip_slow_tests;\n",
             "fn skip_slow_tests() -> bool {\n    (std::env::var(\"CI\").is_err() && std::env::var(\"RUN_SLOW_TESTS\").is_err())\n        || std::env::var(\"SKIP_SLOW_TESTS\").is_ok()\n}\n",
+        )
+        .replace(
+            r#".replace("C:\\", "/c:/").replace('\\', "/")"#,
+            ".analyzed_uri_path()",
         );
+    if source.contains(".analyzed_uri_path()") {
+        source.push_str(ANALYZED_URI_PATH_HELPER);
+    }
     fs::write(path, source)?;
     Ok(())
 }
+
+// The upstream tests rewrite expected paths into URI form with a hardcoded
+// C: drive; this generalizes the rewrite to whatever drive the test
+// directory lives on.
+const ANALYZED_URI_PATH_HELPER: &str = r#"
+trait AnalyzedUriPath {
+    fn analyzed_uri_path(self) -> String;
+}
+
+impl AnalyzedUriPath for String {
+    fn analyzed_uri_path(self) -> String {
+        let path = self.replace('\\', "/");
+        let mut chars = path.chars();
+        match (chars.next(), chars.next()) {
+            (Some(drive), Some(':')) if drive.is_ascii_alphabetic() => {
+                format!("/{}:{}", drive.to_ascii_lowercase(), chars.as_str())
+            }
+            _ => path,
+        }
+    }
+}
+"#;
 
 fn patch_slow_tests_support(path: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(path)?;
