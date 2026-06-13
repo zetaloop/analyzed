@@ -25,7 +25,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "analyzed"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "analyzed-daemon",
  "analyzed-ipc",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "sha2",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "analyzed-ipc",
  "anyhow",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-ipc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
