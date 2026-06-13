@@ -542,43 +542,18 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
     )?;
     replace_once(
         &mut source,
+        "fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {\n",
+        "pub(crate) fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {\n",
+    )?;
+    replace_once(
+        &mut source,
         "    let file_id = state.vfs.read().0.file_id(&vfs_path);\n    if let Some((file_id, vfs::FileExcluded::No)) = file_id {\n",
-        "    let file_id = state.analyzed_shared.base_vfs_path_to_file_id(&vfs_path);\n    if let Ok(Some(file_id)) = file_id {\n",
-    )?;
-    replace_once(
-        &mut source,
-        "    global_state::{FetchWorkspaceRequest, GlobalState},\n",
-        "    global_state::{FetchWorkspaceRequest, GlobalState, GlobalStateSnapshot},\n",
-    )?;
-    replace_once(
-        &mut source,
-        "        let task: Box<dyn FnOnce() -> ide::Cancellable<()> + Send + UnwindSafe> =\n            match invocation_strategy {\n",
-        "        let task: Box<dyn Fn(&GlobalStateSnapshot) -> ide::Cancellable<()> + Send + UnwindSafe> =\n            match invocation_strategy {\n",
-    )?;
-    replace_once(
-        &mut source,
-        "                InvocationStrategy::Once => {\n                    Box::new(move || {\n",
-        "                InvocationStrategy::Once => {\n                    Box::new(move |world: &GlobalStateSnapshot| {\n",
-    )?;
-    replace_once(
-        &mut source,
-        "                        let world = world;\n",
-        "",
-    )?;
-    replace_once(
-        &mut source,
-        "                InvocationStrategy::PerWorkspace => {\n                    Box::new(move || {\n",
-        "                InvocationStrategy::PerWorkspace => {\n                    Box::new(move |world: &GlobalStateSnapshot| {\n",
-    )?;
-    replace_once(
-        &mut source,
-        "                        let target = TargetSpec::for_file(&world, file_id)?.map(|it| {\n",
-        "                        let target = TargetSpec::for_file(world, file_id)?.map(|it| {\n",
+        "    let base_file_id = state.analyzed_shared.base_vfs_path_to_file_id(&vfs_path);\n    let file_id = state.analyzed_shared.vfs_path_to_file_id(&vfs_path);\n    if let (Ok(Some(_)), Ok(Some(file_id))) = (base_file_id, file_id) {\n        let analyzed_vfs_path = vfs_path.clone();\n",
     )?;
     replace_once(
         &mut source,
         "        state.task_pool.handle.spawn_with_sender(stdx::thread::ThreadIntent::Worker, move |_| {\n            if let Err(e) = std::panic::catch_unwind(task) {\n                tracing::error!(\"flycheck task panicked: {e:?}\")\n            }\n        });\n        true\n",
-        "        let analyzed_shared = state.analyzed_shared.clone();\n        state.task_pool.handle.spawn_with_sender(stdx::thread::ThreadIntent::Worker, move |_| {\n            let mut world = world;\n            loop {\n                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(&world))) {\n                    Ok(Ok(())) => break,\n                    Ok(Err(_cancelled)) => world.analysis = analyzed_shared.analysis(),\n                    Err(e) => {\n                        tracing::error!(\"flycheck task panicked: {e:?}\");\n                        break;\n                    }\n                }\n            }\n        });\n        true\n",
+        "        state.task_pool.handle.spawn_with_sender(stdx::thread::ThreadIntent::Worker, move |sender| {\n            match std::panic::catch_unwind(task) {\n                Ok(Ok(())) => {}\n                Ok(Err(_cancelled)) => {\n                    _ = sender.send(crate::main_loop::Task::AnalyzedRunFlycheck(analyzed_vfs_path));\n                }\n                Err(e) => tracing::error!(\"flycheck task panicked: {e:?}\"),\n            }\n        });\n        true\n",
     )?;
 
     fs::write(notification_rs, source)?;
@@ -596,7 +571,7 @@ fn patch_dispatch_source(dispatch_rs: &Path) -> Result<(), Box<dyn Error>> {
     replace_once(
         &mut source,
         "            match thread_result_to_response::<R>(req.id.clone(), result) {\n                Ok(response) => Task::Response(response),\n                Err(_cancelled) if ALLOW_RETRYING => Task::Retry(req),\n                Err(_cancelled) => {\n                    let error = on_cancelled();\n                    Task::Response(Response { id: req.id, result: None, error: Some(error) })\n                }\n            }\n",
-        "            match thread_result_to_response::<R>(req.id.clone(), result) {\n                Ok(response) => Task::Response(response),\n                Err(_cancelled) if ALLOW_RETRYING => Task::Retry(req),\n                Err(_cancelled)\n                    if analyzed_shared.edit_generation() == dispatched_edit_generation =>\n                {\n                    // The cancellation came from another session's write to the shared\n                    // world; this session's inputs are unchanged, so the request is\n                    // still meaningful and can be retried.\n                    Task::Retry(req)\n                }\n                Err(_cancelled) => {\n                    let error = on_cancelled();\n                    Task::Response(Response { id: req.id, result: None, error: Some(error) })\n                }\n            }\n",
+        "            match thread_result_to_response::<R>(req.id.clone(), result) {\n                Ok(response) => Task::Response(response),\n                Err(_cancelled) if ALLOW_RETRYING => Task::Retry(req),\n                Err(_cancelled)\n                    if analyzed_shared.edit_generation() == dispatched_edit_generation =>\n                {\n                    Task::Retry(req)\n                }\n                Err(_cancelled) => {\n                    let error = on_cancelled();\n                    Task::Response(Response { id: req.id, result: None, error: Some(error) })\n                }\n            }\n",
     )?;
 
     fs::write(dispatch_rs, source)?;
@@ -625,7 +600,7 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     replace_once(
         &mut source,
         "    FetchWorkspace(ProjectWorkspaceProgress),\n    FetchBuildData(BuildDataProgress),\n",
-        "    FetchWorkspace(ProjectWorkspaceProgress),\n    AnalyzedFetchWorkspace(FetchWorkspaceResponse),\n",
+        "    FetchWorkspace(ProjectWorkspaceProgress),\n    AnalyzedFetchWorkspace(FetchWorkspaceResponse),\n    AnalyzedRunFlycheck(VfsPath),\n",
     )?;
     replace_once(&mut source, "    LoadProcMacros(ProcMacroProgress),\n", "")?;
     replace_once(&mut source, "    Buildfile(AbsPathBuf),\n", "")?;
@@ -669,7 +644,7 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     replace_once(
         &mut source,
         "            Task::DiscoverLinkedProjects(arg) => {\n",
-        "            Task::AnalyzedFetchWorkspace(resp) => {\n                self.fetch_workspaces_queue.op_completed(resp);\n                if let Err(e) = self.fetch_workspace_error() {\n                    error!(\"FetchWorkspaceError: {e}\");\n                }\n                self.wants_to_switch = Some(\"fetched workspace\".to_owned());\n                self.diagnostics.clear_check_all();\n                self.report_progress(\"Fetching\", Progress::End, None, None, None);\n            }\n            Task::DiscoverLinkedProjects(arg) => {\n",
+        "            Task::AnalyzedFetchWorkspace(resp) => {\n                self.fetch_workspaces_queue.op_completed(resp);\n                if let Err(e) = self.fetch_workspace_error() {\n                    error!(\"FetchWorkspaceError: {e}\");\n                }\n                self.wants_to_switch = Some(\"fetched workspace\".to_owned());\n                self.diagnostics.clear_check_all();\n                self.report_progress(\"Fetching\", Progress::End, None, None, None);\n            }\n            Task::AnalyzedRunFlycheck(path) => {\n                crate::handlers::notification::run_flycheck(self, path);\n            }\n            Task::DiscoverLinkedProjects(arg) => {\n",
     )?;
     let fetch_workspace_start = source
         .find("            Task::FetchWorkspace(progress) => {\n")
@@ -1932,7 +1907,19 @@ struct SharedAnalyzerRuntimeSession {
     excluded_paths: Vec<String>,
     line_endings: Mutex<SharedLineEndings>,
     file_mappings: Mutex<SharedFileMappings>,
+    analysis_cache: Mutex<SharedAnalysisCache>,
     registry_lease: Option<SharedAnalyzerRegistryLease>,
+}
+
+// Visible crate roots and the session mappings only move when the world's
+// inputs move. Recomputing them on every snapshot walks every crate in the
+// merged world and re-verifies it against the current salsa revision, which
+// under cross-session write traffic turns each snapshot into seconds of
+// revalidation and starves the session's main loop.
+#[derive(Default)]
+struct SharedAnalysisCache {
+    generation: Option<u64>,
+    visible_files: Arc<rustc_hash::FxHashSet<FileId>>,
 }
 
 impl Drop for SharedAnalyzerRuntimeSession {
@@ -2001,6 +1988,7 @@ impl SharedAnalyzerRuntime {
             excluded_paths,
             line_endings: Mutex::new(SharedLineEndings::default()),
             file_mappings: Mutex::new(SharedFileMappings::default()),
+            analysis_cache: Mutex::new(SharedAnalysisCache::default()),
             registry_lease,
         });
 
@@ -2063,15 +2051,26 @@ impl SharedAnalyzerRuntime {
             .world
             .lock()
             .expect("shared world mutex poisoned");
-        let visible_files = world.visible_crate_roots_for_session(
-            self.session_id(),
-            self.workspace_indexes(),
-            &self.session.excluded_paths,
-        );
-        self.refresh_session_cache(&world);
+        let generation = self.session.input_generation.load(Ordering::SeqCst);
+        let mut cache = self
+            .session
+            .analysis_cache
+            .lock()
+            .expect("shared analyzer analysis cache mutex poisoned");
+        if cache.generation != Some(generation) {
+            cache.visible_files = Arc::new(world.visible_crate_roots_for_session(
+                self.session_id(),
+                self.workspace_indexes(),
+                &self.session.excluded_paths,
+            ));
+            self.refresh_session_cache(&world);
+            cache.generation = Some(generation);
+        }
+        let visible_files = Arc::clone(&cache.visible_files);
+        drop(cache);
         world
             .host
-            .analyzed_analysis_with_visible_files(Arc::new(visible_files))
+            .analyzed_analysis_with_visible_files(visible_files)
     }
 
     pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {
@@ -2207,6 +2206,11 @@ impl SharedAnalyzerRuntime {
         let sync = world.sync_session_overlay(self.session_id(), self.workspace_indexes(), files)?;
         if sync.changed {
             self.session.edit_generation.fetch_add(1, Ordering::SeqCst);
+            self.session
+                .analysis_cache
+                .lock()
+                .expect("shared analyzer analysis cache mutex poisoned")
+                .generation = None;
         }
         self.refresh_session_cache(&world);
         Ok(sync)
@@ -4238,7 +4242,7 @@ pub(crate) mod analyzed_session {
                 }
                 changed = true;
             }
-            if !matches!(&workspace_structure_change, Some((.., true))) {
+            if changed && !matches!(&workspace_structure_change, Some((.., true))) {
                 let modified_rust_files = self
                     .mem_docs
                     .iter()
@@ -4248,10 +4252,12 @@ pub(crate) mod analyzed_session {
                     })
                     .filter_map(|path| shared.vfs_path_to_file_id(path).ok().flatten())
                     .collect::<Vec<_>>();
-                _ = self
-                    .deferred_task_queue
-                    .sender
-                    .send(crate::main_loop::DeferredTask::CheckProcMacroSources(modified_rust_files));
+                if !modified_rust_files.is_empty() {
+                    _ = self
+                        .deferred_task_queue
+                        .sender
+                        .send(crate::main_loop::DeferredTask::CheckProcMacroSources(modified_rust_files));
+                }
             }
 
             if let Some((path, force_crate_graph_reload)) = workspace_structure_change {
