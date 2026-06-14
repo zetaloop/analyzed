@@ -64,8 +64,6 @@ pub(crate) fn handle_did_save_text_document(
         }
 
         if run_flycheck(state, vfs_path) {
-            state.diagnostics.clear_check_all();
-            state.diagnostics.mark_changed(file_id);
             return Ok(());
         }
     } else if state.config.check_on_save(None) && state.config.flycheck_workspace(None) {

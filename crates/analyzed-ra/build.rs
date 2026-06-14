@@ -18,7 +18,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let generated_src = generated.join("src");
     patch_config_source(&generated_src.join("config.rs"))?;
     patch_discover_source(&generated_src.join("discover.rs"))?;
-    patch_diagnostics_source(&generated_src.join("diagnostics.rs"))?;
     patch_flycheck_to_proto_source(&generated_src.join("diagnostics/flycheck_to_proto.rs"))?;
     patch_notification_source(&generated_src.join("handlers/notification.rs"))?;
     patch_dispatch_source(&generated_src.join("handlers/dispatch.rs"))?;
@@ -362,17 +361,6 @@ fn patch_discover_source(discover_rs: &Path) -> Result<(), Box<dyn Error>> {
         "",
     )?;
     fs::write(discover_rs, source)?;
-    Ok(())
-}
-
-fn patch_diagnostics_source(diagnostics_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(diagnostics_rs)?;
-    build_support::replace_once(
-        &mut source,
-        "    pub(crate) fn clear_native_for(&mut self, file_id: FileId) {\n",
-        "    pub(crate) fn mark_changed(&mut self, file_id: FileId) {\n        self.changes.insert(file_id);\n    }\n\n    pub(crate) fn clear_native_for(&mut self, file_id: FileId) {\n",
-    )?;
-    fs::write(diagnostics_rs, source)?;
     Ok(())
 }
 

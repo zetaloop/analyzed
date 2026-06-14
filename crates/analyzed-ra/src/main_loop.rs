@@ -223,6 +223,14 @@ impl GlobalState {
         if let Ok(task) = self.fmt_pool.receiver.try_recv() {
             return Ok(Some(Event::Task(task)));
         }
+        match inbox.try_recv() {
+            Ok(msg) => return Ok(Some(Event::Lsp(msg))),
+            Err(crossbeam_channel::TryRecvError::Empty) => (),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(None),
+        }
+        if let Ok(message) = self.flycheck_receiver.try_recv() {
+            return Ok(Some(Event::Flycheck(message)));
+        }
 
         select! {
             recv(inbox) -> msg =>
@@ -256,7 +264,7 @@ impl GlobalState {
         .map(Some)
     }
 
-    fn handle_event(&mut self, event: Event) {
+    fn handle_event(&mut self, event: Event, inbox: &Receiver<lsp_server::Message>) {
         let loop_start = Instant::now();
         let _p = tracing::info_span!("GlobalState::handle_event", event = %event).entered();
 
@@ -289,6 +297,12 @@ impl GlobalState {
                 let mut prime_caches_progress = Vec::new();
 
                 self.handle_task(&mut prime_caches_progress, task);
+                while inbox.is_empty() && self.flycheck_receiver.is_empty() {
+                    let Ok(task) = self.task_pool.receiver.try_recv() else {
+                        break;
+                    };
+                    self.handle_task(&mut prime_caches_progress, task);
+                }
 
                 let title = "Indexing";
                 let cancel_token = Some("rustAnalyzer/cachePriming".to_owned());

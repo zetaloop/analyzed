@@ -133,7 +133,7 @@ fn run_shared_state(
             return Ok(());
         }
         state.analyzed_shared.set_busy(true);
-        state.handle_event(event);
+        state.handle_event(event, &inbox);
         let idle =
             state.task_pool.handle.is_empty() && state.fmt_pool.handle.is_empty();
         state.analyzed_shared.set_busy(!idle);
