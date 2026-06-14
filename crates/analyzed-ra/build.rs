@@ -235,6 +235,7 @@ fn table_keys(table: &Table) -> Vec<String> {
 
 fn write_analyzed_root_module(root_rs: &Path, lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let analyzed_bridge = owned_source_path("analyzed_bridge.rs");
+    let analyzed_flycheck_to_proto = owned_source_path("diagnostics/flycheck_to_proto.rs");
     let mut upstream_root = fs::read_to_string(lib_rs)?;
     use_owned_module(
         &mut upstream_root,
@@ -247,10 +248,23 @@ fn write_analyzed_root_module(root_rs: &Path, lib_rs: &Path) -> Result<(), Box<d
         owned_source_path("main_loop.rs"),
     )?;
     use_owned_module(&mut upstream_root, "reload", owned_source_path("reload.rs"))?;
+    use_owned_handlers_module(
+        &mut upstream_root,
+        "analyzed_dispatch",
+        owned_source_path("handlers/dispatch.rs"),
+    )?;
+    use_owned_handlers_module(
+        &mut upstream_root,
+        "analyzed_notification",
+        owned_source_path("handlers/notification.rs"),
+    )?;
     let source = format!(
         r#"
 #[path = {:?}]
 pub mod analyzed_bridge;
+
+#[path = {:?}]
+pub(crate) mod analyzed_flycheck_to_proto;
 
 {upstream_root}
 
@@ -268,10 +282,15 @@ pub use analyzed_bridge::{{
     rust_analyzer_private_boundary, shared_analyzer_registry,
 }};
 "#,
-        analyzed_bridge.to_string_lossy().into_owned()
+        analyzed_bridge.to_string_lossy().into_owned(),
+        analyzed_flycheck_to_proto.to_string_lossy().into_owned()
     );
     fs::write(root_rs, source)?;
     println!("cargo:rerun-if-changed={}", analyzed_bridge.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        analyzed_flycheck_to_proto.display()
+    );
 
     Ok(())
 }
@@ -289,6 +308,23 @@ fn use_owned_module(source: &mut String, name: &str, path: PathBuf) -> Result<()
         &declaration,
         &format!(
             "#[path = {:?}]\nmod {name};",
+            path.to_string_lossy().into_owned()
+        ),
+    )?;
+    println!("cargo:rerun-if-changed={}", path.display());
+    Ok(())
+}
+
+fn use_owned_handlers_module(
+    source: &mut String,
+    name: &str,
+    path: PathBuf,
+) -> Result<(), Box<dyn Error>> {
+    replace_once(
+        source,
+        "mod handlers {\n",
+        &format!(
+            "mod handlers {{\n    #[path = {:?}]\n    pub(crate) mod {name};\n",
             path.to_string_lossy().into_owned()
         ),
     )?;
@@ -331,20 +367,18 @@ fn patch_discover_source(discover_rs: &Path) -> Result<(), Box<dyn Error>> {
 fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(flycheck_to_proto_rs)?;
 
+    build_support::rename_with_prefix(&mut source, "fn location(", "location", "_")?;
+    build_support::allow_dead_code(&mut source, "fn _location(")?;
+    build_support::inject_use(&mut source, "crate::analyzed_flycheck_to_proto::location")?;
     replace_once(
         &mut source,
-        "use vfs::{AbsPath, AbsPathBuf};\n",
-        "use vfs::{AbsPath, AbsPathBuf, VfsPath};\n",
-    )?;
-    replace_once(
-        &mut source,
-        "    let uri = url_from_abs_path(&file_name);\n",
-        "    let uri = snap\n        .base_vfs_path_to_file_id(&VfsPath::from(file_name.clone()))\n        .ok()\n        .flatten()\n        .map(|file_id| snap.file_id_to_url(file_id))\n        .unwrap_or_else(|| url_from_abs_path(&file_name));\n",
+        "    use crate::{config::Config, global_state::GlobalState};\n",
+        "    use crate::analyzed_flycheck_to_proto::test_global_state;\n",
     )?;
     replace_once(
         &mut source,
         "        let state = GlobalState::new(\n            sender,\n            Config::new(\n                workspace_root.to_path_buf(),\n                ClientCapabilities::default(),\n                Vec::new(),\n                None,\n            ),\n        );\n",
-        "        let ra_config = Config::new(\n            workspace_root.to_path_buf(),\n            ClientCapabilities::default(),\n            Vec::new(),\n            None,\n        );\n        let registry = crate::analyzed_bridge::shared_analyzer_registry();\n        let provider = crate::analyzed_bridge::SharedAnalyzerProvider::new(move |key, config, reload_path| {\n            registry.register(key, config, reload_path)\n        });\n        let (key, shared_config) = crate::analyzed_bridge::shared_analyzer_context_from_config(&ra_config).unwrap();\n        let session = provider.resolve(key, shared_config).unwrap();\n        let analyzed_shared = session.runtime();\n        let analyzed_workspaces = session.workspaces().unwrap();\n        let state = GlobalState::new(sender, ra_config, provider, analyzed_shared, analyzed_workspaces);\n",
+        "        let state = test_global_state(\n            sender,\n            workspace_root.to_path_buf(),\n            ClientCapabilities::default(),\n        );\n",
     )?;
 
     fs::write(flycheck_to_proto_rs, source)?;
@@ -354,45 +388,40 @@ fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box
 fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(notification_rs)?;
 
-    replace_once(
+    build_support::rename_with_prefix(
         &mut source,
-        "use vfs::{AbsPathBuf, ChangeKind, VfsPath};\n",
-        "use vfs::{AbsPathBuf, ChangeKind, VfsPath};\n",
+        "fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool",
+        "run_flycheck",
+        "_",
+    )?;
+    build_support::allow_dead_code(
+        &mut source,
+        "fn _run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool",
+    )?;
+    build_support::inject_use(
+        &mut source,
+        "crate::handlers::analyzed_notification::run_flycheck",
+    )?;
+    build_support::rename_with_prefix(
+        &mut source,
+        "pub(crate) fn handle_did_save_text_document(",
+        "handle_did_save_text_document",
+        "_",
+    )?;
+    build_support::allow_dead_code(&mut source, "pub(crate) fn _handle_did_save_text_document(")?;
+    build_support::inject_use(
+        &mut source,
+        "crate::handlers::analyzed_notification::handle_did_save_text_document",
     )?;
     replace_once(
         &mut source,
-        "fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {\n",
-        "pub(crate) fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {\n",
+        "use crate::handlers::analyzed_notification::run_flycheck;\n",
+        "pub(crate) use crate::handlers::analyzed_notification::run_flycheck;\n",
     )?;
     replace_once(
         &mut source,
-        "    let file_id = state.vfs.read().0.file_id(&vfs_path);\n    if let Some((file_id, vfs::FileExcluded::No)) = file_id {\n",
-        "    let base_file_id = state.analyzed_shared.base_vfs_path_to_file_id(&vfs_path);\n    let file_id = state.analyzed_shared.vfs_path_to_file_id(&vfs_path);\n    if let (Ok(Some(_)), Ok(Some(file_id))) = (base_file_id, file_id) {\n        let analyzed_vfs_path = vfs_path.clone();\n",
-    )?;
-    replace_once(
-        &mut source,
-        "        state.task_pool.handle.spawn_with_sender(stdx::thread::ThreadIntent::Worker, move |_| {\n            if let Err(e) = std::panic::catch_unwind(task) {\n                tracing::error!(\"flycheck task panicked: {e:?}\")\n            }\n        });\n        true\n",
-        "        state.task_pool.handle.spawn_with_sender(stdx::thread::ThreadIntent::Worker, move |sender| {\n            match std::panic::catch_unwind(task) {\n                Ok(Ok(())) => {}\n                Ok(Err(_cancelled)) => {\n                    _ = sender.send(crate::main_loop::Task::AnalyzedRunFlycheck(analyzed_vfs_path));\n                }\n                Err(e) => tracing::error!(\"flycheck task panicked: {e:?}\"),\n            }\n        });\n        true\n",
-    )?;
-    replace_once(
-        &mut source,
-        "                        let mut package_workspace_idx = None;\n",
-        "                        let mut package_workspace_idx = None;\n                        let mut package_check_triggered = false;\n",
-    )?;
-    replace_once(
-        &mut source,
-        "                                        flycheck.restart_for_package(\n                                            package,\n                                            target,\n                                            workspace_deps,\n                                            saved_file.clone(),\n                                        );\n",
-        "                                        flycheck.restart_for_package(\n                                            package,\n                                            target,\n                                            workspace_deps,\n                                            saved_file.clone(),\n                                        );\n                                        package_check_triggered = true;\n",
-    )?;
-    replace_once(
-        &mut source,
-        "                                let is_pkg_ws = match package_workspace_idx {\n                                    Some(pkg_idx) => pkg_idx == idx,\n                                    None => false,\n                                };\n",
-        "                                let is_pkg_ws = package_check_triggered\n                                    && match package_workspace_idx {\n                                        Some(pkg_idx) => pkg_idx == idx,\n                                        None => false,\n                                    };\n",
-    )?;
-    replace_once(
-        &mut source,
-        "                        if !workspace_check_triggered && package_workspace_idx.is_none() {\n",
-        "                        if !workspace_check_triggered && !package_check_triggered {\n",
+        "use crate::handlers::analyzed_notification::handle_did_save_text_document;\n",
+        "pub(crate) use crate::handlers::analyzed_notification::handle_did_save_text_document;\n",
     )?;
 
     fs::write(notification_rs, source)?;
@@ -402,15 +431,22 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
 fn patch_dispatch_source(dispatch_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(dispatch_rs)?;
 
-    replace_once(
+    build_support::rename_with_prefix(
         &mut source,
-        "        let world = self.global_state.snapshot();\n",
-        "        let world = self.global_state.snapshot();\n        let dispatched_edit_generation = world.analyzed_shared.edit_generation();\n        let analyzed_shared = world.analyzed_shared.clone();\n",
+        "fn on_with_thread_intent<const RUSTFMT: bool, const ALLOW_RETRYING: bool, R>(",
+        "on_with_thread_intent",
+        "_",
     )?;
-    replace_once(
+    build_support::allow_dead_code(
         &mut source,
-        "            match thread_result_to_response::<R>(req.id.clone(), result) {\n                Ok(response) => Task::Response(response),\n                Err(_cancelled) if ALLOW_RETRYING => Task::Retry(req),\n                Err(_cancelled) => {\n                    let error = on_cancelled();\n                    Task::Response(Response { id: req.id, result: None, error: Some(error) })\n                }\n            }\n",
-        "            match thread_result_to_response::<R>(req.id.clone(), result) {\n                Ok(response) => Task::Response(response),\n                Err(_cancelled) if ALLOW_RETRYING => Task::Retry(req),\n                Err(_cancelled)\n                    if analyzed_shared.edit_generation() == dispatched_edit_generation =>\n                {\n                    Task::Retry(req)\n                }\n                Err(_cancelled) => {\n                    let error = on_cancelled();\n                    Task::Response(Response { id: req.id, result: None, error: Some(error) })\n                }\n            }\n",
+        "fn _on_with_thread_intent<const RUSTFMT: bool, const ALLOW_RETRYING: bool, R>(",
+    )?;
+    build_support::widen_visibility(&mut source, "fn parse<R>(&mut self)", "pub(crate)")?;
+    build_support::widen_visibility(&mut source, "enum HandlerCancelledError {", "pub(crate)")?;
+    build_support::widen_visibility(
+        &mut source,
+        "fn thread_result_to_response<R>(",
+        "pub(crate)",
     )?;
 
     fs::write(dispatch_rs, source)?;

@@ -289,10 +289,6 @@ impl GlobalState {
                 let mut prime_caches_progress = Vec::new();
 
                 self.handle_task(&mut prime_caches_progress, task);
-                // Coalesce multiple task events into one loop turn
-                while let Ok(task) = self.task_pool.receiver.try_recv() {
-                    self.handle_task(&mut prime_caches_progress, task);
-                }
 
                 let title = "Indexing";
                 let cancel_token = Some("rustAnalyzer/cachePriming".to_owned());
