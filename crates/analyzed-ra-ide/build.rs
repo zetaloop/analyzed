@@ -62,7 +62,7 @@ fn patch_skip_slow_tests(tests_rs: &Path) -> Result<(), Box<dyn Error>> {
     replace_once(
         &mut source,
         "use test_utils::{AssertLinear, bench, bench_fixture, skip_slow_tests};\n",
-        "use test_utils::{AssertLinear, bench, bench_fixture};\n\n#[allow(dead_code)]\nfn skip_slow_tests() -> bool {\n    (std::env::var(\"CI\").is_err() && std::env::var(\"RUN_SLOW_TESTS\").is_err())\n        || std::env::var(\"SKIP_SLOW_TESTS\").is_ok()\n}\n",
+        "use crate::analyzed::skip_slow_tests;\nuse test_utils::{AssertLinear, bench, bench_fixture};\n",
     )?;
     for benchmark in [
         "benchmark_syntax_highlighting_long_struct",

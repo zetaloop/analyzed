@@ -304,7 +304,7 @@ fn owned_source_path(file_name: &str) -> PathBuf {
 
 fn use_owned_module(source: &mut String, name: &str, path: PathBuf) -> Result<(), Box<dyn Error>> {
     let declaration = format!("mod {name};");
-    replace_once(
+    build_support::replace_once(
         source,
         &declaration,
         &format!(
@@ -321,7 +321,7 @@ fn use_owned_handlers_module(
     name: &str,
     path: PathBuf,
 ) -> Result<(), Box<dyn Error>> {
-    replace_once(
+    build_support::replace_once(
         source,
         "mod handlers {\n",
         &format!(
@@ -341,7 +341,7 @@ fn patch_config_source(config_rs: &Path) -> Result<(), Box<dyn Error>> {
         "fn generate_package_json_config() {",
         "fn generate_config_documentation() {",
     ] {
-        replace_once(
+        build_support::replace_once(
             &mut source,
             &format!("    #[test]\n    {guard}"),
             &format!(
@@ -356,7 +356,7 @@ fn patch_config_source(config_rs: &Path) -> Result<(), Box<dyn Error>> {
 
 fn patch_discover_source(discover_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(discover_rs)?;
-    replace_once(
+    build_support::replace_once(
         &mut source,
         "    Buildfile(#[serde(serialize_with = \"serialize_abs_pathbuf\")] AbsPathBuf),\n",
         "",
@@ -367,7 +367,7 @@ fn patch_discover_source(discover_rs: &Path) -> Result<(), Box<dyn Error>> {
 
 fn patch_diagnostics_source(diagnostics_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(diagnostics_rs)?;
-    replace_once(
+    build_support::replace_once(
         &mut source,
         "    pub(crate) fn clear_native_for(&mut self, file_id: FileId) {\n",
         "    pub(crate) fn mark_changed(&mut self, file_id: FileId) {\n        self.changes.insert(file_id);\n    }\n\n    pub(crate) fn clear_native_for(&mut self, file_id: FileId) {\n",
@@ -382,12 +382,12 @@ fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box
     build_support::rename_with_prefix(&mut source, "fn location(", "location", "_")?;
     build_support::allow_dead_code(&mut source, "fn _location(")?;
     build_support::inject_use(&mut source, "crate::analyzed_flycheck_to_proto::location")?;
-    replace_once(
+    build_support::replace_once(
         &mut source,
         "    use crate::{config::Config, global_state::GlobalState};\n",
         "    use crate::analyzed_flycheck_to_proto::test_global_state;\n",
     )?;
-    replace_once(
+    build_support::replace_once(
         &mut source,
         "        let state = GlobalState::new(\n            sender,\n            Config::new(\n                workspace_root.to_path_buf(),\n                ClientCapabilities::default(),\n                Vec::new(),\n                None,\n            ),\n        );\n",
         "        let state = test_global_state(\n            sender,\n            workspace_root.to_path_buf(),\n            ClientCapabilities::default(),\n        );\n",
@@ -425,12 +425,12 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
         &mut source,
         "crate::handlers::analyzed_notification::handle_did_save_text_document",
     )?;
-    replace_once(
+    build_support::replace_once(
         &mut source,
         "use crate::handlers::analyzed_notification::run_flycheck;\n",
         "pub(crate) use crate::handlers::analyzed_notification::run_flycheck;\n",
     )?;
-    replace_once(
+    build_support::replace_once(
         &mut source,
         "use crate::handlers::analyzed_notification::handle_did_save_text_document;\n",
         "pub(crate) use crate::handlers::analyzed_notification::handle_did_save_text_document;\n",
@@ -501,54 +501,33 @@ fn patch_slow_tests_imports(path: &Path) -> Result<(), Box<dyn Error>> {
         .replace("<rust_analyzer::", "<ra_ap_rust_analyzer::")
         .replace(
             "use test_utils::skip_slow_tests;\n",
-            "fn skip_slow_tests() -> bool {\n    (std::env::var(\"CI\").is_err() && std::env::var(\"RUN_SLOW_TESTS\").is_err())\n        || std::env::var(\"SKIP_SLOW_TESTS\").is_ok()\n}\n",
+            "use crate::analyzed_slow_tests::skip_slow_tests;\n",
         )
         .replace(
             r#".replace("C:\\", "/c:/").replace('\\', "/")"#,
             ".analyzed_uri_path()",
         );
     if source.contains(".analyzed_uri_path()") {
-        source.push_str(ANALYZED_URI_PATH_HELPER);
+        build_support::inject_use(&mut source, "crate::analyzed_slow_tests::AnalyzedUriPath")?;
     }
     fs::write(path, source)?;
     Ok(())
 }
 
-// The upstream tests rewrite expected paths into URI form with a hardcoded
-// C: drive; this generalizes the rewrite to whatever drive the test
-// directory lives on.
-const ANALYZED_URI_PATH_HELPER: &str = r#"
-trait AnalyzedUriPath {
-    fn analyzed_uri_path(self) -> String;
-}
-
-impl AnalyzedUriPath for String {
-    fn analyzed_uri_path(self) -> String {
-        let path = self.replace('\\', "/");
-        let mut chars = path.chars();
-        match (chars.next(), chars.next()) {
-            (Some(drive), Some(':')) if drive.is_ascii_alphabetic() => {
-                format!("/{}:{}", drive.to_ascii_lowercase(), chars.as_str())
-            }
-            _ => path,
-        }
-    }
-}
-"#;
-
 fn patch_slow_tests_support(path: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(path)?;
-    replace_once(&mut source, "    lsp, main_loop,\n", "    lsp,\n")?;
-    replace_once(
+    build_support::replace_once(&mut source, "    lsp, main_loop,\n", "    lsp,\n")?;
+    build_support::replace_once(
         &mut source,
         "            .spawn(move || main_loop(config, connection).unwrap())\n",
-        "            .spawn(move || {\n                ra_ap_rust_analyzer::run_shared_rust_analyzer_lsp_session_with_config(\n                    config,\n                    connection,\n                )\n                .unwrap()\n            })\n",
+        "            .spawn(move || crate::analyzed_slow_tests::run_server(config, connection))\n",
     )?;
     fs::write(path, source)?;
     Ok(())
 }
 
 fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let analyzed_slow_tests = owned_source_path("slow_tests.rs");
     let main_rs = slow_tests.join("main.rs");
     let mut body = String::new();
     for line in fs::read_to_string(&main_rs)?.lines() {
@@ -576,7 +555,8 @@ fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<PathBuf, Box<dyn Error>
     fs::write(
         &wrapper_rs,
         format!(
-            "#[path = {:?}]\nmod cli;\n#[path = {:?}]\nmod flycheck;\n#[path = {:?}]\nmod ratoml;\n#[path = {:?}]\nmod support;\n#[path = {:?}]\nmod testdir;\ninclude!({:?});\n",
+            "#[path = {:?}]\nmod analyzed_slow_tests;\n#[path = {:?}]\nmod cli;\n#[path = {:?}]\nmod flycheck;\n#[path = {:?}]\nmod ratoml;\n#[path = {:?}]\nmod support;\n#[path = {:?}]\nmod testdir;\ninclude!({:?});\n",
+            analyzed_slow_tests.to_string_lossy().into_owned(),
             slow_tests.join("cli.rs").to_string_lossy().into_owned(),
             slow_tests
                 .join("flycheck.rs")
@@ -588,17 +568,6 @@ fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<PathBuf, Box<dyn Error>
             body_rs.to_string_lossy().into_owned(),
         ),
     )?;
+    println!("cargo:rerun-if-changed={}", analyzed_slow_tests.display());
     Ok(wrapper_rs)
-}
-
-fn replace_once(
-    source: &mut String,
-    needle: &str,
-    replacement: &str,
-) -> Result<(), Box<dyn Error>> {
-    let Some(index) = source.find(needle) else {
-        return Err(format!("could not find source fragment:\n{needle}").into());
-    };
-    source.replace_range(index..index + needle.len(), replacement);
-    Ok(())
 }

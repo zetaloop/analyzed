@@ -133,6 +133,29 @@ pub fn analyzed_load_workspace_change(
     })
 }
 
+pub(crate) fn load_crate_graph_into_db(
+    crate_graph: CrateGraphBuilder,
+    proc_macros: ProcMacrosBuilder,
+    source_root_config: SourceRootConfig,
+    vfs: &mut vfs::Vfs,
+    receiver: &Receiver<vfs::loader::Message>,
+    db: &mut RootDatabase,
+) {
+    let mut file_id_map = FxHashMap::default();
+    let mut allocate_file_id = |file_id| file_id;
+    let (analysis_change, _, _) = analyzed_crate_graph_change(
+        crate_graph,
+        proc_macros,
+        source_root_config,
+        vfs,
+        receiver,
+        &mut file_id_map,
+        &mut allocate_file_id,
+    );
+    db.enable_proc_attr_macros();
+    db.apply_change(analysis_change);
+}
+
 pub(crate) fn analyzed_crate_graph_change(
     crate_graph: CrateGraphBuilder,
     proc_macros: ProcMacrosBuilder,
