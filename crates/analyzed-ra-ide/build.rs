@@ -1,6 +1,11 @@
 use analyzed_bridge as build_support;
 
-use std::{error::Error, fs, path::Path};
+use std::{
+    env,
+    error::Error,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use analyzed_bridge::replace_once;
 
@@ -19,11 +24,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn patch_ide_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(lib_rs)?;
 
+    let analyzed = owned_source_path("analyzed.rs");
     replace_once(
         &mut source,
-        "    /// Returns a snapshot of the current state, which you can query for\n    /// semantic information.\n    pub fn analysis(&self) -> Analysis {\n        Analysis { db: self.db.clone() }\n    }\n",
-        "    /// Returns a snapshot of the current state, which you can query for\n    /// semantic information.\n    pub fn analysis(&self) -> Analysis {\n        Analysis { db: self.db.clone() }\n    }\n\n    pub fn analyzed_analysis_with_visible_files(\n        &self,\n        visible_files: std::sync::Arc<rustc_hash::FxHashSet<FileId>>,\n    ) -> Analysis {\n        Analysis { db: self.db.clone().analyzed_with_visible_files(visible_files) }\n    }\n",
+        "mod annotations;\n",
+        &format!(
+            "#[path = {:?}]\nmod analyzed;\n\nmod annotations;\n",
+            analyzed.to_string_lossy().into_owned()
+        ),
     )?;
+    println!("cargo:rerun-if-changed={}", analyzed.display());
 
     fs::write(lib_rs, source)?;
     Ok(())
@@ -70,4 +80,10 @@ fn patch_skip_slow_tests(tests_rs: &Path) -> Result<(), Box<dyn Error>> {
 
     fs::write(tests_rs, source)?;
     Ok(())
+}
+
+fn owned_source_path(file_name: &str) -> PathBuf {
+    PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"))
+        .join("src")
+        .join(file_name)
 }

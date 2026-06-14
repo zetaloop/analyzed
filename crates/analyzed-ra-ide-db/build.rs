@@ -1,6 +1,11 @@
 use analyzed_bridge as build_support;
 
-use std::{error::Error, fs, path::Path};
+use std::{
+    env,
+    error::Error,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use analyzed_bridge::replace_once;
 
@@ -20,6 +25,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(lib_rs)?;
 
+    let analyzed = owned_source_path("analyzed.rs");
+    replace_once(
+        &mut source,
+        "pub use span::{self, FileId};\n",
+        &format!(
+            "pub use span::{{self, FileId}};\n\n#[path = {:?}]\nmod analyzed;\n",
+            analyzed.to_string_lossy().into_owned()
+        ),
+    )?;
+    println!("cargo:rerun-if-changed={}", analyzed.display());
     replace_once(
         &mut source,
         "    crates_map: Arc<CratesMap>,\n    nonce: Nonce,\n",
@@ -34,11 +49,6 @@ fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
         &mut source,
         "            files: Default::default(),\n            crates_map: Default::default(),\n            nonce: Nonce::new(),\n",
         "            files: Default::default(),\n            crates_map: Default::default(),\n            analyzed_visible_files: None,\n            nonce: Nonce::new(),\n",
-    )?;
-    replace_once(
-        &mut source,
-        "    pub fn enable_proc_attr_macros(&mut self) {\n",
-        "    pub fn analyzed_with_visible_files(\n        mut self,\n        visible_files: std::sync::Arc<rustc_hash::FxHashSet<vfs::FileId>>,\n    ) -> RootDatabase {\n        self.analyzed_visible_files = Some(visible_files);\n        self\n    }\n\n    pub fn analyzed_is_file_visible(&self, file_id: vfs::FileId) -> bool {\n        self.analyzed_visible_files\n            .as_ref()\n            .is_none_or(|visible_files| visible_files.contains(&file_id))\n    }\n\n    pub fn analyzed_is_crate_visible(&self, krate: base_db::Crate) -> bool {\n        self.analyzed_is_file_visible(krate.data(self).root_file_id)\n    }\n\n    pub fn analyzed_is_hir_crate_visible(&self, krate: hir::Crate) -> bool {\n        self.analyzed_is_file_visible(krate.root_file(self))\n    }\n\n    pub fn analyzed_visible_base_crates(\n        &self,\n        crates: impl IntoIterator<Item = base_db::Crate>,\n    ) -> Vec<base_db::Crate> {\n        crates.into_iter().filter(|&krate| self.analyzed_is_crate_visible(krate)).collect()\n    }\n\n    pub fn analyzed_visible_hir_crates(\n        &self,\n        crates: impl IntoIterator<Item = hir::Crate>,\n    ) -> Vec<hir::Crate> {\n        crates.into_iter().filter(|&krate| self.analyzed_is_hir_crate_visible(krate)).collect()\n    }\n\n    pub fn enable_proc_attr_macros(&mut self) {\n",
     )?;
     fs::write(lib_rs, source)?;
     Ok(())
@@ -88,7 +98,7 @@ fn patch_symbol_index_source(symbol_index_rs: &Path) -> Result<(), Box<dyn Error
     replace_once(
         &mut source,
         "                    if non_type_for_type_only_query || !self.matches_assoc_mode(symbol.is_assoc) {\n                        continue;\n                    }\n",
-        "                    if non_type_for_type_only_query || !self.matches_assoc_mode(symbol.is_assoc) {\n                        continue;\n                    }\n                    let file_id = symbol.loc.hir_file_id.original_file(db).file_id(db);\n                    if !db.analyzed_is_file_visible(file_id) {\n                        continue;\n                    }\n",
+        "                    if non_type_for_type_only_query || !self.matches_assoc_mode(symbol.is_assoc) {\n                        continue;\n                    }\n                    if !crate::analyzed::is_symbol_visible(db, symbol) {\n                        continue;\n                    }\n",
     )?;
 
     fs::write(symbol_index_rs, source)?;
@@ -115,4 +125,10 @@ fn patch_node_ext_source(node_ext_rs: &Path) -> Result<(), Box<dyn Error>> {
 
     fs::write(node_ext_rs, source)?;
     Ok(())
+}
+
+fn owned_source_path(file_name: &str) -> PathBuf {
+    PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"))
+        .join("src")
+        .join(file_name)
 }
