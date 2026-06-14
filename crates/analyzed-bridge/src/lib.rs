@@ -265,6 +265,98 @@ pub fn replace_once(
     Ok(())
 }
 
+pub fn widen_visibility(
+    source: &mut String,
+    signature: &str,
+    visibility: &str,
+) -> Result<(), Box<dyn Error>> {
+    replace_once(source, signature, &format!("{visibility} {signature}"))
+}
+
+pub fn rename_with_prefix(
+    source: &mut String,
+    signature: &str,
+    name: &str,
+    prefix: &str,
+) -> Result<String, Box<dyn Error>> {
+    let replacement = replace_identifier(signature, name, &format!("{prefix}{name}"))?;
+    replace_once(source, signature, &replacement)?;
+    Ok(replacement)
+}
+
+pub fn allow_dead_code(source: &mut String, signature: &str) -> Result<(), Box<dyn Error>> {
+    replace_once(
+        source,
+        signature,
+        &format!("#[allow(dead_code)]\n{signature}"),
+    )
+}
+
+pub fn inject_use(source: &mut String, path: &str) -> Result<(), Box<dyn Error>> {
+    let statement = format!("use {path};\n");
+    if source.contains(&statement) {
+        return Err(format!("source already contains `{}`", statement.trim_end()).into());
+    }
+
+    let index =
+        first_use_index(source).unwrap_or_else(|| insertion_index_after_inner_attrs(source));
+    source.insert_str(index, &statement);
+    Ok(())
+}
+
+fn replace_identifier(
+    source: &str,
+    name: &str,
+    replacement: &str,
+) -> Result<String, Box<dyn Error>> {
+    let mut offset = 0;
+    while let Some(index) = source[offset..].find(name).map(|index| offset + index) {
+        let end = index + name.len();
+        if is_identifier_boundary(source, index, end) {
+            let mut source = source.to_owned();
+            source.replace_range(index..end, replacement);
+            return Ok(source);
+        }
+        offset = end;
+    }
+
+    Err(format!("could not find identifier `{name}` in source fragment:\n{source}").into())
+}
+
+fn is_identifier_boundary(source: &str, start: usize, end: usize) -> bool {
+    let before = source[..start].chars().next_back();
+    let after = source[end..].chars().next();
+
+    before.is_none_or(|before| !is_identifier_char(before))
+        && after.is_none_or(|after| !is_identifier_char(after))
+}
+
+fn is_identifier_char(value: char) -> bool {
+    value == '_' || value.is_ascii_alphanumeric()
+}
+
+fn first_use_index(source: &str) -> Option<usize> {
+    let mut index = 0;
+    for line in source.split_inclusive('\n') {
+        if line.starts_with("use ") || line.starts_with("pub use ") {
+            return Some(index);
+        }
+        index += line.len();
+    }
+    None
+}
+
+fn insertion_index_after_inner_attrs(source: &str) -> usize {
+    let mut index = 0;
+    for line in source.split_inclusive('\n') {
+        if !(line.starts_with("#![") || line.starts_with("//!")) {
+            return index;
+        }
+        index += line.len();
+    }
+    index
+}
+
 pub fn workspace_root() -> PathBuf {
     PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"))
         .join("../..")
@@ -276,4 +368,49 @@ fn package_dir(package_name: &str, package: &LockedPackage) -> String {
 
 fn archive_name(package_name: &str, package: &LockedPackage) -> String {
     format!("{}.crate", package_dir(package_name, package))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn widens_visibility() {
+        let mut source = String::from("fn run_flycheck() {}\n");
+
+        widen_visibility(&mut source, "fn run_flycheck()", "pub(crate)").unwrap();
+
+        assert_eq!(source, "pub(crate) fn run_flycheck() {}\n");
+    }
+
+    #[test]
+    fn renames_with_prefix() {
+        let mut source = String::from("fn handle() {}\nfn handle_inner() {}\n");
+
+        let renamed = rename_with_prefix(&mut source, "fn handle()", "handle", "_").unwrap();
+
+        assert_eq!(renamed, "fn _handle()");
+        assert_eq!(source, "fn _handle() {}\nfn handle_inner() {}\n");
+    }
+
+    #[test]
+    fn adds_dead_code_allow() {
+        let mut source = String::from("fn old_handle() {}\n");
+
+        allow_dead_code(&mut source, "fn old_handle()").unwrap();
+
+        assert_eq!(source, "#[allow(dead_code)]\nfn old_handle() {}\n");
+    }
+
+    #[test]
+    fn injects_use_before_existing_imports() {
+        let mut source = String::from("#![allow(clippy::all)]\n\nuse std::path::Path;\n");
+
+        inject_use(&mut source, "crate::patched::run_flycheck").unwrap();
+
+        assert_eq!(
+            source,
+            "#![allow(clippy::all)]\n\nuse crate::patched::run_flycheck;\nuse std::path::Path;\n"
+        );
+    }
 }
