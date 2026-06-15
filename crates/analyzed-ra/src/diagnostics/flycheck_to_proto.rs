@@ -83,6 +83,7 @@ fn resolve_path(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn test_global_state(
     sender: crossbeam_channel::Sender<lsp_server::Message>,
     workspace_root: AbsPathBuf,

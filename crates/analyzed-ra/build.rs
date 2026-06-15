@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let generated_src = generated.join("src");
     patch_config_source(&generated_src.join("config.rs"))?;
     patch_discover_source(&generated_src.join("discover.rs"))?;
+    patch_reload_source(&generated_src.join("reload.rs"))?;
     patch_flycheck_to_proto_source(&generated_src.join("diagnostics/flycheck_to_proto.rs"))?;
     patch_notification_source(&generated_src.join("handlers/notification.rs"))?;
     patch_dispatch_source(&generated_src.join("handlers/dispatch.rs"))?;
@@ -235,6 +236,7 @@ fn table_keys(table: &Table) -> Vec<String> {
 
 fn write_analyzed_root_module(root_rs: &Path, lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let analyzed_bridge = owned_source_path("analyzed_bridge.rs");
+    let analyzed_reload = owned_source_path("reload.rs");
     let analyzed_flycheck_to_proto = owned_source_path("diagnostics/flycheck_to_proto.rs");
     let mut upstream_root = fs::read_to_string(lib_rs)?;
     use_owned_module(
@@ -247,7 +249,6 @@ fn write_analyzed_root_module(root_rs: &Path, lib_rs: &Path) -> Result<(), Box<d
         "main_loop",
         owned_source_path("main_loop.rs"),
     )?;
-    use_owned_module(&mut upstream_root, "reload", owned_source_path("reload.rs"))?;
     use_owned_handlers_module(
         &mut upstream_root,
         "analyzed_dispatch",
@@ -266,6 +267,9 @@ pub mod analyzed_bridge;
 #[path = {:?}]
 pub(crate) mod analyzed_flycheck_to_proto;
 
+#[path = {:?}]
+pub(crate) mod analyzed_reload;
+
 {upstream_root}
 
 pub use analyzed_bridge::{{
@@ -283,7 +287,8 @@ pub use analyzed_bridge::{{
 }};
 "#,
         analyzed_bridge.to_string_lossy().into_owned(),
-        analyzed_flycheck_to_proto.to_string_lossy().into_owned()
+        analyzed_flycheck_to_proto.to_string_lossy().into_owned(),
+        analyzed_reload.to_string_lossy().into_owned()
     );
     fs::write(root_rs, source)?;
     println!("cargo:rerun-if-changed={}", analyzed_bridge.display());
@@ -291,6 +296,7 @@ pub use analyzed_bridge::{{
         "cargo:rerun-if-changed={}",
         analyzed_flycheck_to_proto.display()
     );
+    println!("cargo:rerun-if-changed={}", analyzed_reload.display());
 
     Ok(())
 }
@@ -361,6 +367,45 @@ fn patch_discover_source(discover_rs: &Path) -> Result<(), Box<dyn Error>> {
         "",
     )?;
     fs::write(discover_rs, source)?;
+    Ok(())
+}
+
+fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(reload_rs)?;
+
+    for name in [
+        "update_configuration",
+        "fetch_workspaces",
+        "fetch_build_data",
+        "fetch_proc_macros",
+        "recreate_crate_graph",
+    ] {
+        let replacement = format!("_{name}");
+        build_support::rename_function(&mut source, name, &replacement)?;
+        build_support::allow_dead_code_for_function(&mut source, &replacement)?;
+    }
+
+    build_support::widen_function_visibility(&mut source, "reload_flycheck", "pub(crate)")?;
+
+    build_support::add_record_pattern_rest(
+        &mut source,
+        "switch_workspaces",
+        "FetchWorkspaceResponse",
+    )?;
+    build_support::rename_method_calls_in_function(
+        &mut source,
+        "switch_workspaces",
+        "check_workspaces_msrv",
+        "analyzed_install_shared_and_check_msrv",
+    )?;
+    build_support::rename_last_method_call_in_function(
+        &mut source,
+        "switch_workspaces",
+        "recreate_crate_graph",
+        "analyzed_reload_config_then_recreate_crate_graph",
+    )?;
+
+    fs::write(reload_rs, source)?;
     Ok(())
 }
 

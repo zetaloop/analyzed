@@ -9,10 +9,10 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use hir::ChangeWithProcMacros;
-use ide::{Analysis, Cancellable, FileId, SourceRootId};
+use ide::{Analysis, AnalysisHost, Cancellable, FileId, SourceRootId};
 use ide_db::{
     MiniCore,
-    base_db::{Crate, ProcMacroPaths},
+    base_db::{Crate, ProcMacroPaths, SourceDatabase, salsa::Revision},
 };
 use load_cargo::SourceRootConfig;
 use lsp_types::{SemanticTokens, Url};
@@ -20,6 +20,7 @@ use parking_lot::{Mutex, RwLock};
 use proc_macro_api::ProcMacroClient;
 use project_model::{ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, WorkspaceBuildScripts};
 use rustc_hash::{FxHashMap, FxHashSet};
+use stdx::thread;
 use tracing::{Level, span};
 use triomphe::Arc;
 use vfs::{AbsPathBuf, AnchoredPathBuf, VfsPath};
@@ -81,9 +82,12 @@ pub(crate) struct GlobalState {
 
     pub(crate) task_pool: Handle<TaskPool<Task>, Receiver<Task>>,
     pub(crate) fmt_pool: Handle<TaskPool<Task>, Receiver<Task>>,
+    #[allow(dead_code)]
+    pub(crate) cancellation_pool: thread::Pool,
 
     pub(crate) config: Arc<Config>,
     pub(crate) config_errors: Option<ConfigErrors>,
+    pub(crate) analysis_host: AnalysisHost,
     pub(crate) analyzed_provider: crate::analyzed_bridge::SharedAnalyzerProvider,
     pub(crate) analyzed_shared: crate::analyzed_bridge::SharedAnalyzerRuntime,
     pub(crate) diagnostics: DiagnosticCollection,
@@ -188,6 +192,8 @@ pub(crate) struct GlobalState {
     pub(crate) incomplete_crate_graph: bool,
 
     pub(crate) minicore: MiniCoreRustAnalyzerInternalOnly,
+    #[allow(dead_code)]
+    pub(crate) last_gc_revision: Revision,
 }
 
 // FIXME: This should move to the VFS once the rewrite is done.
@@ -240,10 +246,17 @@ impl GlobalState {
             let handle = TaskPool::new_with_threads(sender, 1);
             Handle { handle, receiver }
         };
+        let cancellation_pool = thread::Pool::new(1);
         let deferred_task_queue = {
             let (sender, receiver) = unbounded();
             DeferredTaskQueue { sender, receiver }
         };
+
+        let mut analysis_host = AnalysisHost::new(config.lru_parse_query_capacity());
+        if let Some(capacities) = config.lru_query_capacities_config() {
+            analysis_host.update_lru_capacities(capacities);
+        }
+        let last_gc_revision = analysis_host.raw_database().nonce_and_revision().1;
 
         let (flycheck_sender, flycheck_receiver) = unbounded();
         let (test_run_sender, test_run_receiver) = unbounded();
@@ -255,8 +268,10 @@ impl GlobalState {
             req_queue: ReqQueue::default(),
             task_pool,
             fmt_pool,
+            cancellation_pool,
             loader,
             config: Arc::new(config.clone()),
+            analysis_host,
             analyzed_provider,
             analyzed_shared,
             diagnostics: Default::default(),
@@ -314,6 +329,7 @@ impl GlobalState {
             incomplete_crate_graph: false,
 
             minicore: MiniCoreRustAnalyzerInternalOnly::default(),
+            last_gc_revision,
         };
         // Apply any required database inputs from the config.
         this.update_configuration(config);

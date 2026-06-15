@@ -7,6 +7,10 @@ use std::{
 };
 
 use flate2::read::GzDecoder;
+use ra_ap_syntax::{
+    AstNode, Edition, SourceFile, SyntaxNode,
+    ast::{self, HasName, HasVisibility},
+};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug)]
@@ -302,6 +306,169 @@ pub fn inject_use(source: &mut String, path: &str) -> Result<(), Box<dyn Error>>
         first_use_index(source).unwrap_or_else(|| insertion_index_after_inner_attrs(source));
     source.insert_str(index, &statement);
     Ok(())
+}
+
+pub fn rename_function(
+    source: &mut String,
+    name: &str,
+    replacement: &str,
+) -> Result<(), Box<dyn Error>> {
+    let function = find_function(source, name)?;
+    let name = function.name().ok_or("function has no name")?;
+    replace_text_range(source, name.syntax().text_range(), replacement);
+    Ok(())
+}
+
+pub fn allow_dead_code_for_function(source: &mut String, name: &str) -> Result<(), Box<dyn Error>> {
+    let function = find_function(source, name)?;
+    let start = text_offset(function.syntax().text_range().start());
+    let indent = line_indent(source, start);
+    source.insert_str(start, &format!("{indent}#[allow(dead_code)]\n"));
+    Ok(())
+}
+
+pub fn widen_function_visibility(
+    source: &mut String,
+    name: &str,
+    visibility: &str,
+) -> Result<(), Box<dyn Error>> {
+    let function = find_function(source, name)?;
+    if let Some(existing) = function.visibility() {
+        replace_text_range(source, existing.syntax().text_range(), visibility);
+    } else {
+        let token = function.fn_token().ok_or("function has no fn token")?;
+        let start = text_offset(token.text_range().start());
+        source.insert_str(start, &format!("{visibility} "));
+    }
+    Ok(())
+}
+
+pub fn rename_method_calls_in_function(
+    source: &mut String,
+    function: &str,
+    method: &str,
+    replacement: &str,
+) -> Result<usize, Box<dyn Error>> {
+    let ranges = method_call_name_ranges(source, function, method)?;
+    let count = ranges.len();
+    for range in ranges.into_iter().rev() {
+        source.replace_range(range, replacement);
+    }
+    Ok(count)
+}
+
+pub fn rename_last_method_call_in_function(
+    source: &mut String,
+    function: &str,
+    method: &str,
+    replacement: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut ranges = method_call_name_ranges(source, function, method)?;
+    let Some(range) = ranges.pop() else {
+        return Err(format!("function `{function}` has no `{method}` method call").into());
+    };
+    source.replace_range(range, replacement);
+    Ok(())
+}
+
+pub fn add_record_pattern_rest(
+    source: &mut String,
+    function: &str,
+    path_tail: &str,
+) -> Result<(), Box<dyn Error>> {
+    let function = find_function(source, function)?;
+    for node in function.syntax().descendants() {
+        let Some(record) = ast::RecordPat::cast(node) else {
+            continue;
+        };
+        let Some(path) = record.path() else {
+            continue;
+        };
+        if !path.syntax().text().to_string().ends_with(path_tail) {
+            continue;
+        }
+        let Some(fields) = record.record_pat_field_list() else {
+            continue;
+        };
+        if fields.rest_pat().is_some() {
+            return Ok(());
+        }
+        let token = fields
+            .r_curly_token()
+            .ok_or("record pattern has no closing brace")?;
+        let start = text_offset(token.text_range().start());
+        source.insert_str(start, ", ..");
+        return Ok(());
+    }
+    Err(format!(
+        "function `{}` has no `{}` record pattern",
+        function
+            .name()
+            .map(|it| it.text().to_string())
+            .unwrap_or_default(),
+        path_tail
+    )
+    .into())
+}
+
+fn find_function(source: &str, name: &str) -> Result<ast::Fn, Box<dyn Error>> {
+    parse_source(source)?
+        .descendants()
+        .filter_map(ast::Fn::cast)
+        .find(|function| function.name().is_some_and(|it| it.text() == name))
+        .ok_or_else(|| format!("could not find function `{name}`").into())
+}
+
+fn method_call_name_ranges(
+    source: &str,
+    function: &str,
+    method: &str,
+) -> Result<Vec<std::ops::Range<usize>>, Box<dyn Error>> {
+    let function = find_function(source, function)?;
+    let ranges = function
+        .syntax()
+        .descendants()
+        .filter_map(ast::MethodCallExpr::cast)
+        .filter_map(|call| call.name_ref())
+        .filter(|name| name.text() == method)
+        .map(|name| text_range(name.syntax().text_range()))
+        .collect::<Vec<_>>();
+    if ranges.is_empty() {
+        Err(format!("function `{function}` has no `{method}` method call").into())
+    } else {
+        Ok(ranges)
+    }
+}
+
+fn parse_source(source: &str) -> Result<SyntaxNode, Box<dyn Error>> {
+    let parsed = SourceFile::parse(source, Edition::CURRENT);
+    let errors = parsed.errors();
+    if !errors.is_empty() {
+        return Err(format!("could not parse Rust source: {errors:?}").into());
+    }
+    Ok(parsed.syntax_node())
+}
+
+fn replace_text_range(source: &mut String, range: ra_ap_syntax::TextRange, replacement: &str) {
+    source.replace_range(text_range(range), replacement);
+}
+
+fn text_range(range: ra_ap_syntax::TextRange) -> std::ops::Range<usize> {
+    text_offset(range.start())..text_offset(range.end())
+}
+
+fn text_offset(size: ra_ap_syntax::TextSize) -> usize {
+    u32::from(size) as usize
+}
+
+fn line_indent(source: &str, offset: usize) -> &str {
+    let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
+    let indent_len = source[line_start..offset]
+        .chars()
+        .take_while(|value| value.is_whitespace())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    &source[line_start..line_start + indent_len]
 }
 
 fn replace_identifier(

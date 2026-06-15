@@ -39,6 +39,7 @@ name = "analyzed-bridge"
 version = "0.2.0"
 dependencies = [
  "flate2",
+ "ra_ap_syntax",
  "sha2",
  "tar",
 ]

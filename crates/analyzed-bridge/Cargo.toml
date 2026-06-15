@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 flate2 = "1.1.5"
+ra_ap_syntax = "=0.0.334"
 sha2 = "0.10.9"
 tar = "0.4.44"

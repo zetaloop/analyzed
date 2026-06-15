@@ -21,7 +21,9 @@ use crate::{
     diagnostics::{DiagnosticsGeneration, NativeDiagnosticsFetchKind, fetch_native_diagnostics},
     discover::{DiscoverArgument, DiscoverCommand, DiscoverProjectMessage},
     flycheck::{self, ClearDiagnosticsKind, ClearScope, FlycheckMessage},
-    global_state::{FetchWorkspaceRequest, FetchWorkspaceResponse, GlobalState},
+    global_state::{
+        FetchBuildDataResponse, FetchWorkspaceRequest, FetchWorkspaceResponse, GlobalState,
+    },
     handlers::{
         dispatch::{NotificationDispatcher, RequestDispatcher},
         request::empty_diagnostic_report,
@@ -31,7 +33,7 @@ use crate::{
         utils::{Progress, notification_is},
     },
     lsp_ext,
-    reload::ProjectWorkspaceProgress,
+    reload::{BuildDataProgress, ProcMacroProgress, ProjectWorkspaceProgress},
     test_runner::{CargoTestMessage, CargoTestOutput, TestState},
 };
 
@@ -116,6 +118,8 @@ pub(crate) enum Task {
     DiscoverTest(lsp_ext::DiscoverTestResults),
     PrimeCaches(PrimeCachesProgress),
     FetchWorkspace(ProjectWorkspaceProgress),
+    FetchBuildData(BuildDataProgress),
+    LoadProcMacros(ProcMacroProgress),
     AnalyzedFetchWorkspace(FetchWorkspaceResponse),
     AnalyzedRunFlycheck(VfsPath),
     // FIXME: Remove this in favor of a more general QueuedTask, see `handle_did_save_text_document`
@@ -124,6 +128,8 @@ pub(crate) enum Task {
 
 #[derive(Debug)]
 pub(crate) enum DiscoverProjectParam {
+    #[allow(dead_code)]
+    Buildfile(AbsPathBuf),
     Path(AbsPathBuf),
 }
 
@@ -761,8 +767,27 @@ impl GlobalState {
                 }
                 PrimeCachesProgress::End { .. } => prime_caches_progress.push(progress),
             },
-            Task::FetchWorkspace(ProjectWorkspaceProgress::Begin) => {
-                self.report_progress("Fetching", Progress::Begin, None, None, None);
+            Task::FetchWorkspace(progress) => {
+                let (state, msg) = match progress {
+                    ProjectWorkspaceProgress::Begin => (Progress::Begin, None),
+                    ProjectWorkspaceProgress::Report(msg) => (Progress::Report, Some(msg)),
+                    ProjectWorkspaceProgress::End(workspaces, force_crate_graph_reload) => {
+                        let resp = FetchWorkspaceResponse {
+                            workspaces,
+                            force_crate_graph_reload,
+                            analyzed_shared: self.analyzed_shared.clone(),
+                        };
+                        self.fetch_workspaces_queue.op_completed(resp);
+                        if let Err(e) = self.fetch_workspace_error() {
+                            error!("FetchWorkspaceError: {e}");
+                        }
+                        self.wants_to_switch = Some("fetched workspace".to_owned());
+                        self.diagnostics.clear_check_all();
+                        (Progress::End, None)
+                    }
+                };
+
+                self.report_progress("Fetching", state, msg, None, None);
             }
             Task::AnalyzedFetchWorkspace(resp) => {
                 self.fetch_workspaces_queue.op_completed(resp);
@@ -780,11 +805,15 @@ impl GlobalState {
                     let command = cfg.command.clone();
                     let discover = DiscoverCommand::new(self.discover_sender.clone(), command);
 
-                    let DiscoverProjectParam::Path(discover_path) = &arg;
+                    let DiscoverProjectParam::Path(discover_path) = &arg else {
+                        return;
+                    };
                     let current_dir =
                         self.config.workspace_root_for(discover_path.as_path()).clone();
 
-                    let DiscoverProjectParam::Path(path) = arg;
+                    let DiscoverProjectParam::Path(path) = arg else {
+                        return;
+                    };
                     let arg = DiscoverArgument::Path(path);
 
                     match discover.spawn(arg, current_dir.as_ref()) {
@@ -802,6 +831,45 @@ impl GlobalState {
                             false,
                         ),
                     }
+                }
+            }
+            Task::FetchBuildData(progress) => {
+                let (state, msg) = match progress {
+                    BuildDataProgress::Begin => (Some(Progress::Begin), None),
+                    BuildDataProgress::Report(msg) => (Some(Progress::Report), Some(msg)),
+                    BuildDataProgress::End((workspaces, build_scripts)) => {
+                        let resp = FetchBuildDataResponse { workspaces, build_scripts };
+                        self.fetch_build_data_queue.op_completed(resp);
+
+                        if let Err(e) = self.fetch_build_data_error() {
+                            error!("FetchBuildDataError: {e}");
+                        }
+
+                        if self.wants_to_switch.is_none() {
+                            self.wants_to_switch = Some("fetched build data".to_owned());
+                        }
+                        (Some(Progress::End), None)
+                    }
+                };
+
+                if let Some(state) = state {
+                    self.report_progress("Building compile-time-deps", state, msg, None, None);
+                }
+            }
+            Task::LoadProcMacros(progress) => {
+                let (state, msg) = match progress {
+                    ProcMacroProgress::Begin => (Some(Progress::Begin), None),
+                    ProcMacroProgress::Report(msg) => (Some(Progress::Report), Some(msg)),
+                    ProcMacroProgress::End(change) => {
+                        self.fetch_proc_macros_queue.op_completed(true);
+                        self.analysis_host.apply_change(change);
+                        self.finish_loading_crate_graph();
+                        (Some(Progress::End), None)
+                    }
+                };
+
+                if let Some(state) = state {
+                    self.report_progress("Loading proc-macros", state, msg, None, None);
                 }
             }
             Task::BuildDepsHaveChanged => self.build_deps_changed = true,
