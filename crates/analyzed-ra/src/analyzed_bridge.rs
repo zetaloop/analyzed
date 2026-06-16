@@ -1019,10 +1019,6 @@ impl SharedAnalyzerRuntime {
             != generation
     }
 
-    pub(crate) fn edit_generation(&self) -> u64 {
-        self.session.edit_generation.load(Ordering::SeqCst)
-    }
-
     fn workspace_indexes(&self) -> &[usize] {
         &self.session.workspace_indexes
     }

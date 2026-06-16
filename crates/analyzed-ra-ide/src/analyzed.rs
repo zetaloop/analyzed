@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ide_db::FileId;
+use ide_db::{FileId, RootDatabase, base_db::Crate, base_db::all_crates};
 use rustc_hash::FxHashSet;
 
 use crate::{Analysis, AnalysisHost};
@@ -14,8 +14,6 @@ impl AnalysisHost {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn skip_slow_tests() -> bool {
-    (std::env::var("CI").is_err() && std::env::var("RUN_SLOW_TESTS").is_err())
-        || std::env::var("SKIP_SLOW_TESTS").is_ok()
+pub(crate) fn visible_crates_for_graph(db: &RootDatabase) -> Vec<Crate> {
+    db.analyzed_visible_base_crates(all_crates(db).iter().copied())
 }

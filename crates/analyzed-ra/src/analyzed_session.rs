@@ -30,7 +30,7 @@ impl RustAnalyzerSession {
         analyzed_workspaces: Vec<project_model::ProjectWorkspace>,
     ) -> Self {
         Self {
-            state: crate::global_state::GlobalState::new(
+            state: crate::global_state::GlobalState::new_analyzed(
                 sender,
                 config,
                 provider,
@@ -133,7 +133,7 @@ fn run_shared_state(
             return Ok(());
         }
         state.analyzed_shared.set_busy(true);
-        state.handle_event(event, &inbox);
+        state.handle_event(event);
         let idle =
             state.task_pool.handle.is_empty() && state.fmt_pool.handle.is_empty();
         state.analyzed_shared.set_busy(!idle);
@@ -493,6 +493,162 @@ impl crate::global_state::GlobalState {
                         .any(|key| *key == analyzed_diagnostic_key(diagnostic))
             })
             .collect()
+    }
+
+    pub(crate) fn publish_changed_diagnostics(&mut self, file_id: FileId) {
+        let Some(uri) = self.analyzed_shared.file_id_to_url(file_id) else {
+            return;
+        };
+        let version = crate::lsp::from_proto::vfs_path(&uri)
+            .ok()
+            .and_then(|path| self.mem_docs.get(&path).map(|it| it.version));
+
+        let diagnostics = self
+            .diagnostics
+            .diagnostics_for(file_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let diagnostics = self.analyzed_filter_diagnostics(diagnostics);
+        self.publish_diagnostics(uri, version, diagnostics);
+    }
+
+    pub(crate) fn record_flycheck_diagnostic(
+        &mut self,
+        id: usize,
+        generation: crate::diagnostics::DiagnosticsGeneration,
+        package_id: &Option<crate::flycheck::PackageSpecifier>,
+        diag: crate::diagnostics::flycheck_to_proto::MappedRustDiagnostic,
+    ) {
+        match self.analyzed_base_url_to_file_id(&diag.url) {
+            Ok(Some(file_id)) => self.diagnostics.add_check_diagnostic(
+                id,
+                generation,
+                package_id,
+                file_id,
+                diag.diagnostic,
+                diag.fix,
+            ),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(
+                    "flycheck {id}: File with cargo diagnostic not found in VFS: {err}"
+                );
+            }
+        };
+    }
+
+    pub(crate) fn mark_prime_caches_gc(&mut self) {
+        crate::analyzed_bridge::shared_analyzer_registry().mark_gc_dirty();
+    }
+
+    pub(crate) fn mark_gc_when_idle(&mut self) {
+        if self.task_pool.handle.is_empty() && self.fmt_pool.handle.is_empty() {
+            crate::analyzed_bridge::shared_analyzer_registry().mark_gc_dirty();
+        }
+    }
+
+    pub(crate) fn handle_event(&mut self, event: super::Event) {
+        self._handle_event(event)
+    }
+
+    pub(crate) fn handle_task(
+        &mut self,
+        prime_caches_progress: &mut Vec<super::PrimeCachesProgress>,
+        task: super::Task,
+    ) {
+        match task {
+            super::Task::AnalyzedFetchWorkspace(resp) => {
+                self.fetch_workspaces_queue.op_completed(resp);
+                if let Err(e) = self.fetch_workspace_error() {
+                    tracing::error!("FetchWorkspaceError: {e}");
+                }
+                self.wants_to_switch = Some("fetched workspace".to_owned());
+                self.report_progress(
+                    "Fetching",
+                    crate::lsp::utils::Progress::End,
+                    None,
+                    None,
+                    None,
+                );
+            }
+            super::Task::AnalyzedRunFlycheck(path) => {
+                crate::handlers::notification::run_flycheck(self, path);
+            }
+            _ => {
+                let upstream = UpstreamTask::try_from(task)
+                    .unwrap_or_else(|_| unreachable!("analyzed task variants handled above"));
+                self._handle_task(prime_caches_progress, upstream)
+            }
+        }
+    }
+
+    pub(crate) fn update_diagnostics(&mut self) {
+        let generation = self.diagnostics.next_generation();
+        let subscriptions: std::sync::Arc<[FileId]> = self
+            .analyzed_workspace_file_ids()
+            .into_iter()
+            .collect();
+        self.spawn_native_diagnostics(generation, subscriptions);
+    }
+
+    pub(crate) fn update_tests(&mut self) {
+        if !self.vfs_done {
+            return;
+        }
+        let subscriptions = self.analyzed_workspace_file_ids();
+        self.spawn_discover_tests(subscriptions);
+    }
+
+    fn analyzed_workspace_file_ids(&self) -> Vec<FileId> {
+        let shared = &self.analyzed_shared;
+        let file_ids = self
+            .mem_docs
+            .iter()
+            .filter_map(|path| shared.vfs_path_to_file_id(path).ok().flatten())
+            .collect::<Vec<_>>();
+        let snap = self.snapshot();
+        file_ids
+            .into_iter()
+            .filter(|&file_id| {
+                snap.analysis
+                    .is_library_file(file_id)
+                    .is_ok_and(|is_library| !is_library)
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum UpstreamTask {
+    Response(lsp_server::Response),
+    DiscoverLinkedProjects(super::DiscoverProjectParam),
+    Retry(lsp_server::Request),
+    Diagnostics(super::DiagnosticsTaskKind),
+    DiscoverTest(crate::lsp_ext::DiscoverTestResults),
+    PrimeCaches(super::PrimeCachesProgress),
+    FetchWorkspace(crate::reload::ProjectWorkspaceProgress),
+    FetchBuildData(crate::reload::BuildDataProgress),
+    LoadProcMacros(crate::reload::ProcMacroProgress),
+    BuildDepsHaveChanged,
+}
+
+impl TryFrom<super::Task> for UpstreamTask {
+    type Error = super::Task;
+
+    fn try_from(task: super::Task) -> Result<Self, Self::Error> {
+        Ok(match task {
+            super::Task::Response(it) => UpstreamTask::Response(it),
+            super::Task::DiscoverLinkedProjects(it) => UpstreamTask::DiscoverLinkedProjects(it),
+            super::Task::Retry(it) => UpstreamTask::Retry(it),
+            super::Task::Diagnostics(it) => UpstreamTask::Diagnostics(it),
+            super::Task::DiscoverTest(it) => UpstreamTask::DiscoverTest(it),
+            super::Task::PrimeCaches(it) => UpstreamTask::PrimeCaches(it),
+            super::Task::FetchWorkspace(it) => UpstreamTask::FetchWorkspace(it),
+            super::Task::FetchBuildData(it) => UpstreamTask::FetchBuildData(it),
+            super::Task::LoadProcMacros(it) => UpstreamTask::LoadProcMacros(it),
+            super::Task::BuildDepsHaveChanged => UpstreamTask::BuildDepsHaveChanged,
+            other => return Err(other),
+        })
     }
 }
 

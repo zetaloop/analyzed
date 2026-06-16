@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use base_db::Crate as BaseCrate;
-use hir::{Crate as HirCrate, symbols::FileSymbol};
+use base_db::{Crate as BaseCrate, LocalRoots, source_root_crates};
+use hir::{Crate as HirCrate, Module, symbols::FileSymbol};
+use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use vfs::FileId;
 
@@ -49,3 +50,69 @@ pub(crate) fn is_symbol_visible(db: &RootDatabase, symbol: &FileSymbol<'_>) -> b
     let file_id = symbol.loc.hir_file_id.original_file(db).file_id(db);
     db.analyzed_is_file_visible(file_id)
 }
+
+pub(crate) fn visible_base_crates(db: &RootDatabase) -> Vec<BaseCrate> {
+    db.analyzed_visible_base_crates(base_db::all_crates(db).iter().copied())
+}
+
+pub(crate) fn all_hir_crates(db: &RootDatabase) -> Vec<HirCrate> {
+    db.analyzed_visible_hir_crates(HirCrate::all(db))
+}
+
+pub(crate) fn resolve_path_to_modules(
+    db: &RootDatabase,
+    path_filter: &[String],
+    anchor_to_crate: bool,
+    case_sensitive: bool,
+) -> Vec<Module> {
+    let [first_segment, rest_segments @ ..] = path_filter else {
+        return Vec::new();
+    };
+
+    let names_match = |actual: &str, expected: &str| {
+        if case_sensitive { actual == expected } else { actual.eq_ignore_ascii_case(expected) }
+    };
+
+    let mut candidates = all_hir_crates(db)
+        .into_iter()
+        .filter(|krate| {
+            krate
+                .display_name(db)
+                .is_some_and(|name| names_match(name.crate_name().as_str(), first_segment))
+        })
+        .map(|krate| (krate.root_module(db), krate.origin(db).is_local()))
+        .collect::<Vec<_>>();
+
+    if !anchor_to_crate {
+        for &root in LocalRoots::get(db).roots(db) {
+            for krate in db.analyzed_visible_base_crates(source_root_crates(db, root).iter().copied()) {
+                let root_module = HirCrate::from(krate).root_module(db);
+                candidates.extend(root_module.children(db).into_iter().filter_map(|child| {
+                    let name = child.name(db)?;
+                    names_match(name.as_str(), first_segment).then_some((child, true))
+                }));
+            }
+        }
+    }
+
+    for segment in rest_segments {
+        candidates = candidates
+            .into_iter()
+            .flat_map(|(module, local)| {
+                module
+                    .modules_in_scope(db, !local)
+                    .into_iter()
+                    .filter(|(name, _)| names_match(name.as_str(), segment))
+                    .map(move |(_, module)| (module, local))
+            })
+            .unique()
+            .collect();
+
+        if candidates.is_empty() {
+            break;
+        }
+    }
+
+    candidates.into_iter().map(|(module, _)| module).collect()
+}
+

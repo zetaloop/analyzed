@@ -9,7 +9,7 @@ use std::{
 use flate2::read::GzDecoder;
 use ra_ap_syntax::{
     AstNode, Edition, SourceFile, SyntaxNode,
-    ast::{self, HasName, HasVisibility},
+    ast::{self, HasLoopBody, HasName, HasVisibility},
 };
 use sha2::{Digest, Sha256};
 
@@ -257,47 +257,20 @@ fn checked_archive_path(path: &Path, package_dir: &str) -> Result<PathBuf, Box<d
     }
 }
 
-pub fn replace_once(
-    source: &mut String,
-    needle: &str,
-    replacement: &str,
-) -> Result<(), Box<dyn Error>> {
-    let Some(index) = source.find(needle) else {
-        return Err(format!("could not find source fragment:\n{needle}").into());
-    };
-    source.replace_range(index..index + needle.len(), replacement);
+pub fn inject_use(source: &mut String, path: &str) -> Result<(), Box<dyn Error>> {
+    let statement = format!("use {path};\n");
+    if source.contains(&statement) {
+        return Err(format!("source already contains `{}`", statement.trim_end()).into());
+    }
+
+    let index =
+        first_use_index(source).unwrap_or_else(|| insertion_index_after_inner_attrs(source));
+    source.insert_str(index, &statement);
     Ok(())
 }
 
-pub fn widen_visibility(
-    source: &mut String,
-    signature: &str,
-    visibility: &str,
-) -> Result<(), Box<dyn Error>> {
-    replace_once(source, signature, &format!("{visibility} {signature}"))
-}
-
-pub fn rename_with_prefix(
-    source: &mut String,
-    signature: &str,
-    name: &str,
-    prefix: &str,
-) -> Result<String, Box<dyn Error>> {
-    let replacement = replace_identifier(signature, name, &format!("{prefix}{name}"))?;
-    replace_once(source, signature, &replacement)?;
-    Ok(replacement)
-}
-
-pub fn allow_dead_code(source: &mut String, signature: &str) -> Result<(), Box<dyn Error>> {
-    replace_once(
-        source,
-        signature,
-        &format!("#[allow(dead_code)]\n{signature}"),
-    )
-}
-
-pub fn inject_use(source: &mut String, path: &str) -> Result<(), Box<dyn Error>> {
-    let statement = format!("use {path};\n");
+pub fn inject_pub_use(source: &mut String, path: &str) -> Result<(), Box<dyn Error>> {
+    let statement = format!("pub(crate) use {path};\n");
     if source.contains(&statement) {
         return Err(format!("source already contains `{}`", statement.trim_end()).into());
     }
@@ -343,32 +316,376 @@ pub fn widen_function_visibility(
     Ok(())
 }
 
-pub fn rename_method_calls_in_function(
+pub fn widen_enum_visibility(
+    source: &mut String,
+    name: &str,
+    visibility: &str,
+) -> Result<(), Box<dyn Error>> {
+    let enumeration = parse_source(source)?
+        .descendants()
+        .filter_map(ast::Enum::cast)
+        .find(|item| item.name().is_some_and(|it| it.text() == name))
+        .ok_or_else(|| format!("could not find enum `{name}`"))?;
+    if let Some(vis) = enumeration.visibility() {
+        replace_text_range(source, vis.syntax().text_range(), visibility);
+    } else {
+        let start = text_offset(enumeration.syntax().text_range().start());
+        source.insert_str(start, &format!("{visibility} "));
+    }
+    Ok(())
+}
+
+pub fn rename_path_root_in_function(
     source: &mut String,
     function: &str,
-    method: &str,
+    root: &str,
     replacement: &str,
 ) -> Result<usize, Box<dyn Error>> {
-    let ranges = method_call_name_ranges(source, function, method)?;
+    let function = find_function(source, function)?;
+    let mut ranges = Vec::new();
+    for node in function.syntax().descendants() {
+        let Some(segment) = ast::PathSegment::cast(node) else {
+            continue;
+        };
+        let Some(name) = segment.name_ref() else {
+            continue;
+        };
+        if name.text() != root {
+            continue;
+        }
+        let Some(path) = segment.syntax().parent().and_then(ast::Path::cast) else {
+            continue;
+        };
+        if path.qualifier().is_some() {
+            continue;
+        }
+        ranges.push(name.syntax().text_range());
+    }
     let count = ranges.len();
     for range in ranges.into_iter().rev() {
-        source.replace_range(range, replacement);
+        replace_text_range(source, range, replacement);
     }
     Ok(count)
 }
 
-pub fn rename_last_method_call_in_function(
+pub struct MethodParam<'a> {
+    pub name: &'a str,
+    pub ty: &'a str,
+}
+
+pub struct ExtractedMethod<'a> {
+    pub name: &'a str,
+    pub receiver: Option<&'a str>,
+    pub params: &'a [MethodParam<'a>],
+    pub args: &'a [&'a str],
+}
+
+#[derive(Clone, Copy)]
+pub enum ExtractSelector<'a> {
+    LetBinding(&'a str),
+    ForLoopBinding(&'a str),
+    TopLevelMethodCall(&'a str),
+}
+
+pub enum ExtractRange<'a> {
+    TailToBlockEnd,
+    Body,
+    StatementSequence { len: usize },
+    Initializer { return_ty: &'a str },
+}
+
+pub fn extract_method(
     source: &mut String,
     function: &str,
-    method: &str,
-    replacement: &str,
+    selector: ExtractSelector<'_>,
+    occurrence: usize,
+    range: ExtractRange<'_>,
+    method: ExtractedMethod<'_>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut ranges = method_call_name_ranges(source, function, method)?;
-    let Some(range) = ranges.pop() else {
-        return Err(format!("function `{function}` has no `{method}` method call").into());
+    let function_node = find_function(source, function)?;
+    let function_end = text_offset(function_node.syntax().text_range().end());
+    let function_indent = line_indent(
+        source,
+        text_offset(function_node.syntax().text_range().start()),
+    )
+    .to_owned();
+    let extraction = match range {
+        ExtractRange::TailToBlockEnd => {
+            let ExtractSelector::LetBinding(_) = selector else {
+                return Err("TailToBlockEnd requires a let binding selector".into());
+            };
+            let body = function_node
+                .body()
+                .ok_or_else(|| format!("function `{function}` has no body"))?;
+            let stmt_list = body
+                .stmt_list()
+                .ok_or_else(|| format!("function `{function}` has no statement list"))?;
+            let anchor = find_statement_in_list(&stmt_list, &selector, occurrence)?;
+            let first_extracted_stmt = stmt_list
+                .statements()
+                .find(|statement| {
+                    statement.syntax().text_range().start() > anchor.text_range().end()
+                })
+                .ok_or_else(|| format!("function `{function}` has no statements after anchor"))?;
+            let closing_brace = stmt_list
+                .r_curly_token()
+                .ok_or_else(|| format!("function `{function}` has no closing brace"))?;
+            let range = text_offset(anchor.text_range().end())
+                ..text_offset(closing_brace.text_range().start());
+            Extraction {
+                call_indent: line_indent(
+                    source,
+                    text_offset(first_extracted_stmt.syntax().text_range().start()),
+                )
+                .to_owned(),
+                close_indent: function_indent.clone(),
+                body: source[range.clone()].trim_end().to_owned(),
+                return_ty: None,
+                expression: false,
+                range,
+            }
+        }
+        ExtractRange::Body => {
+            let ExtractSelector::ForLoopBinding(binding) = selector else {
+                return Err("Body requires a for loop selector".into());
+            };
+            let loop_expr = find_for_expr_by_binding(&function_node, binding, occurrence)?;
+            let body = loop_expr
+                .loop_body()
+                .ok_or_else(|| format!("for `{binding}` has no body"))?;
+            let stmt_list = body
+                .stmt_list()
+                .ok_or_else(|| format!("for `{binding}` has no statement list"))?;
+            let first_statement = stmt_list
+                .statements()
+                .next()
+                .ok_or_else(|| format!("for `{binding}` has empty body"))?;
+            let opening_brace = stmt_list
+                .l_curly_token()
+                .ok_or_else(|| format!("for `{binding}` has no opening brace"))?;
+            let closing_brace = stmt_list
+                .r_curly_token()
+                .ok_or_else(|| format!("for `{binding}` has no closing brace"))?;
+            let range = text_offset(opening_brace.text_range().end())
+                ..text_offset(closing_brace.text_range().start());
+            Extraction {
+                call_indent: line_indent(
+                    source,
+                    text_offset(first_statement.syntax().text_range().start()),
+                )
+                .to_owned(),
+                close_indent: line_indent(source, text_offset(closing_brace.text_range().start()))
+                    .to_owned(),
+                body: source[range.clone()].trim_end().to_owned(),
+                return_ty: None,
+                expression: false,
+                range,
+            }
+        }
+        ExtractRange::StatementSequence { len } => {
+            let (stmt_list, statements, index) =
+                find_statement_sequence_start(&function_node, &selector, occurrence)?;
+            let includes_tail_expr = index + len == statements.len() + 1;
+            if index + len > statements.len() && !includes_tail_expr {
+                return Err("statement sequence exceeds statement list".into());
+            }
+            let first_statement = &statements[index];
+            let tail_expr = includes_tail_expr.then(|| stmt_list.tail_expr()).flatten();
+            let end_range = tail_expr
+                .as_ref()
+                .map(|expr| expr.syntax().text_range())
+                .unwrap_or_else(|| statements[index + len - 1].syntax().text_range());
+            let first_start = text_offset(first_statement.syntax().text_range().start());
+            let range = line_start_offset(source, first_start)..text_offset(end_range.end());
+            let call_indent = line_indent(source, first_start).to_owned();
+            let method_body_indent = format!("{function_indent}    ");
+            Extraction {
+                call_indent: call_indent.clone(),
+                close_indent: String::new(),
+                body: normalize_statement_body(
+                    &source[range.clone()],
+                    &call_indent,
+                    &method_body_indent,
+                ),
+                return_ty: None,
+                expression: false,
+                range,
+            }
+        }
+        ExtractRange::Initializer { return_ty } => {
+            let ExtractSelector::LetBinding(_) = selector else {
+                return Err("Initializer requires a let binding selector".into());
+            };
+            let statement = function_node
+                .syntax()
+                .descendants()
+                .filter_map(ast::LetStmt::cast)
+                .filter(|statement| {
+                    let_statement_has_ident_binding(statement, selector_name(selector))
+                })
+                .nth(occurrence)
+                .ok_or_else(|| format!("function `{function}` has no selected let binding"))?;
+            let initializer = statement
+                .initializer()
+                .ok_or_else(|| "selected let binding has no initializer".to_owned())?;
+            let method_body_indent = format!("{function_indent}    ");
+            Extraction {
+                call_indent: String::new(),
+                close_indent: String::new(),
+                body: format!("\n{method_body_indent}{}", initializer.syntax().text()),
+                return_ty: Some(return_ty.to_owned()),
+                expression: true,
+                range: text_range(initializer.syntax().text_range()),
+            }
+        }
     };
-    source.replace_range(range, replacement);
+    let params = method
+        .params
+        .iter()
+        .map(|param| format!("{}: {}", param.name, param.ty))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let params = match (method.receiver, params.is_empty()) {
+        (Some(receiver), true) => receiver.to_owned(),
+        (Some(receiver), false) => format!("{receiver}, {params}"),
+        (None, _) => params,
+    };
+    let args = method.args.join(", ");
+    let replacement = if extraction.expression {
+        format!("self.{}({args})", method.name)
+    } else {
+        format!(
+            "\n{}self.{}({args});\n{}",
+            extraction.call_indent, method.name, extraction.close_indent,
+        )
+    };
+
+    let return_ty = extraction
+        .return_ty
+        .as_deref()
+        .map_or(String::new(), |ty| format!(" -> {ty}"));
+    let extracted = format!(
+        "\n\n{function_indent}fn {}({params}){return_ty} {{{}\n{function_indent}}}",
+        method.name, extraction.body,
+    );
+    source.insert_str(function_end, &extracted);
+    source.replace_range(extraction.range, &replacement);
+    parse_source(source)?;
     Ok(())
+}
+
+struct Extraction {
+    range: std::ops::Range<usize>,
+    body: String,
+    call_indent: String,
+    close_indent: String,
+    return_ty: Option<String>,
+    expression: bool,
+}
+
+fn selector_name<'a>(selector: ExtractSelector<'a>) -> &'a str {
+    match selector {
+        ExtractSelector::LetBinding(name)
+        | ExtractSelector::ForLoopBinding(name)
+        | ExtractSelector::TopLevelMethodCall(name) => name,
+    }
+}
+
+fn let_statement_has_ident_binding(statement: &ast::LetStmt, name: &str) -> bool {
+    pat_is_ident(statement.pat(), name)
+}
+
+fn find_for_expr_by_binding(
+    function: &ast::Fn,
+    binding: &str,
+    occurrence: usize,
+) -> Result<ast::ForExpr, Box<dyn Error>> {
+    function
+        .syntax()
+        .descendants()
+        .filter_map(ast::ForExpr::cast)
+        .filter(|expr| pat_is_ident(expr.pat(), binding))
+        .nth(occurrence)
+        .ok_or_else(|| {
+            format!("function has no for loop binding `{binding}` occurrence {occurrence}").into()
+        })
+}
+
+fn find_statement_in_list(
+    stmt_list: &ast::StmtList,
+    selector: &ExtractSelector<'_>,
+    occurrence: usize,
+) -> Result<SyntaxNode, Box<dyn Error>> {
+    stmt_list
+        .statements()
+        .filter(|statement| statement_matches_selector(statement, selector))
+        .nth(occurrence)
+        .map(|statement| statement.syntax().clone())
+        .ok_or_else(|| format!("could not find statement occurrence {occurrence}").into())
+}
+
+fn find_statement_sequence_start(
+    function: &ast::Fn,
+    selector: &ExtractSelector<'_>,
+    occurrence: usize,
+) -> Result<(ast::StmtList, Vec<ast::Stmt>, usize), Box<dyn Error>> {
+    let mut matches = Vec::new();
+    for stmt_list in function
+        .syntax()
+        .descendants()
+        .filter_map(ast::StmtList::cast)
+    {
+        let statements = stmt_list.statements().collect::<Vec<_>>();
+        for (index, statement) in statements.iter().enumerate() {
+            if statement_matches_selector(statement, selector) {
+                matches.push((stmt_list.clone(), statements.clone(), index));
+            }
+        }
+    }
+    matches
+        .into_iter()
+        .nth(occurrence)
+        .ok_or_else(|| format!("could not find statement occurrence {occurrence}").into())
+}
+
+fn statement_matches_selector(statement: &ast::Stmt, selector: &ExtractSelector<'_>) -> bool {
+    match selector {
+        ExtractSelector::LetBinding(name) => match statement {
+            ast::Stmt::LetStmt(let_statement) => {
+                let_statement_has_ident_binding(let_statement, name)
+            }
+            _ => false,
+        },
+        ExtractSelector::TopLevelMethodCall(method) => match statement {
+            ast::Stmt::ExprStmt(statement) => statement
+                .expr()
+                .and_then(|expr| match expr {
+                    ast::Expr::MethodCallExpr(call) => Some(call),
+                    _ => None,
+                })
+                .is_some_and(|call| call.name_ref().is_some_and(|name| name.text() == *method)),
+            _ => false,
+        },
+        ExtractSelector::ForLoopBinding(_) => false,
+    }
+}
+
+fn line_start_offset(source: &str, offset: usize) -> usize {
+    source[..offset].rfind('\n').map_or(0, |index| index + 1)
+}
+
+fn normalize_statement_body(body: &str, source_indent: &str, target_indent: &str) -> String {
+    let mut normalized = String::new();
+    for line in body.trim_end().lines() {
+        normalized.push('\n');
+        normalized.push_str(target_indent);
+        normalized.push_str(line.strip_prefix(source_indent).unwrap_or(line));
+    }
+    normalized
+}
+
+fn pat_is_ident(pattern: Option<ast::Pat>, name: &str) -> bool {
+    matches!(pattern, Some(ast::Pat::IdentPat(pattern)) if pattern.name().is_some_and(|it| it.text() == name))
 }
 
 pub fn add_record_pattern_rest(
@@ -411,6 +728,323 @@ pub fn add_record_pattern_rest(
     .into())
 }
 
+pub fn append_struct_fields(
+    source: &mut String,
+    struct_name: &str,
+    fields: &str,
+) -> Result<(), Box<dyn Error>> {
+    let structure = parse_source(source)?
+        .descendants()
+        .filter_map(ast::Struct::cast)
+        .find(|item| item.name().is_some_and(|it| it.text() == struct_name))
+        .ok_or_else(|| format!("could not find struct `{struct_name}`"))?;
+    let Some(ast::FieldList::RecordFieldList(fields_list)) = structure.field_list() else {
+        return Err(format!("struct `{struct_name}` has no record field list").into());
+    };
+    let token = fields_list
+        .r_curly_token()
+        .ok_or("record struct has no closing brace")?;
+    let start = text_offset(token.text_range().start());
+    source.insert_str(start, fields);
+    Ok(())
+}
+
+pub fn add_struct_attribute(
+    source: &mut String,
+    struct_name: &str,
+    attribute: &str,
+) -> Result<(), Box<dyn Error>> {
+    let structure = find_struct(source, struct_name)?;
+    let start = text_offset(structure.syntax().text_range().start());
+    let indent = line_indent(source, start);
+    source.insert_str(start, &format!("{indent}{attribute}\n"));
+    Ok(())
+}
+
+pub fn add_function_attribute(
+    source: &mut String,
+    function: &str,
+    attribute: &str,
+) -> Result<(), Box<dyn Error>> {
+    let function = find_function(source, function)?;
+    let start = text_offset(function.syntax().text_range().start());
+    let indent = line_indent(source, start);
+    source.insert_str(start, &format!("{indent}{attribute}\n"));
+    Ok(())
+}
+
+pub fn widen_struct_field_visibility(
+    source: &mut String,
+    struct_name: &str,
+    field_name: &str,
+    visibility: &str,
+) -> Result<(), Box<dyn Error>> {
+    let structure = find_struct(source, struct_name)?;
+    let Some(ast::FieldList::RecordFieldList(fields_list)) = structure.field_list() else {
+        return Err(format!("struct `{struct_name}` has no record field list").into());
+    };
+    for field in fields_list.fields() {
+        let Some(name) = field.name() else {
+            continue;
+        };
+        if name.text() != field_name {
+            continue;
+        }
+        if let Some(existing) = field.visibility() {
+            replace_text_range(source, existing.syntax().text_range(), visibility);
+        } else {
+            let start = text_offset(name.syntax().text_range().start());
+            source.insert_str(start, &format!("{visibility} "));
+        }
+        return Ok(());
+    }
+    Err(format!("struct `{struct_name}` has no `{field_name}` field").into())
+}
+
+pub fn add_struct_field_attribute(
+    source: &mut String,
+    struct_name: &str,
+    field_name: &str,
+    attribute: &str,
+) -> Result<(), Box<dyn Error>> {
+    let structure = find_struct(source, struct_name)?;
+    let Some(ast::FieldList::RecordFieldList(fields_list)) = structure.field_list() else {
+        return Err(format!("struct `{struct_name}` has no record field list").into());
+    };
+    for field in fields_list.fields() {
+        let Some(name) = field.name() else {
+            continue;
+        };
+        if name.text() != field_name {
+            continue;
+        }
+        let start = text_offset(field.syntax().text_range().start());
+        let indent = line_indent(source, start);
+        source.insert_str(start, &format!("{indent}{attribute}\n"));
+        return Ok(());
+    }
+    Err(format!("struct `{struct_name}` has no `{field_name}` field").into())
+}
+
+pub fn append_enum_variants(
+    source: &mut String,
+    enum_name: &str,
+    variants: &str,
+) -> Result<(), Box<dyn Error>> {
+    let enumeration = parse_source(source)?
+        .descendants()
+        .filter_map(ast::Enum::cast)
+        .find(|item| item.name().is_some_and(|it| it.text() == enum_name))
+        .ok_or_else(|| format!("could not find enum `{enum_name}`"))?;
+    let variants_list = enumeration
+        .variant_list()
+        .ok_or("enum has no variant list")?;
+    let token = variants_list
+        .r_curly_token()
+        .ok_or("enum has no closing brace")?;
+    let start = text_offset(token.text_range().start());
+    source.insert_str(start, variants);
+    Ok(())
+}
+
+pub fn add_enum_variant_attribute(
+    source: &mut String,
+    enum_name: &str,
+    variant_name: &str,
+    attribute: &str,
+) -> Result<(), Box<dyn Error>> {
+    let enumeration = parse_source(source)?
+        .descendants()
+        .filter_map(ast::Enum::cast)
+        .find(|item| item.name().is_some_and(|it| it.text() == enum_name))
+        .ok_or_else(|| format!("could not find enum `{enum_name}`"))?;
+    let variants = enumeration
+        .variant_list()
+        .ok_or("enum has no variant list")?;
+    for variant in variants.variants() {
+        let Some(name) = variant.name() else {
+            continue;
+        };
+        if name.text() != variant_name {
+            continue;
+        }
+        let start = text_offset(variant.syntax().text_range().start());
+        let indent = line_indent(source, start);
+        source.insert_str(start, &format!("{indent}{attribute}\n"));
+        return Ok(());
+    }
+    Err(format!("enum `{enum_name}` has no `{variant_name}` variant").into())
+}
+
+pub fn prepend_path_module(source: &mut String, visibility: Option<&str>, name: &str, path: &Path) {
+    let visibility = visibility.map_or(String::new(), |visibility| format!("{visibility} "));
+    source.insert_str(
+        0,
+        &format!(
+            "#[path = {:?}]\n{visibility}mod {name};\n\n",
+            path.to_string_lossy().into_owned()
+        ),
+    );
+}
+
+pub fn retarget_use_tree(
+    source: &mut String,
+    name: &str,
+    path: &str,
+    alias: &str,
+) -> Result<(), Box<dyn Error>> {
+    let file = parse_source(source)?;
+    let matches = file
+        .descendants()
+        .filter_map(ast::UseTree::cast)
+        .filter_map(|tree| {
+            let path = tree.path()?;
+            let segment = path.segment()?;
+            let name_ref = segment.name_ref()?;
+            (name_ref.text() == name && tree.rename().is_none()).then_some(tree)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [tree] => {
+            if tree
+                .syntax()
+                .ancestors()
+                .find_map(ast::UseTreeList::cast)
+                .is_some()
+            {
+                let range = use_tree_removal_range(source, tree)?;
+                source.replace_range(range, "");
+                inject_use(source, &format!("{path} as {alias}"))?;
+            } else {
+                replace_text_range(
+                    source,
+                    tree.syntax().text_range(),
+                    &format!("{path} as {alias}"),
+                );
+            }
+            parse_source(source)?;
+            Ok(())
+        }
+        [] => Err(format!("could not find use tree `{name}`").into()),
+        _ => Err(format!("found multiple use trees `{name}`").into()),
+    }
+}
+
+fn use_tree_removal_range(
+    source: &str,
+    tree: &ast::UseTree,
+) -> Result<std::ops::Range<usize>, Box<dyn Error>> {
+    let start = text_offset(tree.syntax().text_range().start());
+    let end = text_offset(tree.syntax().text_range().end());
+    let bytes = source.as_bytes();
+
+    let mut after = end;
+    while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+        after += 1;
+    }
+    if after < bytes.len() && bytes[after] == b',' {
+        after += 1;
+        while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+            after += 1;
+        }
+        return Ok(start..after);
+    }
+
+    let mut before = start;
+    while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+        before -= 1;
+    }
+    if before > 0 && bytes[before - 1] == b',' {
+        return Ok(before - 1..end);
+    }
+    Ok(start..end)
+}
+
+pub fn append_function_params(
+    source: &mut String,
+    function: &str,
+    params: &str,
+) -> Result<(), Box<dyn Error>> {
+    let function = find_function(source, function)?;
+    let params_list = function
+        .param_list()
+        .ok_or("function has no parameter list")?;
+    let token = params_list
+        .r_paren_token()
+        .ok_or("parameter list has no closing paren")?;
+    let start = text_offset(token.text_range().start());
+    source.insert_str(start, params);
+    Ok(())
+}
+
+pub fn append_record_expr_fields_in_function(
+    source: &mut String,
+    function: &str,
+    path_tail: &str,
+    fields: &str,
+) -> Result<(), Box<dyn Error>> {
+    let function = find_function(source, function)?;
+    for node in function.syntax().descendants() {
+        let Some(record) = ast::RecordExpr::cast(node) else {
+            continue;
+        };
+        let Some(path) = record.path() else {
+            continue;
+        };
+        if !path.syntax().text().to_string().ends_with(path_tail) {
+            continue;
+        }
+        let Some(field_list) = record.record_expr_field_list() else {
+            continue;
+        };
+        let token = field_list
+            .r_curly_token()
+            .ok_or("record expression has no closing brace")?;
+        let start = text_offset(token.text_range().start());
+        source.insert_str(start, fields);
+        return Ok(());
+    }
+    Err(format!("function `{function}` has no `{path_tail}` record expression").into())
+}
+
+pub fn replace_record_expr_field_in_function(
+    source: &mut String,
+    function: &str,
+    path_tail: &str,
+    field: &str,
+    value: &str,
+) -> Result<(), Box<dyn Error>> {
+    let function = find_function(source, function)?;
+    for node in function.syntax().descendants() {
+        let Some(record) = ast::RecordExpr::cast(node) else {
+            continue;
+        };
+        let Some(path) = record.path() else {
+            continue;
+        };
+        if !path.syntax().text().to_string().ends_with(path_tail) {
+            continue;
+        }
+        let Some(field_list) = record.record_expr_field_list() else {
+            continue;
+        };
+        for record_field in field_list.fields() {
+            let Some(name) = record_field.name_ref() else {
+                continue;
+            };
+            if name.text() != field {
+                continue;
+            }
+            let Some(expr) = record_field.expr() else {
+                return Err(format!("record field `{field}` has no expression").into());
+            };
+            replace_text_range(source, expr.syntax().text_range(), value);
+            return Ok(());
+        }
+    }
+    Err(format!("function `{function}` has no `{path_tail}.{field}` field").into())
+}
+
 fn find_function(source: &str, name: &str) -> Result<ast::Fn, Box<dyn Error>> {
     parse_source(source)?
         .descendants()
@@ -419,25 +1053,12 @@ fn find_function(source: &str, name: &str) -> Result<ast::Fn, Box<dyn Error>> {
         .ok_or_else(|| format!("could not find function `{name}`").into())
 }
 
-fn method_call_name_ranges(
-    source: &str,
-    function: &str,
-    method: &str,
-) -> Result<Vec<std::ops::Range<usize>>, Box<dyn Error>> {
-    let function = find_function(source, function)?;
-    let ranges = function
-        .syntax()
+fn find_struct(source: &str, name: &str) -> Result<ast::Struct, Box<dyn Error>> {
+    parse_source(source)?
         .descendants()
-        .filter_map(ast::MethodCallExpr::cast)
-        .filter_map(|call| call.name_ref())
-        .filter(|name| name.text() == method)
-        .map(|name| text_range(name.syntax().text_range()))
-        .collect::<Vec<_>>();
-    if ranges.is_empty() {
-        Err(format!("function `{function}` has no `{method}` method call").into())
-    } else {
-        Ok(ranges)
-    }
+        .filter_map(ast::Struct::cast)
+        .find(|item| item.name().is_some_and(|it| it.text() == name))
+        .ok_or_else(|| format!("could not find struct `{name}`").into())
 }
 
 fn parse_source(source: &str) -> Result<SyntaxNode, Box<dyn Error>> {
@@ -469,37 +1090,6 @@ fn line_indent(source: &str, offset: usize) -> &str {
         .map(char::len_utf8)
         .sum::<usize>();
     &source[line_start..line_start + indent_len]
-}
-
-fn replace_identifier(
-    source: &str,
-    name: &str,
-    replacement: &str,
-) -> Result<String, Box<dyn Error>> {
-    let mut offset = 0;
-    while let Some(index) = source[offset..].find(name).map(|index| offset + index) {
-        let end = index + name.len();
-        if is_identifier_boundary(source, index, end) {
-            let mut source = source.to_owned();
-            source.replace_range(index..end, replacement);
-            return Ok(source);
-        }
-        offset = end;
-    }
-
-    Err(format!("could not find identifier `{name}` in source fragment:\n{source}").into())
-}
-
-fn is_identifier_boundary(source: &str, start: usize, end: usize) -> bool {
-    let before = source[..start].chars().next_back();
-    let after = source[end..].chars().next();
-
-    before.is_none_or(|before| !is_identifier_char(before))
-        && after.is_none_or(|after| !is_identifier_char(after))
-}
-
-fn is_identifier_char(value: char) -> bool {
-    value == '_' || value.is_ascii_alphanumeric()
 }
 
 fn first_use_index(source: &str) -> Option<usize> {
@@ -540,34 +1130,6 @@ fn archive_name(package_name: &str, package: &LockedPackage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn widens_visibility() {
-        let mut source = String::from("fn run_flycheck() {}\n");
-
-        widen_visibility(&mut source, "fn run_flycheck()", "pub(crate)").unwrap();
-
-        assert_eq!(source, "pub(crate) fn run_flycheck() {}\n");
-    }
-
-    #[test]
-    fn renames_with_prefix() {
-        let mut source = String::from("fn handle() {}\nfn handle_inner() {}\n");
-
-        let renamed = rename_with_prefix(&mut source, "fn handle()", "handle", "_").unwrap();
-
-        assert_eq!(renamed, "fn _handle()");
-        assert_eq!(source, "fn _handle() {}\nfn handle_inner() {}\n");
-    }
-
-    #[test]
-    fn adds_dead_code_allow() {
-        let mut source = String::from("fn old_handle() {}\n");
-
-        allow_dead_code(&mut source, "fn old_handle()").unwrap();
-
-        assert_eq!(source, "#[allow(dead_code)]\nfn old_handle() {}\n");
-    }
 
     #[test]
     fn injects_use_before_existing_imports() {

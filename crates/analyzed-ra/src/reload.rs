@@ -79,26 +79,30 @@ impl GlobalState {
         });
     }
 
-    pub(crate) fn analyzed_install_shared_and_check_msrv(
-        &mut self,
-    ) -> impl Iterator<Item = String> + use<> {
+    pub(crate) fn show_workspace_msrv_warnings(&mut self) {
         if let Some(FetchWorkspaceResponse { analyzed_shared, .. }) =
             self.fetch_workspaces_queue.last_op_result()
         {
             self.analyzed_shared = analyzed_shared.clone();
         }
         self.diagnostics.clear_check_all();
-        let messages = self.check_workspaces_msrv().collect::<Vec<_>>();
-        messages.into_iter()
+        self.check_workspaces_msrv().for_each(|message| {
+            self.send_notification::<lsp_types::notification::ShowMessage>(
+                lsp_types::ShowMessageParams {
+                    typ: lsp_types::MessageType::WARNING,
+                    message,
+                },
+            );
+        });
     }
 
-    pub(crate) fn analyzed_reload_config_then_recreate_crate_graph(
+    pub(crate) fn recreate_crate_graph_after_shared_reload(
         &mut self,
         cause: String,
-        initial_build: bool,
+        switching_from_empty_workspace: bool,
     ) {
         self.analyzed_reload_config_from_shared();
-        self.recreate_crate_graph(cause, initial_build);
+        self.recreate_crate_graph(cause, switching_from_empty_workspace);
     }
 
     pub(crate) fn recreate_crate_graph(&mut self, cause: String, initial_build: bool) {

@@ -7,8 +7,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use analyzed_bridge::replace_once;
-
 const PACKAGE: &str = "ra_ap_ide_db";
 const GENERATED_DIR: &str = "ra_ap_ide_db_bridge";
 
@@ -17,7 +15,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     patch_ide_db_source(&generated.join("src/lib.rs"))?;
     patch_search_source(&generated.join("src/search.rs"))?;
     patch_symbol_index_source(&generated.join("src/symbol_index.rs"))?;
-    patch_node_ext_source(&generated.join("src/syntax_helpers/node_ext.rs"))?;
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())
 }
@@ -26,29 +23,24 @@ fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(lib_rs)?;
 
     let analyzed = owned_source_path("analyzed.rs");
-    replace_once(
-        &mut source,
-        "pub use span::{self, FileId};\n",
-        &format!(
-            "pub use span::{{self, FileId}};\n\n#[path = {:?}]\nmod analyzed;\n",
-            analyzed.to_string_lossy().into_owned()
-        ),
-    )?;
+    build_support::prepend_path_module(&mut source, None, "analyzed", &analyzed);
     println!("cargo:rerun-if-changed={}", analyzed.display());
-    replace_once(
+    build_support::append_struct_fields(
         &mut source,
-        "    crates_map: Arc<CratesMap>,\n    nonce: Nonce,\n",
-        "    crates_map: Arc<CratesMap>,\n    analyzed_visible_files: Option<std::sync::Arc<rustc_hash::FxHashSet<vfs::FileId>>>,\n    nonce: Nonce,\n",
+        "RootDatabase",
+        "    analyzed_visible_files: Option<std::sync::Arc<rustc_hash::FxHashSet<vfs::FileId>>>,\n",
     )?;
-    replace_once(
+    build_support::append_record_expr_fields_in_function(
         &mut source,
-        "            crates_map: self.crates_map.clone(),\n            nonce: self.nonce,\n",
-        "            crates_map: self.crates_map.clone(),\n            analyzed_visible_files: self.analyzed_visible_files.clone(),\n            nonce: self.nonce,\n",
+        "clone",
+        "Self",
+        "            analyzed_visible_files: self.analyzed_visible_files.clone(),\n",
     )?;
-    replace_once(
+    build_support::append_record_expr_fields_in_function(
         &mut source,
-        "            files: Default::default(),\n            crates_map: Default::default(),\n            nonce: Nonce::new(),\n",
-        "            files: Default::default(),\n            crates_map: Default::default(),\n            analyzed_visible_files: None,\n            nonce: Nonce::new(),\n",
+        "new",
+        "RootDatabase",
+        "            analyzed_visible_files: None,\n",
     )?;
     fs::write(lib_rs, source)?;
     Ok(())
@@ -57,16 +49,20 @@ fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 fn patch_search_source(search_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(search_rs)?;
 
-    replace_once(
+    build_support::retarget_use_tree(
         &mut source,
-        "        let all_crates = all_crates(db);\n        for &krate in all_crates.iter() {\n",
-        "        let all_crates = db.analyzed_visible_base_crates(all_crates(db).iter().copied());\n        for krate in all_crates {\n",
+        "all_crates",
+        "crate::analyzed::visible_base_crates",
+        "all_crates",
     )?;
-    replace_once(
-        &mut source,
-        "        for rev_dep in of.transitive_reverse_dependencies(db) {\n",
-        "        for rev_dep in db.analyzed_visible_hir_crates(of.transitive_reverse_dependencies(db)) {\n",
-    )?;
+    let analyzed_search_scope = owned_source_path("search_scope.rs");
+    source.push_str(&format!(
+        "\n#[path = {:?}]\nmod analyzed_search_scope;\n",
+        analyzed_search_scope.to_string_lossy().into_owned()
+    ));
+    println!("cargo:rerun-if-changed={}", analyzed_search_scope.display());
+    build_support::rename_function(&mut source, "reverse_dependencies", "_reverse_dependencies")?;
+    build_support::allow_dead_code_for_function(&mut source, "_reverse_dependencies")?;
 
     fs::write(search_rs, source)?;
     Ok(())
@@ -75,55 +71,23 @@ fn patch_search_source(search_rs: &Path) -> Result<(), Box<dyn Error>> {
 fn patch_symbol_index_source(symbol_index_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(symbol_index_rs)?;
 
-    replace_once(
+    let analyzed_symbol_index = owned_source_path("symbol_index.rs");
+    source.push_str(&format!(
+        "\n#[path = {:?}]\nmod analyzed_symbol_index;\npub use analyzed_symbol_index::world_symbols;\n",
+        analyzed_symbol_index.to_string_lossy().into_owned()
+    ));
+    println!("cargo:rerun-if-changed={}", analyzed_symbol_index.display());
+    build_support::rename_function(&mut source, "world_symbols", "_world_symbols")?;
+    build_support::allow_dead_code_for_function(&mut source, "_world_symbols")?;
+    build_support::rename_function(
         &mut source,
-        "fn resolve_path_to_modules(\n    db: &dyn HirDatabase,\n",
-        "fn resolve_path_to_modules(\n    db: &RootDatabase,\n",
+        "resolve_path_to_modules",
+        "_resolve_path_to_modules",
     )?;
-    replace_once(
-        &mut source,
-        "    let matching_crates: Vec<Crate> = Crate::all(db)\n",
-        "    let matching_crates: Vec<Crate> = db.analyzed_visible_hir_crates(Crate::all(db))\n",
-    )?;
-    replace_once(
-        &mut source,
-        "            for &krate in source_root_crates(db, root).iter() {\n",
-        "            for krate in db.analyzed_visible_base_crates(source_root_crates(db, root).iter().copied()) {\n",
-    )?;
-    replace_once(
-        &mut source,
-        "            crates.extend(source_root_crates(db, root).iter().copied())\n",
-        "            crates.extend(db.analyzed_visible_base_crates(source_root_crates(db, root).iter().copied()))\n",
-    )?;
-    replace_once(
-        &mut source,
-        "                    if non_type_for_type_only_query || !self.matches_assoc_mode(symbol.is_assoc) {\n                        continue;\n                    }\n",
-        "                    if non_type_for_type_only_query || !self.matches_assoc_mode(symbol.is_assoc) {\n                        continue;\n                    }\n                    if !crate::analyzed::is_symbol_visible(db, symbol) {\n                        continue;\n                    }\n",
-    )?;
+    build_support::allow_dead_code_for_function(&mut source, "_resolve_path_to_modules")?;
+    build_support::inject_use(&mut source, "crate::analyzed::resolve_path_to_modules")?;
 
     fs::write(symbol_index_rs, source)?;
-    Ok(())
-}
-
-fn patch_node_ext_source(node_ext_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(node_ext_rs)?;
-
-    replace_once(
-        &mut source,
-        "            Some(ty) =>
-            {
-                #[expect(
-                    clippy::collapsible_match,
-                    reason = \"it won't compile due to exhaustiveness\"
-                )]
-                if cb(ty) {
-",
-        "            Some(ty) => {
-                if cb(ty) {
-",
-    )?;
-
-    fs::write(node_ext_rs, source)?;
     Ok(())
 }
 

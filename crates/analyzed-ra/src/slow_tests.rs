@@ -1,9 +1,9 @@
-use lsp_server::Connection;
-use ra_ap_rust_analyzer::config::Config;
-
 pub(crate) fn skip_slow_tests() -> bool {
-    (std::env::var("CI").is_err() && std::env::var("RUN_SLOW_TESTS").is_err())
-        || std::env::var("SKIP_SLOW_TESTS").is_ok()
+    if std::env::var_os("SKIP_SLOW_TESTS").is_some() {
+        return true;
+    }
+
+    std::env::var_os("RUN_SLOW_TESTS").is_none() && std::env::var_os("CI").is_none()
 }
 
 pub(crate) trait AnalyzedUriPath {
@@ -23,7 +23,3 @@ impl AnalyzedUriPath for String {
     }
 }
 
-pub(crate) fn run_server(config: Config, connection: Connection) {
-    ra_ap_rust_analyzer::run_shared_rust_analyzer_lsp_session_with_config(config, connection)
-        .unwrap()
-}

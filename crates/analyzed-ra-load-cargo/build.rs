@@ -7,8 +7,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use analyzed_bridge::replace_once;
-
 const PACKAGE: &str = "ra_ap_load-cargo";
 const GENERATED_DIR: &str = "ra_ap_load_cargo_bridge";
 
@@ -22,43 +20,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn patch_analyzed_workspace_load_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(lib_rs)?;
 
-    replace_once(
+    build_support::inject_use(
         &mut source,
-        "    base_db::{CrateGraphBuilder, Env, ProcMacroLoadingError, SourceRoot, SourceRootId},\n",
-        "    base_db::{\n        CrateBuilderId, CrateGraphBuilder, Env, ProcMacroLoadingError, SourceRoot,\n        SourceRootId,\n    },\n",
+        "ide_db::base_db::{CrateBuilderId, ProcMacroPaths}",
     )?;
-    replace_once(
-        &mut source,
-        "    file_set::FileSetConfig,\n",
-        "    file_set::{FileSet, FileSetConfig},\n",
-    )?;
+    build_support::inject_use(&mut source, "vfs::file_set::FileSet")?;
 
     let analyzed = owned_source_path("analyzed.rs");
-    replace_once(
-        &mut source,
-        "\n// This variant of `load_workspace` allows deferring the loading of rust-analyzer\n",
+    source.insert_str(
+        0,
         &format!(
-            r#"
-#[path = {:?}]
-mod analyzed;
-pub use analyzed::{{
-    AnalyzedProcMacroLoad, AnalyzedWorkspaceLoad, analyzed_load_workspace_change,
-}};
-use analyzed::load_crate_graph_into_db;
-
-// This variant of `load_workspace` allows deferring the loading of rust-analyzer
-"#,
+            "#[path = {:?}]\nmod analyzed;\npub use analyzed::{{\n    AnalyzedProcMacroLoad, AnalyzedWorkspaceLoad, analyzed_load_workspace_change,\n}};\nuse analyzed::load_crate_graph_into_db;\n\n",
             analyzed.to_string_lossy().into_owned()
         ),
-    )?;
+    );
     println!("cargo:rerun-if-changed={}", analyzed.display());
-    build_support::rename_with_prefix(
+
+    build_support::rename_function(
         &mut source,
-        "fn load_crate_graph_into_db(",
         "load_crate_graph_into_db",
-        "_",
+        "_load_crate_graph_into_db",
     )?;
-    build_support::allow_dead_code(&mut source, "fn _load_crate_graph_into_db(")?;
+    build_support::allow_dead_code_for_function(&mut source, "_load_crate_graph_into_db")?;
 
     fs::write(lib_rs, source)?;
     Ok(())

@@ -29,41 +29,8 @@ pub fn analyzed_load_workspace_change(
     let mut file_id_map = FxHashMap::default();
 
     tracing::debug!(?load_config, "LoadCargoConfig");
-    let proc_macro_server = match &load_config.with_proc_macro_server {
-        ProcMacroServerChoice::Sysroot => ws.find_sysroot_proc_macro_srv().map(|it| {
-            it.and_then(|it| {
-                ProcMacroClient::spawn(
-                    &it,
-                    extra_env,
-                    ws.toolchain.as_ref(),
-                    load_config.proc_macro_processes,
-                )
-                .map_err(Into::into)
-            })
-            .map_err(|e| ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str()))
-        }),
-        ProcMacroServerChoice::Explicit(path) => Some(
-            ProcMacroClient::spawn(
-                path,
-                extra_env,
-                ws.toolchain.as_ref(),
-                load_config.proc_macro_processes,
-            )
-            .map_err(|e| ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str())),
-        ),
-        ProcMacroServerChoice::None => Some(Err(ProcMacroLoadingError::Disabled)),
-    };
-    match &proc_macro_server {
-        Some(Ok(server)) => {
-            tracing::info!(manifest=%ws.manifest_or_root(), path=%server.server_path(), "Proc-macro server started")
-        }
-        Some(Err(e)) => {
-            tracing::info!(manifest=%ws.manifest_or_root(), %e, "Failed to start proc-macro server")
-        }
-        None => {
-            tracing::info!(manifest=%ws.manifest_or_root(), "No proc-macro server started")
-        }
-    }
+    let proc_macro_server = spawn_proc_macro_server(&ws, extra_env, load_config);
+    log_proc_macro_server(&ws, &proc_macro_server);
 
     let (crate_graph, proc_macros) = ws.to_crate_graph(
         &mut |path: &AbsPath| {
@@ -77,30 +44,7 @@ pub fn analyzed_load_workspace_change(
         },
         extra_env,
     );
-    let proc_macros = {
-        let proc_macro_server = match &proc_macro_server {
-            Some(Ok(it)) => Ok(it),
-            Some(Err(e)) => {
-                Err(ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str()))
-            }
-            None => Err(ProcMacroLoadingError::ProcMacroSrvError(
-                "proc-macro-srv is not running, workspace is missing a sysroot".into(),
-            )),
-        };
-        proc_macros
-            .into_iter()
-            .map(|(crate_id, path)| {
-                (
-                    crate_id,
-                    path.map_or_else(Err, |(_, path)| {
-                        proc_macro_server.as_ref().map_err(Clone::clone).and_then(
-                            |proc_macro_server| load_proc_macro(proc_macro_server, &path, &[]),
-                        )
-                    }),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
+    let proc_macros = collect_proc_macros(&proc_macro_server, proc_macros);
 
     let project_folders = ProjectFolders::new(std::slice::from_ref(&ws), &[], None);
     let source_root_parent_map = project_folders.source_root_config.source_root_parent_map();
@@ -133,6 +77,42 @@ pub fn analyzed_load_workspace_change(
     })
 }
 
+pub(crate) fn analyzed_crate_graph_change(
+    crate_graph: CrateGraphBuilder,
+    proc_macros: ProcMacrosBuilder,
+    source_root_config: SourceRootConfig,
+    vfs: &mut vfs::Vfs,
+    receiver: &Receiver<vfs::loader::Message>,
+    file_id_map: &mut FxHashMap<FileId, FileId>,
+    allocate_file_id: &mut impl FnMut(FileId) -> FileId,
+) -> (ChangeWithProcMacros, Vec<(FileId, String)>, Vec<SourceRoot>) {
+    let mut analysis_change = ChangeWithProcMacros::default();
+    let mut file_texts = Vec::new();
+
+    drain_loader(receiver, vfs);
+    let changes = vfs.take_changes();
+    for (_, file) in changes {
+        if let vfs::Change::Create(v, _) | vfs::Change::Modify(v, _) = file.change
+            && let Ok(text) = String::from_utf8(v)
+        {
+            let file_id = analyzed_file_id(file.file_id, file_id_map, allocate_file_id);
+            analysis_change.change_file(file_id, Some(text.clone()));
+            file_texts.push((file_id, text));
+        }
+    }
+    let source_roots: Vec<SourceRoot> = source_root_config
+        .partition(vfs)
+        .into_iter()
+        .map(|root| analyzed_source_root(root, file_id_map, allocate_file_id))
+        .collect();
+    analysis_change.set_roots(source_roots.clone());
+
+    analysis_change.set_crate_graph(crate_graph);
+    analysis_change.set_proc_macros(proc_macros);
+
+    (analysis_change, file_texts, source_roots)
+}
+
 pub(crate) fn load_crate_graph_into_db(
     crate_graph: CrateGraphBuilder,
     proc_macros: ProcMacrosBuilder,
@@ -156,26 +136,90 @@ pub(crate) fn load_crate_graph_into_db(
     db.apply_change(analysis_change);
 }
 
-pub(crate) fn analyzed_crate_graph_change(
-    crate_graph: CrateGraphBuilder,
-    proc_macros: ProcMacrosBuilder,
-    source_root_config: SourceRootConfig,
-    vfs: &mut vfs::Vfs,
-    receiver: &Receiver<vfs::loader::Message>,
-    file_id_map: &mut FxHashMap<FileId, FileId>,
-    allocate_file_id: &mut impl FnMut(FileId) -> FileId,
-) -> (ChangeWithProcMacros, Vec<(FileId, String)>, Vec<SourceRoot>) {
-    let mut analysis_change = ChangeWithProcMacros::default();
-    let mut file_texts = Vec::new();
+fn spawn_proc_macro_server(
+    workspace: &ProjectWorkspace,
+    extra_env: &FxHashMap<String, Option<String>>,
+    load_config: &LoadCargoConfig,
+) -> Option<Result<ProcMacroClient, ProcMacroLoadingError>> {
+    match &load_config.with_proc_macro_server {
+        ProcMacroServerChoice::Sysroot => workspace
+            .find_sysroot_proc_macro_srv()
+            .map(|result| {
+                result
+                    .and_then(|path| {
+                        ProcMacroClient::spawn(
+                            &path,
+                            extra_env,
+                            workspace.toolchain.as_ref(),
+                            load_config.proc_macro_processes,
+                        )
+                        .map_err(Into::into)
+                    })
+                    .map_err(proc_macro_loading_error)
+            }),
+        ProcMacroServerChoice::Explicit(path) => Some(
+            ProcMacroClient::spawn(
+                path,
+                extra_env,
+                workspace.toolchain.as_ref(),
+                load_config.proc_macro_processes,
+            )
+            .map_err(proc_macro_loading_error),
+        ),
+        ProcMacroServerChoice::None => Some(Err(ProcMacroLoadingError::Disabled)),
+    }
+}
 
-    // wait until Vfs has loaded all roots
-    for task in receiver {
+fn proc_macro_loading_error(error: impl ToString) -> ProcMacroLoadingError {
+    ProcMacroLoadingError::ProcMacroSrvError(error.to_string().into_boxed_str())
+}
+
+fn log_proc_macro_server(
+    workspace: &ProjectWorkspace,
+    proc_macro_server: &Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
+) {
+    let manifest = workspace.manifest_or_root();
+    match proc_macro_server {
+        Some(Ok(server)) => {
+            tracing::info!(%manifest, path=%server.server_path(), "Proc-macro server started")
+        }
+        Some(Err(error)) => tracing::info!(%manifest, %error, "Failed to start proc-macro server"),
+        None => tracing::info!(%manifest, "No proc-macro server started"),
+    }
+}
+
+fn collect_proc_macros(
+    proc_macro_server: &Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
+    proc_macro_paths: ProcMacroPaths,
+) -> Vec<AnalyzedProcMacroLoad> {
+    let server = match proc_macro_server {
+        Some(Ok(server)) => Ok(server),
+        Some(Err(error)) => {
+            Err(ProcMacroLoadingError::ProcMacroSrvError(error.to_string().into_boxed_str()))
+        }
+        None => Err(ProcMacroLoadingError::ProcMacroSrvError(
+            "proc-macro-srv is not running, workspace is missing a sysroot".into(),
+        )),
+    };
+
+    proc_macro_paths
+        .into_iter()
+        .map(|(crate_id, dylib)| {
+            let proc_macros = dylib.map_or_else(Err, |(_, path)| {
+                server
+                    .clone()
+                    .and_then(|server| load_proc_macro(server, &path, &[]))
+            });
+            (crate_id, proc_macros)
+        })
+        .collect()
+}
+
+fn drain_loader(receiver: &Receiver<vfs::loader::Message>, vfs: &mut vfs::Vfs) {
+    while let Ok(task) = receiver.recv() {
         match task {
-            vfs::loader::Message::Progress { n_done, .. } => {
-                if n_done == LoadingProgress::Finished {
-                    break;
-                }
-            }
+            vfs::loader::Message::Progress { n_done: LoadingProgress::Finished, .. } => break,
+            vfs::loader::Message::Progress { .. } => (),
             vfs::loader::Message::Loaded { files } | vfs::loader::Message::Changed { files } => {
                 let _p =
                     tracing::info_span!("load_cargo::load_crate_craph/LoadedChanged").entered();
@@ -185,27 +229,6 @@ pub(crate) fn analyzed_crate_graph_change(
             }
         }
     }
-    let changes = vfs.take_changes();
-    for (_, file) in changes {
-        if let vfs::Change::Create(v, _) | vfs::Change::Modify(v, _) = file.change
-            && let Ok(text) = String::from_utf8(v)
-        {
-            let file_id = analyzed_file_id(file.file_id, file_id_map, allocate_file_id);
-            analysis_change.change_file(file_id, Some(text.clone()));
-            file_texts.push((file_id, text));
-        }
-    }
-    let source_roots: Vec<SourceRoot> = source_root_config
-        .partition(vfs)
-        .into_iter()
-        .map(|root| analyzed_source_root(root, file_id_map, allocate_file_id))
-        .collect();
-    analysis_change.set_roots(source_roots.clone());
-
-    analysis_change.set_crate_graph(crate_graph);
-    analysis_change.set_proc_macros(proc_macros);
-
-    (analysis_change, file_texts, source_roots)
 }
 
 fn analyzed_file_id(
