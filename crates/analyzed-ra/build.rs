@@ -452,6 +452,7 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         build_support::rename_function(&mut source, name, &replacement)?;
         build_support::allow_dead_code_for_function(&mut source, &replacement)?;
     }
+    build_support::widen_function_visibility(&mut source, "enqueue_workspace_fetch", "pub(crate)")?;
 
     fs::write(global_state_rs, source)?;
     Ok(())

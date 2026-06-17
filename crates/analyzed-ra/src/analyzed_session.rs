@@ -335,10 +335,7 @@ impl crate::global_state::GlobalState {
         }
 
         if let Some((path, force_crate_graph_reload)) = workspace_structure_change {
-            self.fetch_workspaces_queue.request_op(
-                "workspace structure changed".to_owned(),
-                FetchWorkspaceRequest { path: Some(path), force_crate_graph_reload },
-            );
+            self.enqueue_workspace_fetch(path, force_crate_graph_reload);
         }
 
         changed
@@ -563,6 +560,7 @@ impl crate::global_state::GlobalState {
                     tracing::error!("FetchWorkspaceError: {e}");
                 }
                 self.wants_to_switch = Some("fetched workspace".to_owned());
+                self.diagnostics.clear_check_all();
                 self.report_progress(
                     "Fetching",
                     crate::lsp::utils::Progress::End,

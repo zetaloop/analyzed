@@ -85,7 +85,6 @@ impl GlobalState {
         {
             self.analyzed_shared = analyzed_shared.clone();
         }
-        self.diagnostics.clear_check_all();
         self.check_workspaces_msrv().for_each(|message| {
             self.send_notification::<lsp_types::notification::ShowMessage>(
                 lsp_types::ShowMessageParams {
