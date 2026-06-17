@@ -1,8 +1,8 @@
-use std::{env, fs, sync::Once};
+use std::{collections::BTreeSet, env, fs, sync::Once};
 
 use crossbeam_channel::{Receiver, Sender};
 use ide::FileId;
-use ide_db::{FxHashMap, base_db::{SourceRoot, SourceRootId}};
+use ide_db::{FxHashMap, base_db::SourceRootId};
 use lsp_server::{Connection, Message};
 use lsp_types::Url;
 use paths::Utf8PathBuf;
@@ -271,7 +271,8 @@ impl crate::global_state::GlobalState {
                     let doc = self.mem_docs.get(path)?;
                     let text = std::str::from_utf8(&doc.data).ok()?.to_owned();
                     let (source_root_id, is_library) = shared.source_root_for_path(path)?;
-                    Some((path.clone(), source_root_id, is_library, text))
+                    let path = crate::analyzed_bridge::normalize_vfs_path(path);
+                    Some((path, source_root_id, is_library, text))
                 }));
                 files
             };
@@ -295,13 +296,8 @@ impl crate::global_state::GlobalState {
                         .and_then(|path| fs::read_to_string(path).ok())
                 });
             let shared_source_root_parent_map = Arc::new(shared.source_root_parent_map());
-            let source_roots = {
-                let guard = self.vfs.read();
-                self.source_root_config.partition(&guard.0)
-            };
             let config_change = self.analyzed_config_change_from_ratoml(
                 modified_ratoml_files,
-                &source_roots,
                 shared_ratoml_files,
                 user_config_text,
                 shared_source_root_parent_map,
@@ -359,13 +355,8 @@ impl crate::global_state::GlobalState {
             })
             .or_else(|| user_config_path.as_ref().and_then(|path| fs::read_to_string(path).ok()));
         let shared_source_root_parent_map = Arc::new(shared.source_root_parent_map());
-        let source_roots = {
-            let guard = self.vfs.read();
-            self.source_root_config.partition(&guard.0)
-        };
         let config_change = self.analyzed_config_change_from_ratoml(
             Vec::new(),
-            &source_roots,
             shared_ratoml_files,
             user_config_text,
             shared_source_root_parent_map,
@@ -383,7 +374,6 @@ impl crate::global_state::GlobalState {
     fn analyzed_config_change_from_ratoml(
         &self,
         modified_ratoml_files: Vec<(ChangeKind, VfsPath, Option<String>)>,
-        source_roots: &[SourceRoot],
         shared_ratoml_files: Vec<(VfsPath, SourceRootId, bool, String)>,
         user_config_text: Option<String>,
         shared_source_root_parent_map: Arc<FxHashMap<SourceRootId, SourceRootId>>,
@@ -398,35 +388,38 @@ impl crate::global_state::GlobalState {
             .workspaces
             .iter()
             .map(|workspace| {
-                VfsPath::from({
+                let path = VfsPath::from({
                     let mut path = workspace.workspace_root().to_owned();
                     path.push("rust-analyzer.toml");
                     path
-                })
+                });
+                crate::analyzed_bridge::path_key(&path)
             })
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
         let mut change = ConfigChange::default();
         let mut ratoml_files = shared_ratoml_files
             .into_iter()
             .map(|(path, source_root_id, is_library, text)| {
+                let path = crate::analyzed_bridge::normalize_vfs_path(&path);
                 (path, source_root_id, is_library, Some(Arc::<str>::from(text)))
             })
             .collect::<Vec<_>>();
         let mut user_config_changed = false;
 
         for (_kind, vfs_path, text) in modified_ratoml_files {
+            let vfs_path = crate::analyzed_bridge::normalize_vfs_path(&vfs_path);
             let text = text.map(Arc::<str>::from);
             if vfs_path.as_path() == user_config_abs_path {
                 change.change_user_config(text.clone());
                 user_config_changed = true;
             }
 
-            let Some((source_root_id, source_root)) =
-                source_root_for_path(source_roots, &vfs_path)
+            let Some((source_root_id, is_library)) =
+                self.analyzed_shared.source_root_for_path(&vfs_path)
             else {
                 continue;
             };
-            ratoml_files.push((vfs_path, source_root_id, source_root.is_library, text));
+            ratoml_files.push((vfs_path, source_root_id, is_library, text));
         }
 
         if !user_config_changed
@@ -436,18 +429,21 @@ impl crate::global_state::GlobalState {
         }
 
         for (vfs_path, source_root_id, is_library, text) in ratoml_files {
+            let key = crate::analyzed_bridge::path_key(&vfs_path);
+            let is_workspace_ratoml = workspace_ratoml_paths.contains(&key);
             if is_library {
                 continue;
             }
 
-            let entry = if workspace_ratoml_paths.contains(&vfs_path) {
+            let entry = if is_workspace_ratoml {
                 change.change_workspace_ratoml(source_root_id, vfs_path.clone(), text.clone())
             } else {
                 change.change_ratoml(source_root_id, vfs_path.clone(), text.clone())
             };
 
             if let Some((kind, old_path, old_text)) = entry
-                && old_path < vfs_path
+                && crate::analyzed_bridge::path_key(&old_path)
+                    < crate::analyzed_bridge::path_key(&vfs_path)
             {
                 match kind {
                     crate::config::RatomlFileKind::Crate => {
@@ -659,17 +655,6 @@ fn analyzed_diagnostic_key(
     });
 
     (diagnostic.range, code)
-}
-
-fn source_root_for_path<'a>(
-    source_roots: &'a [SourceRoot],
-    path: &VfsPath,
-) -> Option<(SourceRootId, &'a SourceRoot)> {
-    source_roots.iter().enumerate().find_map(|(index, source_root)| {
-        source_root
-            .file_for_path(path)
-            .map(|_| (SourceRootId(index as u32), source_root))
-    })
 }
 
 fn config_from_initialize_params(

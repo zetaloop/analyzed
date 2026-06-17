@@ -1450,7 +1450,7 @@ fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
     path
 }
 
-fn path_key(path: &VfsPath) -> String {
+pub(crate) fn path_key(path: &VfsPath) -> String {
     normalize_vfs_path(path).to_string()
 }
 
@@ -1532,6 +1532,10 @@ impl SharedFileMappings {
 }
 
 fn common_path_prefix_len(left: &str, right: &str) -> usize {
+    fn is_path_separator(byte: u8) -> bool {
+        matches!(byte, b'/' | b'\\')
+    }
+
     let left = left.as_bytes();
     let right = right.as_bytes();
     let mut index = 0;
@@ -1539,7 +1543,7 @@ fn common_path_prefix_len(left: &str, right: &str) -> usize {
     let end = left.len().min(right.len());
 
     while index < end && left[index] == right[index] {
-        if left[index] == b'/' {
+        if is_path_separator(left[index]) {
             last_separator = index + 1;
         }
         index += 1;
@@ -1547,8 +1551,8 @@ fn common_path_prefix_len(left: &str, right: &str) -> usize {
 
     if index == end
         && (left.len() == right.len()
-            || left.get(index) == Some(&b'/')
-            || right.get(index) == Some(&b'/'))
+            || left.get(index).is_some_and(|byte| is_path_separator(*byte))
+            || right.get(index).is_some_and(|byte| is_path_separator(*byte)))
     {
         return index;
     }
