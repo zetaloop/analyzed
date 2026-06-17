@@ -87,7 +87,7 @@ pub(crate) fn resolve_path_to_modules(
         for &root in LocalRoots::get(db).roots(db) {
             for krate in db.analyzed_visible_base_crates(source_root_crates(db, root).iter().copied()) {
                 let root_module = HirCrate::from(krate).root_module(db);
-                candidates.extend(root_module.children(db).into_iter().filter_map(|child| {
+                candidates.extend(root_module.children(db).filter_map(|child| {
                     let name = child.name(db)?;
                     names_match(name.as_str(), first_segment).then_some((child, true))
                 }));

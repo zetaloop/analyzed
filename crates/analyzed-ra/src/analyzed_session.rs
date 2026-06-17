@@ -513,14 +513,14 @@ impl crate::global_state::GlobalState {
         &mut self,
         id: usize,
         generation: crate::diagnostics::DiagnosticsGeneration,
-        package_id: &Option<crate::flycheck::PackageSpecifier>,
+        package_id: Option<crate::flycheck::PackageSpecifier>,
         diag: crate::diagnostics::flycheck_to_proto::MappedRustDiagnostic,
     ) {
         match self.analyzed_base_url_to_file_id(&diag.url) {
             Ok(Some(file_id)) => self.diagnostics.add_check_diagnostic(
                 id,
                 generation,
-                package_id,
+                &package_id,
                 file_id,
                 diag.diagnostic,
                 diag.fix,

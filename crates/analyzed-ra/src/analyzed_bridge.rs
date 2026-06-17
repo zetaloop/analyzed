@@ -197,6 +197,116 @@ struct SharedAnalyzerGcCoordinator {
     dirty: Arc<AtomicBool>,
 }
 
+#[derive(Default)]
+struct SharedWorldAccess {
+    state: Mutex<SharedWorldAccessState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct SharedWorldAccessState {
+    readers: BTreeMap<u64, usize>,
+    pending_writers: BTreeMap<Option<u64>, usize>,
+}
+
+pub(crate) struct SharedAnalyzerReadPermit {
+    access: Arc<SharedWorldAccess>,
+    session_id: u64,
+}
+
+struct SharedAnalyzerWritePermit {
+    access: Arc<SharedWorldAccess>,
+    owner: Option<u64>,
+}
+
+impl SharedWorldAccess {
+    fn read(self: &Arc<Self>, session_id: u64) -> SharedAnalyzerReadPermit {
+        let mut state = self.state.lock().expect("shared world access mutex poisoned");
+        while state.read_is_blocked(session_id) {
+            state = self
+                .ready
+                .wait(state)
+                .expect("shared world access mutex poisoned");
+        }
+        *state.readers.entry(session_id).or_default() += 1;
+        SharedAnalyzerReadPermit { access: Arc::clone(self), session_id }
+    }
+
+    fn write(self: &Arc<Self>, owner: Option<u64>) -> SharedAnalyzerWritePermit {
+        let mut state = self.state.lock().expect("shared world access mutex poisoned");
+        *state.pending_writers.entry(owner).or_default() += 1;
+        while state.write_is_blocked(owner) {
+            state = self
+                .ready
+                .wait(state)
+                .expect("shared world access mutex poisoned");
+        }
+        SharedAnalyzerWritePermit { access: Arc::clone(self), owner }
+    }
+}
+
+impl SharedWorldAccessState {
+    fn read_is_blocked(&self, session_id: u64) -> bool {
+        self.pending_writers
+            .iter()
+            .any(|(owner, count)| *count > 0 && *owner != Some(session_id))
+    }
+
+    fn write_is_blocked(&self, owner: Option<u64>) -> bool {
+        self.readers
+            .iter()
+            .any(|(reader, count)| *count > 0 && owner != Some(*reader))
+    }
+}
+
+impl Drop for SharedAnalyzerReadPermit {
+    fn drop(&mut self) {
+        let mut state = self.state();
+        let count = state
+            .readers
+            .get_mut(&self.session_id)
+            .expect("shared world reader was registered");
+        *count -= 1;
+        if *count == 0 {
+            state.readers.remove(&self.session_id);
+        }
+        self.access.ready.notify_all();
+    }
+}
+
+impl SharedAnalyzerReadPermit {
+    fn state(&self) -> std::sync::MutexGuard<'_, SharedWorldAccessState> {
+        self.access
+            .state
+            .lock()
+            .expect("shared world access mutex poisoned")
+    }
+}
+
+impl Drop for SharedAnalyzerWritePermit {
+    fn drop(&mut self) {
+        let mut state = self.state();
+        let count = state
+            .pending_writers
+            .get_mut(&self.owner)
+            .expect("shared world writer was registered");
+        *count -= 1;
+        if *count == 0 {
+            state.pending_writers.remove(&self.owner);
+        }
+        self.access.ready.notify_all();
+    }
+}
+
+impl SharedAnalyzerWritePermit {
+    fn state(&self) -> std::sync::MutexGuard<'_, SharedWorldAccessState> {
+        self.access
+            .state
+            .lock()
+            .expect("shared world access mutex poisoned")
+    }
+}
+
 impl SharedAnalyzerRegistry {
     fn new() -> Self {
         let gc = SharedAnalyzerGcCoordinator::spawn();
@@ -351,6 +461,11 @@ impl SharedAnalyzerRegistry {
         if leader {
             let result = SharedWorld::prepare_workspace_load(source, config)
                 .and_then(|loaded| {
+                    let access = world
+                        .lock()
+                        .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
+                        .access();
+                    let _write = access.write(None);
                     world
                         .lock()
                         .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
@@ -509,16 +624,17 @@ impl SharedAnalyzerGcCoordinator {
                         .collect::<Vec<_>>()
                 };
 
-                let mut guards = Vec::new();
+                let mut targets = Vec::new();
                 let mut blocked = false;
-                for world in &worlds {
+                for world in worlds {
                     match world.lock() {
-                        Ok(world) => {
-                            if world.any_session_busy() {
+                        Ok(world_guard) => {
+                            let access = world_guard.access();
+                            if world_guard.any_session_busy() {
                                 blocked = true;
                                 break;
                             }
-                            guards.push(world);
+                            targets.push((Arc::clone(&world), access));
                         }
                         Err(error) => {
                             tracing::error!("shared world mutex is poisoned during gc: {error}");
@@ -529,14 +645,25 @@ impl SharedAnalyzerGcCoordinator {
                 }
 
                 if blocked {
-                    drop(guards);
                     worker_dirty.store(true, Ordering::SeqCst);
                     continue;
                 }
 
-                if !guards.is_empty() {
-                    for world in &mut guards {
-                        world.synthetic_write();
+                if !targets.is_empty() {
+                    for (world, access) in targets {
+                        let _write = access.write(None);
+                        match world.lock() {
+                            Ok(mut world) => world.synthetic_write(),
+                            Err(error) => {
+                                tracing::error!("shared world mutex is poisoned during gc: {error}");
+                                blocked = true;
+                                break;
+                            }
+                        }
+                    }
+                    if blocked {
+                        worker_dirty.store(true, Ordering::SeqCst);
+                        continue;
                     }
                     unsafe { collect_ty_garbage() };
                 }
@@ -904,6 +1031,7 @@ pub struct SharedAnalyzerRuntime {
 
 struct SharedAnalyzerRuntimeSession {
     world: Arc<Mutex<SharedWorld>>,
+    access: Arc<SharedWorldAccess>,
     id: u64,
     activity: Arc<AtomicBool>,
     input_generation: Arc<AtomicU64>,
@@ -930,8 +1058,11 @@ struct SharedAnalysisCache {
 
 impl Drop for SharedAnalyzerRuntimeSession {
     fn drop(&mut self) {
-        if let Ok(mut world) = self.world.lock() {
-            world.unregister_session(self.id);
+        {
+            let _write = self.access.write(Some(self.id));
+            if let Ok(mut world) = self.world.lock() {
+                world.unregister_session(self.id);
+            }
         }
         if let Some(lease) = &self.registry_lease
             && let Some(registry) = lease.registry.upgrade()
@@ -979,12 +1110,13 @@ impl SharedAnalyzerRuntime {
         excluded_paths: Vec<String>,
         registry_lease: Option<SharedAnalyzerRegistryLease>,
     ) -> Self {
-        let (id, activity, input_generation) = world
+        let (id, activity, input_generation, access) = world
             .lock()
             .expect("shared world mutex poisoned")
             .register_session();
         let session = Arc::new(SharedAnalyzerRuntimeSession {
             world: Arc::clone(&world),
+            access,
             id,
             activity,
             input_generation,
@@ -1049,6 +1181,7 @@ impl SharedAnalyzerRuntime {
     }
 
     pub(crate) fn analysis(&self) -> Analysis {
+        let read_permit = self.session.access.read(self.session_id());
         let world = self
             .world
             .lock()
@@ -1070,9 +1203,10 @@ impl SharedAnalyzerRuntime {
         }
         let visible_files = Arc::clone(&cache.visible_files);
         drop(cache);
-        world
+        let analysis = world
             .host
-            .analyzed_analysis_with_visible_files(visible_files)
+            .analyzed_analysis_with_visible_files(visible_files);
+        analysis.analyzed_with_guard(read_permit)
     }
 
     pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {
@@ -1201,6 +1335,7 @@ impl SharedAnalyzerRuntime {
             crate::line_index::LineEndings,
         )>,
     ) -> anyhow::Result<SharedOverlaySync> {
+        let _write = self.session.access.write(Some(self.session_id()));
         let mut world = self
             .world
             .lock()
@@ -1726,6 +1861,7 @@ struct PreparedWorkspaceLoad {
 }
 
 pub struct SharedWorld {
+    access: Arc<SharedWorldAccess>,
     host: AnalysisHost,
     loaded_workspaces: Vec<LoadedWorkspace>,
     workspace_indexes: BTreeMap<String, usize>,
@@ -1745,6 +1881,7 @@ pub struct SharedWorld {
 impl SharedWorld {
     pub fn new() -> Self {
         Self {
+            access: Arc::new(SharedWorldAccess::default()),
             host: AnalysisHost::with_database(RootDatabase::new(None)),
             loaded_workspaces: Vec::new(),
             workspace_indexes: BTreeMap::new(),
@@ -1764,6 +1901,10 @@ impl SharedWorld {
 
     fn workspace_index(&self, load_key: &str) -> Option<usize> {
         self.workspace_indexes.get(load_key).copied()
+    }
+
+    fn access(&self) -> Arc<SharedWorldAccess> {
+        Arc::clone(&self.access)
     }
 
     fn prepare_workspace_load(
@@ -2017,14 +2158,14 @@ impl SharedWorld {
         }
     }
 
-    fn register_session(&mut self) -> (u64, Arc<AtomicBool>, Arc<AtomicU64>) {
+    fn register_session(&mut self) -> (u64, Arc<AtomicBool>, Arc<AtomicU64>, Arc<SharedWorldAccess>) {
         let id = self.next_session_id;
         self.next_session_id += 1;
         self.session_overlays
             .insert(id, ActiveSessionOverlay::default());
         let activity = Arc::new(AtomicBool::new(true));
         self.session_activity.insert(id, Arc::clone(&activity));
-        (id, activity, Arc::clone(&self.input_generation))
+        (id, activity, Arc::clone(&self.input_generation), self.access())
     }
 
     fn unregister_session(&mut self, session_id: u64) {

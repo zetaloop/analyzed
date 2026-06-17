@@ -609,14 +609,14 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
                 },
                 build_support::MethodParam {
                     name: "package_id",
-                    ty: "&Option<crate::flycheck::PackageSpecifier>",
+                    ty: "Option<crate::flycheck::PackageSpecifier>",
                 },
                 build_support::MethodParam {
                     name: "diag",
                     ty: "crate::diagnostics::flycheck_to_proto::MappedRustDiagnostic",
                 },
             ],
-            args: &["id", "generation", "&package_id", "diag"],
+            args: &["id", "generation", "package_id.clone()", "diag"],
         },
     )?;
     build_support::rename_function(

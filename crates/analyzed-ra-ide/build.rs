@@ -25,6 +25,23 @@ fn patch_ide_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let analyzed = owned_source_path("analyzed.rs");
     build_support::prepend_path_module(&mut source, None, "analyzed", &analyzed);
     println!("cargo:rerun-if-changed={}", analyzed.display());
+    build_support::append_struct_fields(
+        &mut source,
+        "Analysis",
+        "    analyzed_guard: Option<crate::analyzed::AnalyzedAnalysisGuard>,\n",
+    )?;
+    build_support::append_record_expr_fields_in_function(
+        &mut source,
+        "analysis",
+        "Analysis",
+        ", analyzed_guard: None",
+    )?;
+    build_support::append_record_expr_fields_in_function(
+        &mut source,
+        "from_ra_fixture_with_on_cursor",
+        "Analysis",
+        ", analyzed_guard: None",
+    )?;
 
     fs::write(lib_rs, source)?;
     Ok(())
