@@ -134,8 +134,9 @@ fn run_shared_state(
         }
         state.analyzed_shared.set_busy(true);
         state.handle_event(event);
-        let idle =
-            state.task_pool.handle.is_empty() && state.fmt_pool.handle.is_empty();
+        let idle = state.is_quiescent()
+            && state.task_pool.handle.is_empty()
+            && state.fmt_pool.handle.is_empty();
         state.analyzed_shared.set_busy(!idle);
     }
 
@@ -531,14 +532,10 @@ impl crate::global_state::GlobalState {
     }
 
     pub(crate) fn mark_prime_caches_gc(&mut self) {
-        crate::analyzed_bridge::shared_analyzer_registry().mark_gc_dirty();
+        crate::analyzed_bridge::shared_analyzer_registry().request_gc();
     }
 
-    pub(crate) fn mark_gc_when_idle(&mut self) {
-        if self.task_pool.handle.is_empty() && self.fmt_pool.handle.is_empty() {
-            crate::analyzed_bridge::shared_analyzer_registry().mark_gc_dirty();
-        }
-    }
+    pub(crate) fn mark_gc_when_idle(&mut self) {}
 
     pub(crate) fn handle_event(&mut self, event: super::Event) {
         self._handle_event(event)
@@ -564,9 +561,6 @@ impl crate::global_state::GlobalState {
                     None,
                     None,
                 );
-            }
-            super::Task::AnalyzedRunFlycheck(path) => {
-                crate::handlers::notification::run_flycheck(self, path);
             }
             _ => {
                 let upstream = UpstreamTask::try_from(task)

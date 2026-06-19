@@ -474,7 +474,7 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::append_enum_variants(
         &mut source,
         "Task",
-        "    AnalyzedFetchWorkspace(FetchWorkspaceResponse),\n    AnalyzedRunFlycheck(VfsPath),\n",
+        "    AnalyzedFetchWorkspace(FetchWorkspaceResponse),\n",
     )?;
     build_support::add_enum_variant_attribute(
         &mut source,

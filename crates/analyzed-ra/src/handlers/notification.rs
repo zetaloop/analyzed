@@ -8,7 +8,6 @@ use crate::{
     flycheck::{InvocationStrategy, PackageSpecifier, Target},
     global_state::{FetchWorkspaceRequest, GlobalState},
     lsp::from_proto,
-    main_loop::Task,
     reload,
     target_spec::TargetSpec,
     try_default,
@@ -83,7 +82,6 @@ pub(crate) fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
     let base_file_id = state.analyzed_shared.base_vfs_path_to_file_id(&vfs_path);
     let file_id = state.analyzed_shared.vfs_path_to_file_id(&vfs_path);
     if let (Ok(Some(_)), Ok(Some(file_id))) = (base_file_id, file_id) {
-        let analyzed_vfs_path = vfs_path.clone();
         let world = state.snapshot();
         let invocation_strategy = state.config.flycheck(None).invocation_strategy();
         let may_flycheck_workspace = state.config.flycheck_workspace(None);
@@ -139,7 +137,6 @@ pub(crate) fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
                     // we have a specific non-library target, attempt to only check that target, nothing
                     // else will be affected
                     let mut package_workspace_idx = None;
-                    let mut package_check_triggered = false;
                     if let Some((target, root, package)) = target {
                         // trigger a package check if we have a non-library target as that can't affect
                         // anything else in the workspace OR if we're not allowed to check the workspace as
@@ -181,7 +178,6 @@ pub(crate) fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
                                         workspace_deps,
                                         saved_file.clone(),
                                     );
-                                    package_check_triggered = true;
                                 }
                             }
                         }
@@ -245,11 +241,10 @@ pub(crate) fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
                                 ..
                             } => false,
                         };
-                        let is_pkg_ws = package_check_triggered
-                            && match package_workspace_idx {
-                                Some(pkg_idx) => pkg_idx == idx,
-                                None => false,
-                            };
+                        let is_pkg_ws = match package_workspace_idx {
+                            Some(pkg_idx) => pkg_idx == idx,
+                            None => false,
+                        };
                         ws_contains_file && !is_pkg_ws
                     });
 
@@ -266,7 +261,7 @@ pub(crate) fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
                     }
 
                     // No specific flycheck was triggered, so let's trigger all of them.
-                    if !workspace_check_triggered && !package_check_triggered {
+                    if !workspace_check_triggered && package_workspace_idx.is_none() {
                         for flycheck in world.flycheck.iter() {
                             flycheck.restart_workspace(saved_file.clone());
                         }
@@ -275,18 +270,11 @@ pub(crate) fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
                 }),
             };
 
-        state
-            .task_pool
-            .handle
-            .spawn_with_sender(stdx::thread::ThreadIntent::Worker, move |sender| {
-                match std::panic::catch_unwind(task) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_cancelled)) => {
-                        _ = sender.send(Task::AnalyzedRunFlycheck(analyzed_vfs_path));
-                    }
-                    Err(e) => tracing::error!("flycheck task panicked: {e:?}"),
-                }
-            });
+        state.task_pool.handle.spawn_with_sender(stdx::thread::ThreadIntent::Worker, move |_| {
+            if let Err(e) = std::panic::catch_unwind(task) {
+                tracing::error!("flycheck task panicked: {e:?}")
+            }
+        });
         true
     } else {
         false
