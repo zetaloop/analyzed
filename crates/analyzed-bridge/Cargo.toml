@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-flate2 = "1.1.5"
+flate2 = "1.1.9"
 ra_ap_syntax = "=0.0.337"
 serde_json.workspace = true
-sha2 = "0.10.9"
-tar = "0.4.44"
+sha2 = "0.11.0"
+tar = "0.4.46"
