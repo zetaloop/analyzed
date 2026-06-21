@@ -693,9 +693,9 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::extract_method(
         &mut source,
         "_handle_event",
-        build_support::ExtractSelector::LetBinding("current_revision"),
+        build_support::ExtractSelector::TopLevelMethodCall("trigger_garbage_collection"),
         0,
-        build_support::ExtractRange::StatementSequence { len: 2 },
+        build_support::ExtractRange::StatementSequence { len: 1 },
         build_support::ExtractedMethod {
             name: "mark_gc_when_idle",
             receiver: Some("&mut self"),

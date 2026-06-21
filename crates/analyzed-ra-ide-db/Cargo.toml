@@ -1,6 +1,6 @@
 [package]
 name = "ra_ap_ide_db"
-version = "0.0.334"
+version = "0.0.337"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -21,37 +21,37 @@ analyzed-bridge = { path = "../analyzed-bridge" }
 
 [dependencies]
 arrayvec = { version = "0.7.6" }
-base-db = { version = "=0.0.334", package = "ra_ap_base_db" }
+base-db = { version = "=0.0.337", package = "ra_ap_base_db" }
 bitflags = { version = "2.9.1" }
 cov-mark = { version = "2.0.0" }
 crossbeam-channel = { version = "0.5.15" }
 either = { version = "1.15.0" }
 fst = { version = "0.4.7", default-features = false }
-hir = { version = "=0.0.334", package = "ra_ap_hir" }
+hir = { version = "=0.0.337", package = "ra_ap_hir" }
 itertools = { version = "0.14.0" }
 line-index = { version = "0.1.2" }
-macros = { version = "=0.0.334", package = "ra_ap_macros" }
+macros = { version = "=0.0.337", package = "ra_ap_macros" }
 memchr = { version = "2.7.5" }
 nohash-hasher = { version = "0.2.0" }
-parser = { version = "=0.0.334", package = "ra_ap_parser" }
-profile = { version = "=0.0.334", package = "ra_ap_profile" }
+parser = { version = "=0.0.337", package = "ra_ap_parser" }
+profile = { version = "=0.0.337", package = "ra_ap_profile" }
 rayon = { version = "1.10.0" }
 rustc-hash = { version = "2.1.1" }
-salsa = { version = "0.26.2", features = ["rayon", "salsa_unstable", "macros", "inventory"], default-features = false }
-salsa-macros = { version = "0.26.2" }
+salsa = { version = "0.27.0", features = ["rayon", "salsa_unstable", "macros", "inventory"], default-features = false }
+salsa-macros = { version = "0.27.0" }
 smallvec = { version = "1.15.1", features = ["const_new", "union", "const_generics"] }
-span = { version = "=0.0.334", package = "ra_ap_span" }
-stdx = { version = "=0.0.334", package = "ra_ap_stdx" }
-syntax = { version = "=0.0.334", package = "ra_ap_syntax" }
-test-fixture = { version = "=0.0.334", package = "ra_ap_test_fixture" }
-test-utils = { version = "=0.0.334", package = "ra_ap_test_utils" }
+span = { version = "=0.0.337", package = "ra_ap_span" }
+stdx = { version = "=0.0.337", package = "ra_ap_stdx" }
+syntax = { version = "=0.0.337", package = "ra_ap_syntax" }
+test-fixture = { version = "=0.0.337", package = "ra_ap_test_fixture" }
+test-utils = { version = "=0.0.337", package = "ra_ap_test_utils" }
 tracing = { version = "0.1.41", features = ["std", "attributes"], default-features = false }
 triomphe = { version = "0.1.14", features = ["std"], default-features = false }
-vfs = { version = "=0.0.334", package = "ra_ap_vfs" }
+vfs = { version = "=0.0.337", package = "ra_ap_vfs" }
 
 [dev-dependencies]
 expect-test = "1.5.1"
-ra_ap_ide_db = "=0.0.334"
+ra_ap_ide_db = "=0.0.337"
 
 [lints.clippy]
 assigning_clones = "allow"

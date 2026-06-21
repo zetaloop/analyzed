@@ -1,6 +1,6 @@
 [package]
 name = "ra_ap_load-cargo"
-version = "0.0.334"
+version = "0.0.337"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -13,7 +13,7 @@ doctest = false
 test = false
 
 [features]
-in-rust-tree = ["hir-expand/in-rust-tree"]
+in-rust-tree = ["hir-expand/in-rust-tree", "proc-macro-api/in-rust-tree"]
 
 [build-dependencies]
 analyzed-bridge = { path = "../analyzed-bridge" }
@@ -21,20 +21,20 @@ analyzed-bridge = { path = "../analyzed-bridge" }
 [dependencies]
 anyhow = { version = "1.0.98" }
 crossbeam-channel = { version = "0.5.15" }
-hir-expand = { version = "=0.0.334", package = "ra_ap_hir_expand" }
+hir-expand = { version = "=0.0.337", package = "ra_ap_hir_expand" }
 ide-db = { path = "../analyzed-ra-ide-db", package = "ra_ap_ide_db" }
-intern = { version = "=0.0.334", package = "ra_ap_intern" }
+intern = { version = "=0.0.337", package = "ra_ap_intern" }
 itertools = { version = "0.14.0" }
-proc-macro-api = { version = "=0.0.334", package = "ra_ap_proc_macro_api" }
-project-model = { version = "=0.0.334", package = "ra_ap_project_model" }
-span = { version = "=0.0.334", package = "ra_ap_span" }
+proc-macro-api = { version = "=0.0.337", package = "ra_ap_proc_macro_api" }
+project-model = { version = "=0.0.337", package = "ra_ap_project_model" }
+span = { version = "=0.0.337", package = "ra_ap_span" }
 tracing = { version = "0.1.41", features = ["std"], default-features = false }
-tt = { version = "=0.0.334", package = "ra_ap_tt" }
-vfs = { version = "=0.0.334", package = "ra_ap_vfs" }
-vfs-notify = { version = "=0.0.334", package = "ra_ap_vfs-notify" }
+tt = { version = "=0.0.337", package = "ra_ap_tt" }
+vfs = { version = "=0.0.337", package = "ra_ap_vfs" }
+vfs-notify = { version = "=0.0.337", package = "ra_ap_vfs-notify" }
 
 [dev-dependencies]
-ra_ap_load-cargo = "=0.0.334"
+ra_ap_load-cargo = "=0.0.337"
 
 [lints.clippy]
 assigning_clones = "allow"
