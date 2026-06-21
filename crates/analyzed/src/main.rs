@@ -4,10 +4,10 @@ use std::{
 };
 
 use analyzed_ipc::RuntimePaths;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Rust analysis daemon")]
+#[command(about = "Rust analysis daemon")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -26,7 +26,10 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command()
+        .version(analyzed_daemon::version())
+        .get_matches();
+    let cli = Cli::from_arg_matches(&matches)?;
 
     match cli.command {
         Some(Command::Status) => print_status()?,

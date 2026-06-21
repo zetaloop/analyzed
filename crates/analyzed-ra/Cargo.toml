@@ -20,7 +20,9 @@ jemalloc = ["jemallocator", "profile/jemalloc"]
 
 [build-dependencies]
 analyzed-bridge = { path = "../analyzed-bridge" }
+serde_json = "1.0.150"
 toml = "0.9.8"
+ureq = "3.3.0"
 
 [dependencies]
 anyhow = { version = "1.0.98" }

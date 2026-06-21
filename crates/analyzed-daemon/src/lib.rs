@@ -23,6 +23,14 @@ use lsp_server::{Connection, Message};
 use ra_ap_rust_analyzer::{SharedAnalyzerProvider, shared_analyzer_registry};
 use serde::Serialize;
 
+pub fn version() -> String {
+    format!(
+        "{} (rust-analyzer {})",
+        env!("CARGO_PKG_VERSION"),
+        ra_ap_rust_analyzer::RUST_ANALYZER_VERSION
+    )
+}
+
 #[derive(Debug, Serialize)]
 pub struct DaemonStatus {
     running: bool,

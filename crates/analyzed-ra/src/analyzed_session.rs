@@ -12,7 +12,7 @@ use vfs::{AbsPathBuf, ChangeKind, VfsPath};
 use crate::{
     analyzed_bridge::{SharedAnalyzerProvider, SharedAnalyzerRuntime, patch_path_prefix},
     config::{Config, ConfigChange, ConfigErrors},
-    from_json, server_capabilities, version,
+    from_json, server_capabilities,
     global_state::FetchWorkspaceRequest,
     line_index::LineEndings,
 };
@@ -56,7 +56,7 @@ pub(crate) fn run_shared_lsp_session(
         capabilities: server_capabilities(&config),
         server_info: Some(lsp_types::ServerInfo {
             name: String::from("rust-analyzer"),
-            version: Some(version().to_string()),
+            version: Some(crate::RUST_ANALYZER_VERSION.to_owned()),
         }),
         offset_encoding: None,
     };

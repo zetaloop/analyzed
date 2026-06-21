@@ -3,6 +3,7 @@ use std::{
     error::Error,
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use toml::{Table, Value, map::Map};
@@ -10,10 +11,16 @@ use toml::{Table, Value, map::Map};
 use analyzed_bridge as build_support;
 
 const RA_PACKAGE: &str = "ra_ap_rust-analyzer";
+const RA_REPOSITORY: &str = "rust-lang/rust-analyzer";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let (generated, package) =
         build_support::prepare_bridge_package(RA_PACKAGE, "ra_ap_rust_analyzer_bridge")?;
+    let revision = package
+        .git_revision
+        .as_deref()
+        .ok_or("ra_ap_rust-analyzer does not contain .cargo_vcs_info.json")?;
+    let release = rust_analyzer_release(revision)?;
     verify_manifest_matches_bridge(&generated.join("Cargo.toml"))?;
     let generated_src = generated.join("src");
     patch_config_source(&generated_src.join("config.rs"))?;
@@ -31,12 +38,144 @@ fn main() -> Result<(), Box<dyn Error>> {
     let slow_tests = generated.join("tests/slow-tests");
     patch_slow_tests(&slow_tests)?;
     let slow_tests_wrapper = write_slow_tests_wrapper(&slow_tests)?;
-    println!("cargo:rustc-env=ANALYZED_RA_VERSION={}", package.version);
+    println!(
+        "cargo:rustc-env=ANALYZED_RA_CRATE_VERSION={}",
+        package.version
+    );
+    println!(
+        "cargo:rustc-env=ANALYZED_RA_RELEASE_VERSION={}",
+        release.version
+    );
+    println!("cargo:rustc-env=ANALYZED_RA_COMMIT_HASH={revision}");
+    println!(
+        "cargo:rustc-env=ANALYZED_RA_VERSION={} {}",
+        release.version,
+        &revision[..8]
+    );
     println!(
         "cargo:rustc-env=ANALYZED_RA_SLOW_TESTS={}",
         slow_tests_wrapper.display()
     );
+    println!("cargo:rerun-if-env-changed=GITHUB_TOKEN");
     println!("cargo:rerun-if-changed=build.rs");
+    Ok(())
+}
+
+struct RustAnalyzerRelease {
+    version: String,
+}
+
+fn rust_analyzer_release(revision: &str) -> Result<RustAnalyzerRelease, Box<dyn Error>> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .new_agent();
+
+    for page in 1.. {
+        let releases = github_get(
+            &agent,
+            &format!("/repos/{RA_REPOSITORY}/releases?per_page=100&page={page}"),
+        )?;
+        let releases = releases
+            .as_array()
+            .ok_or("GitHub releases response is not an array")?;
+
+        for release in releases {
+            let Some(body) = release.get("body").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if release_commit(body) != Some(revision) {
+                continue;
+            }
+            let tag = release
+                .get("tag_name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("matching rust-analyzer release has no tag_name")?;
+            let version = release_version(body)
+                .ok_or("matching rust-analyzer release has no extension version")?;
+            verify_release_tag(&agent, tag, revision)?;
+            return Ok(RustAnalyzerRelease {
+                version: version.to_owned(),
+            });
+        }
+
+        if releases.len() < 100 {
+            break;
+        }
+    }
+
+    Err(format!("could not find a rust-analyzer release for commit {revision}").into())
+}
+
+fn github_get(agent: &ureq::Agent, path: &str) -> Result<serde_json::Value, Box<dyn Error>> {
+    let url = format!("https://api.github.com{path}");
+    let mut request = agent
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header(
+            "User-Agent",
+            format!("analyzed/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Ok(token) = env::var("GITHUB_TOKEN") {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let mut response = request.call()?;
+    Ok(serde_json::from_str(
+        &response.body_mut().read_to_string()?,
+    )?)
+}
+
+fn release_commit(body: &str) -> Option<&str> {
+    body.lines()
+        .find(|line| line.starts_with("Commit: "))
+        .and_then(|line| line.split_once("/commit/"))
+        .and_then(|(_, revision)| revision.split(')').next())
+}
+
+fn release_version(body: &str) -> Option<&str> {
+    let line = body.lines().find(|line| line.starts_with("Release: "))?;
+    let (_, version) = line.rsplit_once(" (`")?;
+    let (version, _) = version.split_once("`)")?;
+    let mut parts = version.strip_prefix('v')?.split('.');
+    let parts = (parts.next()?, parts.next()?, parts.next()?, parts.next());
+    if parts.3.is_none()
+        && [parts.0, parts.1, parts.2]
+            .into_iter()
+            .all(|part| part.parse::<u64>().is_ok())
+    {
+        Some(version)
+    } else {
+        None
+    }
+}
+
+fn verify_release_tag(
+    agent: &ureq::Agent,
+    tag: &str,
+    expected_revision: &str,
+) -> Result<(), Box<dyn Error>> {
+    let reference = github_get(agent, &format!("/repos/{RA_REPOSITORY}/git/ref/tags/{tag}"))?;
+    let object = reference
+        .get("object")
+        .ok_or("rust-analyzer release tag has no object")?;
+    let actual_revision = object
+        .get("sha")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("rust-analyzer release tag has no object SHA")?;
+    let object_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("rust-analyzer release tag has no object type")?;
+    if object_type != "commit" {
+        return Err(format!("rust-analyzer release tag {tag} is not a lightweight tag").into());
+    }
+    if actual_revision != expected_revision {
+        return Err(format!(
+            "rust-analyzer release tag {tag} points to {actual_revision}, expected {expected_revision}"
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -263,6 +402,7 @@ pub(crate) mod analyzed_reload;
 {upstream_root}
 
 pub use analyzed_bridge::{{
+    RUST_ANALYZER_COMMIT_HASH, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_RELEASE_VERSION,
     RUST_ANALYZER_VERSION,
     PackageInstance, PackageInstanceKey, RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary,
     SessionOverlay, SessionOverlayCrate, SessionOverlayFile, SharedAnalyzerBackendKey,

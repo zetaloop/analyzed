@@ -17,19 +17,21 @@ use sha2::{Digest, Sha256};
 pub struct LockedPackage {
     pub version: String,
     pub checksum: String,
+    pub git_revision: Option<String>,
 }
 
 pub fn prepare_bridge_package(
     package_name: &str,
     generated_dir: &str,
 ) -> Result<(PathBuf, LockedPackage), Box<dyn Error>> {
-    let package = locked_package(package_name)?;
+    let mut package = locked_package(package_name)?;
     let archive = registry_archive(package_name, &package)?;
     verify_archive_checksum(&archive, &package)?;
 
     let generated =
         PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo")).join(generated_dir);
     unpack_crate_archive(package_name, &archive, &generated, &package)?;
+    package.git_revision = crate_git_revision(&generated)?;
     rewrite_lib_header(&generated.join("src/lib.rs"))?;
 
     println!("cargo:rerun-if-changed={}", archive.display());
@@ -134,7 +136,30 @@ fn locked_package(package_name: &str) -> Result<LockedPackage, Box<dyn Error>> {
         )
     })?;
 
-    Ok(LockedPackage { version, checksum })
+    Ok(LockedPackage {
+        version,
+        checksum,
+        git_revision: None,
+    })
+}
+
+fn crate_git_revision(generated: &Path) -> Result<Option<String>, Box<dyn Error>> {
+    let path = generated.join(".cargo_vcs_info.json");
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let info: serde_json::Value = serde_json::from_str(&source)?;
+    let revision = info
+        .get("git")
+        .and_then(|git| git.get("sha1"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(".cargo_vcs_info.json does not contain git.sha1")?;
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("invalid git.sha1 in .cargo_vcs_info.json: {revision}").into());
+    }
+    Ok(Some(revision.to_ascii_lowercase()))
 }
 
 fn locked_package_checksum(

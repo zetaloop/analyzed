@@ -28,6 +28,9 @@
 	use serde::Serialize;
 	use vfs::{AbsPathBuf, Vfs, VfsPath};
 
+pub const RUST_ANALYZER_CRATE_VERSION: &str = env!("ANALYZED_RA_CRATE_VERSION");
+pub const RUST_ANALYZER_RELEASE_VERSION: &str = env!("ANALYZED_RA_RELEASE_VERSION");
+pub const RUST_ANALYZER_COMMIT_HASH: &str = env!("ANALYZED_RA_COMMIT_HASH");
 pub const RUST_ANALYZER_VERSION: &str = env!("ANALYZED_RA_VERSION");
 
 #[derive(Clone, Debug, Serialize)]
@@ -840,7 +843,7 @@ pub(crate) fn shared_analyzer_context_from_config(
     };
     let backend_key = SharedAnalyzerBackendKey {
         shared_world: SharedAnalyzerWorldKey {
-            rust_analyzer_version: RUST_ANALYZER_VERSION.to_owned(),
+            rust_analyzer_version: RUST_ANALYZER_COMMIT_HASH.to_owned(),
             toolchain: env::var("RUSTUP_TOOLCHAIN").ok(),
             sysroot: env::var("RUST_SRC_PATH").ok(),
             cargo_target: cargo_config

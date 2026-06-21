@@ -27,7 +27,7 @@ analyzed-ipc = { path = "crates/analyzed-ipc" }
 ra_ap_rust-analyzer = { path = "crates/analyzed-ra" }
 
 anyhow = "1.0.102"
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive", "string"] }
 crossbeam-channel = "0.5.15"
 lsp-server = "0.7.9"
 serde = { version = "1.0.228", features = ["derive"] }
