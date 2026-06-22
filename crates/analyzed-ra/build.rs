@@ -619,9 +619,11 @@ fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::extract_method(
         &mut source,
         "switch_workspaces",
-        build_support::ExtractSelector::TopLevelMethodCall("recreate_crate_graph"),
-        3,
-        build_support::ExtractRange::StatementSequence { len: 1 },
+        build_support::ExtractSelector::LetBinding("cancellation_time"),
+        0,
+        build_support::ExtractRange::Initializer {
+            return_ty: "Option<Duration>",
+        },
         build_support::ExtractedMethod {
             name: "recreate_crate_graph_after_shared_reload",
             receiver: Some("&mut self"),
