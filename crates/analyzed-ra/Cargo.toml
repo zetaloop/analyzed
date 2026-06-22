@@ -1,9 +1,11 @@
 [package]
-name = "ra_ap_rust-analyzer"
-version = "0.0.337"
+name = "analyzed-ra"
+version.workspace = true
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
+repository.workspace = true
+description = "Patched rust-analyzer bridge crate for analyzed"
 build = "build.rs"
 
 [lib]
@@ -19,9 +21,8 @@ in-rust-tree = ["cfg/in-rust-tree", "hir-def/in-rust-tree", "hir-ty/in-rust-tree
 jemalloc = ["jemallocator", "profile/jemalloc"]
 
 [build-dependencies]
-analyzed-bridge = { path = "../analyzed-bridge" }
+analyzed-bridge = { path = "../analyzed-bridge", version = "=0.3.0" }
 serde_json = "1.0.150"
-toml = "0.9.8"
 ureq = "3.3.0"
 
 [dependencies]
@@ -36,13 +37,13 @@ dissimilar = { version = "1.0.10" }
 hir = { version = "=0.0.337", package = "ra_ap_hir" }
 hir-def = { version = "=0.0.337", package = "ra_ap_hir_def" }
 hir-ty = { version = "=0.0.337", package = "ra_ap_hir_ty" }
-ide = { path = "../analyzed-ra-ide", package = "ra_ap_ide" }
-ide-completion = { path = "../analyzed-ra-ide-completion", package = "ra_ap_ide_completion" }
-ide-db = { path = "../analyzed-ra-ide-db", package = "ra_ap_ide_db" }
-ide-ssr = { path = "../analyzed-ra-ide-ssr", package = "ra_ap_ide_ssr" }
+ide = { path = "../analyzed-ra-ide", package = "analyzed-ra-ide", version = "=0.3.0" }
+ide-completion = { path = "../analyzed-ra-ide-completion", package = "analyzed-ra-ide-completion", version = "=0.3.0" }
+ide-db = { path = "../analyzed-ra-ide-db", package = "analyzed-ra-ide-db", version = "=0.3.0" }
+ide-ssr = { path = "../analyzed-ra-ide-ssr", package = "analyzed-ra-ide-ssr", version = "=0.3.0" }
 indexmap = { version = "2.9.0", features = ["serde"] }
 itertools = { version = "0.14.0" }
-load-cargo = { path = "../analyzed-ra-load-cargo", package = "ra_ap_load-cargo" }
+load-cargo = { path = "../analyzed-ra-load-cargo", package = "analyzed-ra-load-cargo", version = "=0.3.0" }
 lsp-server = { version = "0.7.9" }
 lsp-types = { version = "=0.95.0", features = ["proposed"] }
 memchr = { version = "2.7.5" }
@@ -82,12 +83,14 @@ xflags = { version = "0.3.2" }
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemallocator = { version = "0.5.4", package = "tikv-jemallocator", optional = true }
 
+[target.'cfg(any())'.dependencies]
+ra_ap_rust-analyzer = "=0.0.337"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug", "Win32_System_Threading"] }
 
 [dev-dependencies]
 expect-test = "1.5.1"
-rust-analyzer = { version = "=0.0.337", package = "ra_ap_rust-analyzer" }
 test-fixture = { version = "=0.0.337", package = "ra_ap_test_fixture" }
 test-utils = { version = "=0.0.337", package = "ra_ap_test_utils" }
 

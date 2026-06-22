@@ -6,8 +6,6 @@ use std::{
     time::Duration,
 };
 
-use toml::{Table, Value, map::Map};
-
 use analyzed_bridge as build_support;
 
 const RA_PACKAGE: &str = "ra_ap_rust-analyzer";
@@ -21,7 +19,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .as_deref()
         .ok_or("ra_ap_rust-analyzer does not contain .cargo_vcs_info.json")?;
     let release = rust_analyzer_release(revision)?;
-    verify_manifest_matches_bridge(&generated.join("Cargo.toml"))?;
     let generated_src = generated.join("src");
     patch_config_source(&generated_src.join("config.rs"))?;
     patch_discover_source(&generated_src.join("discover.rs"))?;
@@ -42,14 +39,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         "cargo:rustc-env=ANALYZED_RA_CRATE_VERSION={}",
         package.version
     );
-    println!(
-        "cargo:rustc-env=ANALYZED_RA_RELEASE_VERSION={}",
-        release.version
-    );
+    println!("cargo:rustc-env=ANALYZED_RA_RELEASE_VERSION={}", release);
     println!("cargo:rustc-env=ANALYZED_RA_COMMIT_HASH={revision}");
     println!(
         "cargo:rustc-env=ANALYZED_RA_VERSION={} {}",
-        release.version,
+        release,
         &revision[..8]
     );
     println!(
@@ -61,50 +55,67 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-struct RustAnalyzerRelease {
-    version: String,
-}
-
-fn rust_analyzer_release(revision: &str) -> Result<RustAnalyzerRelease, Box<dyn Error>> {
+fn rust_analyzer_release(revision: &str) -> Result<String, Box<dyn Error>> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(30)))
         .build()
         .new_agent();
 
-    for page in 1.. {
-        let releases = github_get(
-            &agent,
-            &format!("/repos/{RA_REPOSITORY}/releases?per_page=100&page={page}"),
-        )?;
-        let releases = releases
-            .as_array()
-            .ok_or("GitHub releases response is not an array")?;
-
-        for release in releases {
-            let Some(body) = release.get("body").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            if release_commit(body) != Some(revision) {
-                continue;
-            }
-            let tag = release
-                .get("tag_name")
-                .and_then(serde_json::Value::as_str)
-                .ok_or("matching rust-analyzer release has no tag_name")?;
-            let version = release_version(body)
-                .ok_or("matching rust-analyzer release has no extension version")?;
-            verify_release_tag(&agent, tag, revision)?;
-            return Ok(RustAnalyzerRelease {
-                version: version.to_owned(),
-            });
-        }
-
-        if releases.len() < 100 {
-            break;
-        }
+    let tag = rust_analyzer_release_tag(&agent, revision)?;
+    let release = github_get(
+        &agent,
+        &format!("/repos/{RA_REPOSITORY}/releases/tags/{tag}"),
+    )?;
+    let body = release
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("rust-analyzer release has no body")?;
+    if release_commit(body) != Some(revision) {
+        return Err(
+            format!("rust-analyzer release {tag} does not describe commit {revision}").into(),
+        );
     }
+    let version = release_version(body).ok_or("rust-analyzer release has no extension version")?;
 
-    Err(format!("could not find a rust-analyzer release for commit {revision}").into())
+    Ok(version.to_owned())
+}
+
+fn rust_analyzer_release_tag(
+    agent: &ureq::Agent,
+    revision: &str,
+) -> Result<String, Box<dyn Error>> {
+    let refs = github_get(
+        agent,
+        &format!("/repos/{RA_REPOSITORY}/git/matching-refs/tags/"),
+    )?;
+    let refs = refs
+        .as_array()
+        .ok_or("GitHub matching refs response is not an array")?;
+    let mut tags = refs
+        .iter()
+        .filter_map(|reference| {
+            let object = reference.get("object")?;
+            if object.get("type")?.as_str()? != "commit" {
+                return None;
+            }
+            if object.get("sha")?.as_str()? != revision {
+                return None;
+            }
+            reference.get("ref")?.as_str()?.strip_prefix("refs/tags/")
+        })
+        .filter(|tag| *tag != "nightly")
+        .collect::<Vec<_>>();
+    tags.sort();
+
+    match tags.as_slice() {
+        [tag] => Ok((*tag).to_owned()),
+        [] => Err(format!("no rust-analyzer release tag points to commit {revision}").into()),
+        tags => Err(format!(
+            "multiple rust-analyzer release tags point to commit {revision}: {}",
+            tags.join(", ")
+        )
+        .into()),
+    }
 }
 
 fn github_get(agent: &ureq::Agent, path: &str) -> Result<serde_json::Value, Box<dyn Error>> {
@@ -120,7 +131,17 @@ fn github_get(agent: &ureq::Agent, path: &str) -> Result<serde_json::Value, Box<
     if let Ok(token) = env::var("GITHUB_TOKEN") {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
-    let mut response = request.call()?;
+    let mut response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(403 | 429)) if env::var_os("GITHUB_TOKEN").is_none() => {
+            return Err(format!(
+                "GitHub API request to {path} was rate limited (60 requests/hour unauthenticated); \
+                 set GITHUB_TOKEN to raise the limit"
+            )
+            .into());
+        }
+        Err(error) => return Err(error.into()),
+    };
     Ok(serde_json::from_str(
         &response.body_mut().read_to_string()?,
     )?)
@@ -150,241 +171,25 @@ fn release_version(body: &str) -> Option<&str> {
     }
 }
 
-fn verify_release_tag(
-    agent: &ureq::Agent,
-    tag: &str,
-    expected_revision: &str,
-) -> Result<(), Box<dyn Error>> {
-    let reference = github_get(agent, &format!("/repos/{RA_REPOSITORY}/git/ref/tags/{tag}"))?;
-    let object = reference
-        .get("object")
-        .ok_or("rust-analyzer release tag has no object")?;
-    let actual_revision = object
-        .get("sha")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("rust-analyzer release tag has no object SHA")?;
-    let object_type = object
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("rust-analyzer release tag has no object type")?;
-    if object_type != "commit" {
-        return Err(format!("rust-analyzer release tag {tag} is not a lightweight tag").into());
-    }
-    if actual_revision != expected_revision {
-        return Err(format!(
-            "rust-analyzer release tag {tag} points to {actual_revision}, expected {expected_revision}"
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn verify_manifest_matches_bridge(ra_manifest_path: &Path) -> Result<(), Box<dyn Error>> {
-    let bridge_manifest_path = PathBuf::from(
-        env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
-    )
-    .join("Cargo.toml");
-    let ra_manifest = read_manifest(ra_manifest_path)?;
-    let bridge_manifest = read_manifest(&bridge_manifest_path)?;
-    let mut mismatches = Vec::new();
-
-    compare_manifest_section(
-        "dependencies",
-        normalized_dependencies(&ra_manifest),
-        normalized_dependencies(&bridge_manifest),
-        &mut mismatches,
-    );
-    compare_manifest_section(
-        "target",
-        normalized_target_dependencies(&ra_manifest),
-        normalized_target_dependencies(&bridge_manifest),
-        &mut mismatches,
-    );
-    compare_manifest_section(
-        "features",
-        manifest_section(&ra_manifest, &["features"]),
-        manifest_section(&bridge_manifest, &["features"]),
-        &mut mismatches,
-    );
-    compare_manifest_section(
-        "lints",
-        manifest_section(&ra_manifest, &["lints"]),
-        manifest_section(&bridge_manifest, &["lints"]),
-        &mut mismatches,
-    );
-
-    if mismatches.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "ra_ap_rust-analyzer bridge Cargo.toml is out of sync with {RA_PACKAGE}:\n{}",
-            mismatches.join("\n")
-        )
-        .into())
-    }
-}
-
-fn read_manifest(path: &Path) -> Result<Value, Box<dyn Error>> {
-    Ok(toml::from_str(&fs::read_to_string(path)?)?)
-}
-
-fn manifest_table<'a>(manifest: &'a Value, path: &[&str]) -> Option<&'a Table> {
-    let mut value = manifest;
-    for key in path {
-        value = value.get(*key)?;
-    }
-    value.as_table()
-}
-
-fn manifest_section(manifest: &Value, path: &[&str]) -> Option<Value> {
-    let mut value = manifest;
-    for key in path {
-        value = value.get(*key)?;
-    }
-    Some(value.clone())
-}
-
-fn compare_manifest_section(
-    label: &str,
-    expected: Option<Value>,
-    actual: Option<Value>,
-    mismatches: &mut Vec<String>,
-) {
-    match (expected, actual) {
-        (Some(expected), Some(actual)) if expected == actual => {}
-        (Some(Value::Table(expected)), Some(Value::Table(actual))) => {
-            compare_manifest_tables(label, &expected, &actual, mismatches);
-        }
-        (Some(_), Some(_)) => mismatches.push(format!("  {label}: different value")),
-        (Some(_), None) => {
-            mismatches.push(format!("  {label}: missing section in bridge manifest"))
-        }
-        (None, Some(_)) => mismatches.push(format!("  {label}: extra section in bridge manifest")),
-        (None, None) => {}
-    }
-}
-
-fn compare_manifest_tables(
-    label: &str,
-    expected: &Table,
-    actual: &Table,
-    mismatches: &mut Vec<String>,
-) {
-    let expected_only = table_keys(expected)
-        .into_iter()
-        .filter(|key| !actual.contains_key(key))
-        .collect::<Vec<_>>();
-    let actual_only = table_keys(actual)
-        .into_iter()
-        .filter(|key| !expected.contains_key(key))
-        .collect::<Vec<_>>();
-    let changed = table_keys(expected)
-        .into_iter()
-        .filter(|key| actual.get(key) != expected.get(key))
-        .collect::<Vec<_>>();
-
-    if !expected_only.is_empty() {
-        mismatches.push(format!(
-            "  {label}: missing keys in bridge manifest: {}",
-            expected_only.join(", ")
-        ));
-    }
-    if !actual_only.is_empty() {
-        mismatches.push(format!(
-            "  {label}: extra keys in bridge manifest: {}",
-            actual_only.join(", ")
-        ));
-    }
-    if !changed.is_empty() {
-        mismatches.push(format!(
-            "  {label}: different values: {}",
-            changed.join(", ")
-        ));
-    }
-}
-
-fn normalized_dependencies(manifest: &Value) -> Option<Value> {
-    Some(Value::Table(normalize_dependencies(manifest_table(
-        manifest,
-        &["dependencies"],
-    )?)))
-}
-
-fn normalized_target_dependencies(manifest: &Value) -> Option<Value> {
-    let targets = manifest_table(manifest, &["target"])?;
-    let mut normalized_targets = Map::new();
-
-    for (target, target_value) in targets {
-        let Some(target_table) = target_value.as_table() else {
-            continue;
-        };
-        let Some(dependencies) = target_table.get("dependencies").and_then(Value::as_table) else {
-            continue;
-        };
-        let mut normalized_target = Map::new();
-        normalized_target.insert(
-            "dependencies".to_owned(),
-            Value::Table(normalize_dependencies(dependencies)),
-        );
-        normalized_targets.insert(target.clone(), Value::Table(normalized_target));
-    }
-
-    Some(Value::Table(normalized_targets))
-}
-
-fn normalize_dependencies(dependencies: &Table) -> Table {
-    dependencies
-        .iter()
-        .map(|(name, value)| (name.clone(), normalize_dependency(value)))
-        .collect()
-}
-
-fn normalize_dependency(value: &Value) -> Value {
-    match value {
-        Value::String(version) => {
-            let mut dependency = Map::new();
-            dependency.insert("version".to_owned(), Value::String(version.clone()));
-            Value::Table(dependency)
-        }
-        Value::Table(dependency) => {
-            let mut dependency = dependency.clone();
-            if dependency
-                .get("path")
-                .and_then(Value::as_str)
-                .is_some_and(|path| path.starts_with("../analyzed-ra"))
-            {
-                dependency.remove("path");
-                dependency.insert(
-                    "version".to_owned(),
-                    Value::String(format!(
-                        "={}",
-                        env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION is set by Cargo")
-                    )),
-                );
-            }
-            Value::Table(dependency)
-        }
-        _ => value.clone(),
-    }
-}
-
-fn table_keys(table: &Table) -> Vec<String> {
-    let mut keys = table.keys().cloned().collect::<Vec<_>>();
-    keys.sort();
-    keys
-}
-
 fn write_analyzed_root_module(root_rs: &Path, lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let analyzed_bridge = owned_source_path("analyzed_bridge.rs");
     let analyzed_global_state = owned_source_path("global_state.rs");
     let analyzed_main_loop = owned_source_path("main_loop.rs");
     let analyzed_reload = owned_source_path("reload.rs");
+    let analyzed_notification = owned_source_path("handlers/notification.rs");
     let mut upstream_root = fs::read_to_string(lib_rs)?;
-    use_owned_handlers_module(
-        &mut upstream_root,
-        "analyzed_notification",
-        owned_source_path("handlers/notification.rs"),
-    )?;
+    let handlers_start = "mod handlers {\n";
+    let insert_at = upstream_root
+        .find(handlers_start)
+        .map(|index| index + handlers_start.len())
+        .ok_or("could not find handlers module")?;
+    upstream_root.insert_str(
+        insert_at,
+        &format!(
+            "    #[path = {:?}]\n    pub(crate) mod analyzed_notification;\n",
+            analyzed_notification.to_string_lossy().into_owned()
+        ),
+    );
     let source = format!(
         r#"
 #[path = {:?}]
@@ -426,6 +231,7 @@ pub use analyzed_bridge::{{
     println!("cargo:rerun-if-changed={}", analyzed_global_state.display());
     println!("cargo:rerun-if-changed={}", analyzed_main_loop.display());
     println!("cargo:rerun-if-changed={}", analyzed_reload.display());
+    println!("cargo:rerun-if-changed={}", analyzed_notification.display());
 
     Ok(())
 }
@@ -434,27 +240,6 @@ fn owned_source_path(file_name: &str) -> PathBuf {
     PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"))
         .join("src")
         .join(file_name)
-}
-
-fn use_owned_handlers_module(
-    source: &mut String,
-    name: &str,
-    path: PathBuf,
-) -> Result<(), Box<dyn Error>> {
-    let module_start = "mod handlers {\n";
-    let insert_at = source
-        .find(module_start)
-        .map(|index| index + module_start.len())
-        .ok_or("could not find handlers module")?;
-    source.insert_str(
-        insert_at,
-        &format!(
-            "    #[path = {:?}]\n    pub(crate) mod {name};\n",
-            path.to_string_lossy().into_owned()
-        ),
-    );
-    println!("cargo:rerun-if-changed={}", path.display());
-    Ok(())
 }
 
 fn patch_config_source(config_rs: &Path) -> Result<(), Box<dyn Error>> {

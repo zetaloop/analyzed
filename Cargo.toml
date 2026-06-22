@@ -20,11 +20,12 @@ version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
+repository = "https://github.com/zetaloop/analyzed"
 
 [workspace.dependencies]
-analyzed-daemon = { path = "crates/analyzed-daemon" }
-analyzed-ipc = { path = "crates/analyzed-ipc" }
-ra_ap_rust-analyzer = { path = "crates/analyzed-ra" }
+analyzed-daemon = { path = "crates/analyzed-daemon", version = "=0.3.0" }
+analyzed-ipc = { path = "crates/analyzed-ipc", version = "=0.3.0" }
+ra_ap_rust-analyzer = { path = "crates/analyzed-ra", package = "analyzed-ra", version = "=0.3.0" }
 
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive", "string"] }

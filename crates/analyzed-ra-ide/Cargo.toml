@@ -1,9 +1,11 @@
 [package]
-name = "ra_ap_ide"
-version = "0.0.337"
+name = "analyzed-ra-ide"
+version.workspace = true
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
+repository.workspace = true
+description = "Patched ra_ap_ide bridge crate for analyzed"
 build = "build.rs"
 
 [lib]
@@ -16,7 +18,7 @@ test = false
 in-rust-tree = []
 
 [build-dependencies]
-analyzed-bridge = { path = "../analyzed-bridge" }
+analyzed-bridge = { path = "../analyzed-bridge", version = "=0.3.0" }
 
 [dependencies]
 arrayvec = { version = "0.7.6" }
@@ -25,11 +27,11 @@ cov-mark = { version = "2.0.0" }
 dot = { version = "0.1.4" }
 either = { version = "1.15.0" }
 hir = { version = "=0.0.337", package = "ra_ap_hir" }
-ide-assists = { path = "../analyzed-ra-ide-assists", package = "ra_ap_ide_assists" }
-ide-completion = { path = "../analyzed-ra-ide-completion", package = "ra_ap_ide_completion" }
-ide-db = { path = "../analyzed-ra-ide-db", package = "ra_ap_ide_db" }
-ide-diagnostics = { path = "../analyzed-ra-ide-diagnostics", package = "ra_ap_ide_diagnostics" }
-ide-ssr = { path = "../analyzed-ra-ide-ssr", package = "ra_ap_ide_ssr" }
+ide-assists = { path = "../analyzed-ra-ide-assists", package = "analyzed-ra-ide-assists", version = "=0.3.0" }
+ide-completion = { path = "../analyzed-ra-ide-completion", package = "analyzed-ra-ide-completion", version = "=0.3.0" }
+ide-db = { path = "../analyzed-ra-ide-db", package = "analyzed-ra-ide-db", version = "=0.3.0" }
+ide-diagnostics = { path = "../analyzed-ra-ide-diagnostics", package = "analyzed-ra-ide-diagnostics", version = "=0.3.0" }
+ide-ssr = { path = "../analyzed-ra-ide-ssr", package = "analyzed-ra-ide-ssr", version = "=0.3.0" }
 itertools = { version = "0.14.0" }
 macros = { version = "=0.0.337", package = "ra_ap_macros" }
 nohash-hasher = { version = "0.2.0" }
@@ -52,9 +54,11 @@ toolchain = { version = "=0.0.337", package = "ra_ap_toolchain" }
 
 [dev-dependencies]
 expect-test = "1.5.1"
-ra_ap_ide = "=0.0.337"
 test-fixture = { version = "=0.0.337", package = "ra_ap_test_fixture" }
 test-utils = { version = "=0.0.337", package = "ra_ap_test_utils" }
+
+[target.'cfg(any())'.dependencies]
+ra_ap_ide = "=0.0.337"
 
 [lints.clippy]
 assigning_clones = "allow"

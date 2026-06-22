@@ -1,9 +1,11 @@
 [package]
-name = "ra_ap_ide_db"
-version = "0.0.337"
+name = "analyzed-ra-ide-db"
+version.workspace = true
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
+repository.workspace = true
+description = "Patched ra_ap_ide_db bridge crate for analyzed"
 build = "build.rs"
 
 [lib]
@@ -17,7 +19,7 @@ default = []
 in-rust-tree = []
 
 [build-dependencies]
-analyzed-bridge = { path = "../analyzed-bridge" }
+analyzed-bridge = { path = "../analyzed-bridge", version = "=0.3.0" }
 
 [dependencies]
 arrayvec = { version = "0.7.6" }
@@ -51,6 +53,8 @@ vfs = { version = "=0.0.337", package = "ra_ap_vfs" }
 
 [dev-dependencies]
 expect-test = "1.5.1"
+
+[target.'cfg(any())'.dependencies]
 ra_ap_ide_db = "=0.0.337"
 
 [lints.clippy]
