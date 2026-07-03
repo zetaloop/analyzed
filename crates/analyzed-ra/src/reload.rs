@@ -81,27 +81,16 @@ impl GlobalState {
         });
     }
 
-    pub(crate) fn show_workspace_msrv_warnings(&mut self) {
-        if let Some(FetchWorkspaceResponse { analyzed_shared, .. }) =
-            self.fetch_workspaces_queue.last_op_result()
-        {
-            self.analyzed_shared = analyzed_shared.clone();
-        }
-        self.check_workspaces_msrv().for_each(|message| {
-            self.send_notification::<lsp_types::notification::ShowMessage>(
-                lsp_types::ShowMessageParams {
-                    typ: lsp_types::MessageType::WARNING,
-                    message,
-                },
-            );
-        });
-    }
-
     pub(crate) fn recreate_crate_graph_after_shared_reload(
         &mut self,
         cause: String,
         switching_from_empty_workspace: bool,
     ) -> Option<Duration> {
+        if let Some(FetchWorkspaceResponse { analyzed_shared, .. }) =
+            self.fetch_workspaces_queue.last_op_result()
+        {
+            self.analyzed_shared = analyzed_shared.clone();
+        }
         self.analyzed_reload_config_from_shared();
         self.recreate_crate_graph(cause, switching_from_empty_workspace)
     }

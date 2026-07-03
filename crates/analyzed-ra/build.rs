@@ -600,25 +600,6 @@ fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::extract_method(
         &mut source,
         "switch_workspaces",
-        build_support::ExtractSelector::TopLevelMethodCall("for_each"),
-        0,
-        build_support::ExtractRange::StatementSequence { len: 1 },
-        build_support::ExtractedMethod {
-            name: "show_workspace_msrv_warnings",
-            receiver: Some("&mut self"),
-            params: &[],
-            args: &[],
-        },
-    )?;
-    build_support::rename_function(
-        &mut source,
-        "show_workspace_msrv_warnings",
-        "_show_workspace_msrv_warnings",
-    )?;
-    build_support::allow_dead_code_for_function(&mut source, "_show_workspace_msrv_warnings")?;
-    build_support::extract_method(
-        &mut source,
-        "switch_workspaces",
         build_support::ExtractSelector::LetBinding("cancellation_time"),
         0,
         build_support::ExtractRange::Initializer {
