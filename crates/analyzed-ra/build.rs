@@ -604,38 +604,11 @@ fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
         "switch_workspaces",
         "FetchWorkspaceResponse",
     )?;
-    build_support::extract_method(
+    build_support::redirect_top_level_method_call(
         &mut source,
         "switch_workspaces",
-        build_support::ExtractSelector::LetBinding("cancellation_time"),
-        0,
-        build_support::ExtractRange::Initializer {
-            return_ty: "Option<Duration>",
-        },
-        build_support::ExtractedMethod {
-            name: "recreate_crate_graph_after_shared_reload",
-            receiver: Some("&mut self"),
-            params: &[
-                build_support::MethodParam {
-                    name: "cause",
-                    ty: "String",
-                },
-                build_support::MethodParam {
-                    name: "switching_from_empty_workspace",
-                    ty: "bool",
-                },
-            ],
-            args: &["cause", "switching_from_empty_workspace"],
-        },
-    )?;
-    build_support::rename_function(
-        &mut source,
+        "recreate_crate_graph",
         "recreate_crate_graph_after_shared_reload",
-        "_recreate_crate_graph_after_shared_reload",
-    )?;
-    build_support::allow_dead_code_for_function(
-        &mut source,
-        "_recreate_crate_graph_after_shared_reload",
     )?;
 
     fs::write(reload_rs, source)?;

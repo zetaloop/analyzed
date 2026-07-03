@@ -967,6 +967,48 @@ fn apply_extraction(
     Ok(())
 }
 
+pub fn redirect_top_level_method_call(
+    source: &mut String,
+    function: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), Box<dyn Error>> {
+    let function_node = find_function(source, function)?;
+    let body = function_node
+        .body()
+        .ok_or_else(|| format!("function `{function}` has no body"))?;
+    let stmt_list = body
+        .stmt_list()
+        .ok_or_else(|| format!("function `{function}` has no statement list"))?;
+    let body_stmt_list = stmt_list.syntax().clone();
+    let mut calls = function_node
+        .syntax()
+        .descendants()
+        .filter_map(ast::MethodCallExpr::cast)
+        .filter(|call| call.name_ref().is_some_and(|name| name.text() == from))
+        .filter(|call| {
+            call.syntax()
+                .ancestors()
+                .filter_map(ast::StmtList::cast)
+                .next()
+                .is_some_and(|list| *list.syntax() == body_stmt_list)
+        });
+    let call = calls
+        .next()
+        .ok_or_else(|| format!("function `{function}` has no top-level `{from}` call"))?;
+    if calls.next().is_some() {
+        return Err(
+            format!("function `{function}` has more than one top-level `{from}` call").into(),
+        );
+    }
+    let name = call
+        .name_ref()
+        .ok_or_else(|| format!("`{from}` call has no method name"))?;
+    source.replace_range(text_range(name.syntax().text_range()), to);
+    parse_source(source)?;
+    Ok(())
+}
+
 struct Extraction {
     range: std::ops::Range<usize>,
     body: String,
