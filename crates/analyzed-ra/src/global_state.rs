@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use ide::{Cancellable, FileId};
 use ide_db::base_db::AnchoredPathBuf;
 use lsp_types::Url;
@@ -26,7 +28,7 @@ impl GlobalState {
         Self::new_analyzed(sender, config, provider, session.runtime(), Vec::new())
     }
 
-    pub(crate) fn process_changes(&mut self) -> bool {
+    pub(crate) fn process_changes(&mut self) -> (bool, Option<Duration>) {
         let _p = tracing::span!(tracing::Level::INFO, "GlobalState::process_changes").entered();
         self.analyzed_process_shared_changes()
     }

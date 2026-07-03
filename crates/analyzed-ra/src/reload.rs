@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use hir::ChangeWithProcMacros;
 use ide_db::base_db::ProcMacroPaths;
 use project_model::WorkspaceBuildScripts;
@@ -99,12 +101,16 @@ impl GlobalState {
         &mut self,
         cause: String,
         switching_from_empty_workspace: bool,
-    ) {
+    ) -> Option<Duration> {
         self.analyzed_reload_config_from_shared();
-        self.recreate_crate_graph(cause, switching_from_empty_workspace);
+        self.recreate_crate_graph(cause, switching_from_empty_workspace)
     }
 
-    pub(crate) fn recreate_crate_graph(&mut self, cause: String, initial_build: bool) {
+    pub(crate) fn recreate_crate_graph(
+        &mut self,
+        cause: String,
+        initial_build: bool,
+    ) -> Option<Duration> {
         let _ = (cause, initial_build);
         self.detached_files = self
             .workspaces
@@ -115,7 +121,7 @@ impl GlobalState {
             })
             .collect();
         self.incomplete_crate_graph = false;
-        self.finish_loading_crate_graph();
+        self.finish_loading_crate_graph()
     }
 
     pub(crate) fn fetch_build_data(&mut self, cause: Cause) {

@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, env, fs, sync::Once};
+use std::{
+    collections::BTreeSet,
+    env, fs,
+    sync::Once,
+    time::{Duration, Instant},
+};
 
 use crossbeam_channel::{Receiver, Sender};
 use ide::FileId;
@@ -144,12 +149,13 @@ fn run_shared_state(
 }
 
 impl crate::global_state::GlobalState {
-    pub(crate) fn analyzed_process_shared_changes(&mut self) -> bool {
+    pub(crate) fn analyzed_process_shared_changes(&mut self) -> (bool, Option<Duration>) {
         let shared = self.analyzed_shared.clone();
         let generation_changed = shared.config_generation_changed();
         let mut modified_ratoml_files = Vec::new();
         let mut workspace_structure_change = None;
         let mut changed = false;
+        let mut cancellation_time = None;
 
         {
             let mut guard = self.vfs.write();
@@ -230,7 +236,7 @@ impl crate::global_state::GlobalState {
                 Ok(needed) => needed,
                 Err(error) => {
                     tracing::error!("failed to check shared analyzer overlay: {error}");
-                    return false;
+                    return (false, None);
                 }
             };
             if overlay_needed {
@@ -240,16 +246,18 @@ impl crate::global_state::GlobalState {
                         tracing::error!(
                             "failed to prepare shared analyzer overlay: {error}"
                         );
-                        return false;
+                        return (false, None);
                     }
                 };
+                let sync_start = Instant::now();
                 let sync = match shared.sync_open_files(overlay_files) {
                     Ok(sync) => sync,
                     Err(error) => {
                         tracing::error!("failed to sync shared analyzer overlay: {error}");
-                        return false;
+                        return (false, None);
                     }
                 };
+                cancellation_time = Some(sync_start.elapsed());
 
                 if sync.changed {
                     changed = true;
@@ -335,7 +343,7 @@ impl crate::global_state::GlobalState {
             self.enqueue_workspace_fetch(path, force_crate_graph_reload);
         }
 
-        changed
+        (changed, cancellation_time)
     }
 
     pub(crate) fn analyzed_reload_config_from_shared(&mut self) {
@@ -545,7 +553,7 @@ impl crate::global_state::GlobalState {
         &mut self,
         prime_caches_progress: &mut Vec<super::PrimeCachesProgress>,
         task: super::Task,
-    ) {
+    ) -> Option<Duration> {
         match task {
             super::Task::AnalyzedFetchWorkspace(resp) => {
                 self.fetch_workspaces_queue.op_completed(resp);
@@ -561,6 +569,7 @@ impl crate::global_state::GlobalState {
                     None,
                     None,
                 );
+                None
             }
             _ => {
                 let upstream = UpstreamTask::try_from(task)
