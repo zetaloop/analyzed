@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use ide::{Cancellable, FileId};
-use ide_db::base_db::AnchoredPathBuf;
+use ide_db::base_db::{AnchoredPathBuf, Crate};
 use lsp_types::Url;
 use vfs::VfsPath;
 
@@ -9,6 +9,7 @@ use crate::{
     global_state::{GlobalState, GlobalStateSnapshot},
     line_index::LineIndex,
     lsp::to_proto::url_from_abs_path,
+    target_spec::TargetSpec,
 };
 
 impl GlobalState {
@@ -82,7 +83,13 @@ impl GlobalStateSnapshot {
         self.analyzed_shared.file_exists(id).unwrap_or(false)
     }
 
-    pub(crate) fn target_spec_vfs_path(&self, id: FileId) -> vfs::VfsPath {
-        self.file_id_to_file_path(id)
+    pub(crate) fn target_spec_for_file(
+        &self,
+        file_id: FileId,
+        crate_id: Crate,
+    ) -> Option<TargetSpec> {
+        let path = self.file_id_to_file_path(file_id);
+        let path = path.as_path()?;
+        self.target_spec_from_workspaces(path, crate_id)
     }
 }

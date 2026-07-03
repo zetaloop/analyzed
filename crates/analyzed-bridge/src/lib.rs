@@ -873,6 +873,65 @@ pub fn extract_method(
             }
         }
     };
+    apply_extraction(source, function_end, &function_indent, extraction, method)
+}
+
+pub fn extract_method_from_unique_for_loop(
+    source: &mut String,
+    function: &str,
+    return_ty: &str,
+    method: ExtractedMethod<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let function_node = find_function(source, function)?;
+    let function_end = text_offset(function_node.syntax().text_range().end());
+    let function_indent = line_indent(
+        source,
+        text_offset(function_node.syntax().text_range().start()),
+    )
+    .to_owned();
+    let mut for_loops = function_node
+        .syntax()
+        .descendants()
+        .filter_map(ast::ForExpr::cast);
+    let loop_expr = for_loops
+        .next()
+        .ok_or_else(|| format!("function `{function}` has no for loop"))?;
+    if for_loops.next().is_some() {
+        return Err(format!("function `{function}` has more than one for loop").into());
+    }
+    let body = function_node
+        .body()
+        .ok_or_else(|| format!("function `{function}` has no body"))?;
+    let stmt_list = body
+        .stmt_list()
+        .ok_or_else(|| format!("function `{function}` has no statement list"))?;
+    let tail = stmt_list
+        .tail_expr()
+        .ok_or_else(|| format!("function `{function}` has no tail expression"))?;
+    let start = text_offset(loop_expr.syntax().text_range().start());
+    let end = text_offset(tail.syntax().text_range().end());
+    if end <= start {
+        return Err(format!("function `{function}` tail expression precedes its for loop").into());
+    }
+    let call_indent = line_indent(source, start).to_owned();
+    let extraction = Extraction {
+        body: format!("\n{call_indent}{}", &source[start..end]),
+        range: start..end,
+        call_indent,
+        close_indent: String::new(),
+        return_ty: Some(return_ty.to_owned()),
+        expression: true,
+    };
+    apply_extraction(source, function_end, &function_indent, extraction, method)
+}
+
+fn apply_extraction(
+    source: &mut String,
+    function_end: usize,
+    function_indent: &str,
+    extraction: Extraction,
+    method: ExtractedMethod<'_>,
+) -> Result<(), Box<dyn Error>> {
     let params = method
         .params
         .iter()

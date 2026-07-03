@@ -342,26 +342,33 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         "GlobalStateSnapshot",
         "            analyzed_shared: self.analyzed_shared.clone(),\n",
     )?;
-    build_support::extract_method(
+    build_support::rename_function(&mut source, "target_spec_for_file", "_target_spec_for_file")?;
+    build_support::allow_dead_code_for_function(&mut source, "_target_spec_for_file")?;
+    build_support::extract_method_from_unique_for_loop(
         &mut source,
-        "target_spec_for_file",
-        build_support::ExtractSelector::LetBinding("path"),
-        0,
-        build_support::ExtractRange::Initializer {
-            return_ty: "vfs::VfsPath",
-        },
+        "_target_spec_for_file",
+        "Option<TargetSpec>",
         build_support::ExtractedMethod {
-            name: "target_spec_vfs_path",
+            name: "target_spec_from_workspaces",
             receiver: Some("&self"),
-            params: &[build_support::MethodParam {
-                name: "file_id",
-                ty: "FileId",
-            }],
-            args: &["file_id"],
+            params: &[
+                build_support::MethodParam {
+                    name: "path",
+                    ty: "&paths::AbsPath",
+                },
+                build_support::MethodParam {
+                    name: "crate_id",
+                    ty: "Crate",
+                },
+            ],
+            args: &["path", "crate_id"],
         },
     )?;
-    build_support::rename_function(&mut source, "target_spec_vfs_path", "_target_spec_vfs_path")?;
-    build_support::allow_dead_code_for_function(&mut source, "_target_spec_vfs_path")?;
+    build_support::widen_function_visibility(
+        &mut source,
+        "target_spec_from_workspaces",
+        "pub(crate)",
+    )?;
     for name in [
         "process_changes",
         "url_to_file_id",
