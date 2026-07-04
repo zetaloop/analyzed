@@ -50,12 +50,7 @@ fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 fn patch_search_source(search_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(search_rs)?;
 
-    build_support::retarget_use(
-        &mut source,
-        "all_crates",
-        "crate::analyzed::visible_base_crates",
-        "all_crates",
-    )?;
+    build_support::retarget_use(&mut source, "all_crates", "crate::analyzed::all_crates")?;
     let analyzed_search_scope = owned_source_path("search_scope.rs");
     source.push_str(&format!(
         "\n#[path = {:?}]\nmod analyzed_search_scope;\n",

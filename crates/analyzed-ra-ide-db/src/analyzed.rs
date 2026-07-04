@@ -51,7 +51,7 @@ pub(crate) fn is_symbol_visible(db: &RootDatabase, symbol: &FileSymbol<'_>) -> b
     db.analyzed_is_file_visible(file_id)
 }
 
-pub(crate) fn visible_base_crates(db: &RootDatabase) -> Vec<BaseCrate> {
+pub(crate) fn all_crates(db: &RootDatabase) -> Vec<BaseCrate> {
     db.analyzed_visible_base_crates(base_db::all_crates(db).iter().copied())
 }
 

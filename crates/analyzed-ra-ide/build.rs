@@ -51,12 +51,7 @@ fn patch_ide_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 fn patch_view_crate_graph_source(view_crate_graph_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(view_crate_graph_rs)?;
 
-    build_support::retarget_use(
-        &mut source,
-        "all_crates",
-        "crate::analyzed::visible_crates_for_graph",
-        "all_crates",
-    )?;
+    build_support::retarget_use(&mut source, "all_crates", "crate::analyzed::all_crates")?;
 
     fs::write(view_crate_graph_rs, source)?;
     Ok(())

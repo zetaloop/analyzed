@@ -458,7 +458,6 @@ pub fn retarget_use(
     source: &mut String,
     name: &str,
     path: &str,
-    alias: &str,
 ) -> Result<(), Box<dyn Error>> {
     let (editor, root) = open(source)?;
     let matches = root
@@ -483,12 +482,11 @@ pub fn retarget_use(
                     editor.delete(element);
                 }
                 commit(source, editor)?;
-                insert_use(source, &format!("use {path} as {alias};\n"))
+                add_use(source, path)
             } else {
-                editor.replace(
-                    tree.syntax(),
-                    use_tree_element(&format!("{path} as {alias}"))?,
-                );
+                let replacement =
+                    ast::make::use_tree(ast::make::path_from_text(path), None, None, false);
+                editor.replace(tree.syntax(), replacement.syntax().clone());
                 commit(source, editor)
             }
         }
@@ -1005,14 +1003,7 @@ fn name_ref_element(name: &str) -> Result<SyntaxElement, Box<dyn Error>> {
         .ok_or_else(|| "could not parse method name".into())
 }
 
-fn use_tree_element(tree: &str) -> Result<SyntaxElement, Box<dyn Error>> {
-    let file = parse_file(&format!("use {tree};\n"))?;
-    file.syntax()
-        .descendants()
-        .find_map(ast::UseTree::cast)
-        .map(|tree| tree.syntax().clone().into())
-        .ok_or_else(|| "could not parse use tree".into())
-}
+
 
 fn visibility_element(visibility: &str) -> Result<SyntaxElement, Box<dyn Error>> {
     let file = parse_file(&format!("{visibility} fn w() {{}}"))?;

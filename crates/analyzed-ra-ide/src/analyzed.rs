@@ -1,6 +1,6 @@
 use std::{any::Any, fmt, panic::RefUnwindSafe, sync::Arc};
 
-use ide_db::{FileId, RootDatabase, base_db::Crate, base_db::all_crates};
+use ide_db::{FileId, RootDatabase, base_db::Crate};
 use rustc_hash::FxHashSet;
 
 use crate::{Analysis, AnalysisHost};
@@ -37,6 +37,6 @@ impl AnalysisHost {
     }
 }
 
-pub(crate) fn visible_crates_for_graph(db: &RootDatabase) -> Vec<Crate> {
-    db.analyzed_visible_base_crates(all_crates(db).iter().copied())
+pub(crate) fn all_crates(db: &RootDatabase) -> Vec<Crate> {
+    db.analyzed_visible_base_crates(ide_db::base_db::all_crates(db).iter().copied())
 }
