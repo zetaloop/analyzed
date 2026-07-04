@@ -1,4 +1,5 @@
 use analyzed_bridge as build_support;
+use analyzed_bridge::ast;
 
 use std::{
     env,
@@ -20,11 +21,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn patch_analyzed_workspace_load_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(lib_rs)?;
 
-    build_support::inject_use(
+    build_support::add_use(
         &mut source,
         "ide_db::base_db::{CrateBuilderId, ProcMacroPaths}",
     )?;
-    build_support::inject_use(&mut source, "vfs::file_set::FileSet")?;
+    build_support::add_use(&mut source, "vfs::file_set::FileSet")?;
 
     let analyzed = owned_source_path("analyzed.rs");
     source.insert_str(
@@ -36,12 +37,16 @@ fn patch_analyzed_workspace_load_source(lib_rs: &Path) -> Result<(), Box<dyn Err
     );
     println!("cargo:rerun-if-changed={}", analyzed.display());
 
-    build_support::rename_function(
+    build_support::rename::<ast::Fn>(
         &mut source,
         "load_crate_graph_into_db",
         "_load_crate_graph_into_db",
     )?;
-    build_support::allow_dead_code_for_function(&mut source, "_load_crate_graph_into_db")?;
+    build_support::add_attr::<ast::Fn>(
+        &mut source,
+        "_load_crate_graph_into_db",
+        "#[allow(dead_code)]",
+    )?;
 
     fs::write(lib_rs, source)?;
     Ok(())

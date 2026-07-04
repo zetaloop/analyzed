@@ -1,4 +1,5 @@
 use analyzed_bridge as build_support;
+use analyzed_bridge::ast;
 
 use std::{
     env,
@@ -23,20 +24,20 @@ fn patch_ide_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(lib_rs)?;
 
     let analyzed = owned_source_path("analyzed.rs");
-    build_support::prepend_path_module(&mut source, None, "analyzed", &analyzed);
+    build_support::mount_module(&mut source, None, "analyzed", &analyzed);
     println!("cargo:rerun-if-changed={}", analyzed.display());
-    build_support::append_struct_fields(
+    build_support::append::<ast::Struct>(
         &mut source,
         "Analysis",
         "    analyzed_guard: Option<crate::analyzed::AnalyzedAnalysisGuard>,\n",
     )?;
-    build_support::append_record_expr_fields_in_function(
+    build_support::append_record_fields(
         &mut source,
         "analysis",
         "Analysis",
         ", analyzed_guard: None",
     )?;
-    build_support::append_record_expr_fields_in_function(
+    build_support::append_record_fields(
         &mut source,
         "from_ra_fixture_with_on_cursor",
         "Analysis",
@@ -50,7 +51,7 @@ fn patch_ide_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 fn patch_view_crate_graph_source(view_crate_graph_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(view_crate_graph_rs)?;
 
-    build_support::retarget_use_tree(
+    build_support::retarget_use(
         &mut source,
         "all_crates",
         "crate::analyzed::visible_crates_for_graph",
@@ -73,7 +74,7 @@ fn patch_syntax_highlighting_benches(tests_rs: &Path) -> Result<(), Box<dyn Erro
         "syntax_highlighting_not_quadratic",
         "benchmark_syntax_highlighting_parser",
     ] {
-        build_support::add_function_attribute(
+        build_support::add_attr::<ast::Fn>(
             &mut source,
             benchmark,
             "#[ignore = \"bench_data not available in registry packages\"]",

@@ -553,7 +553,7 @@ pub fn extract(
     source: &mut String,
     function: &str,
     select: impl FnOnce(&ast::Fn) -> Result<Selection, Box<dyn Error>>,
-    method: &Method<'_>,
+    method: Method<'_>,
 ) -> Result<(), Box<dyn Error>> {
     let function_node: ast::Fn = named(source, function)?;
     let function_end = text_offset(function_node.syntax().text_range().end());
@@ -830,4 +830,21 @@ fn insertion_index_after_inner_attrs(source: &str) -> usize {
         index += line.len();
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn injects_use_before_existing_imports() {
+        let mut source = String::from("#![allow(clippy::all)]\n\nuse std::path::Path;\n");
+
+        add_use(&mut source, "crate::patched::run_flycheck").unwrap();
+
+        assert_eq!(
+            source,
+            "#![allow(clippy::all)]\n\nuse crate::patched::run_flycheck;\nuse std::path::Path;\n"
+        );
+    }
 }

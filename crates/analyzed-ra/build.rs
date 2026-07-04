@@ -7,6 +7,7 @@ use std::{
 };
 
 use analyzed_bridge as build_support;
+use analyzed_bridge::ast;
 
 const RA_PACKAGE: &str = "ra_ap_rust-analyzer";
 const RA_REPOSITORY: &str = "rust-lang/rust-analyzer";
@@ -254,7 +255,7 @@ fn patch_config_source(config_rs: &Path) -> Result<(), Box<dyn Error>> {
             .strip_prefix("fn ")
             .and_then(|value| value.strip_suffix("() {"))
             .ok_or("unexpected config test guard")?;
-        build_support::add_function_attribute(
+        build_support::add_attr::<ast::Fn>(
             &mut source,
             function,
             "#[ignore = \"regenerates files from the rust-analyzer source tree\"]",
@@ -267,10 +268,9 @@ fn patch_config_source(config_rs: &Path) -> Result<(), Box<dyn Error>> {
 
 fn patch_discover_source(discover_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(discover_rs)?;
-    build_support::add_enum_variant_attribute(
+    build_support::add_attr::<ast::Variant>(
         &mut source,
-        "DiscoverArgument",
-        "Buildfile",
+        "DiscoverArgument::Buildfile",
         "#[allow(dead_code)]",
     )?;
     fs::write(discover_rs, source)?;
@@ -280,48 +280,50 @@ fn patch_discover_source(discover_rs: &Path) -> Result<(), Box<dyn Error>> {
 fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(global_state_rs)?;
 
-    build_support::append_struct_fields(
+    build_support::append::<ast::Struct>(
         &mut source,
         "FetchWorkspaceResponse",
         "    pub(crate) analyzed_shared: crate::analyzed_bridge::SharedAnalyzerRuntime,\n",
     )?;
-    build_support::add_struct_attribute(&mut source, "FetchWorkspaceResponse", "#[derive(Debug)]")?;
-    build_support::append_struct_fields(
+    build_support::add_attr::<ast::Struct>(
+        &mut source,
+        "FetchWorkspaceResponse",
+        "#[derive(Debug)]",
+    )?;
+    build_support::append::<ast::Struct>(
         &mut source,
         "GlobalState",
         "    pub(crate) analyzed_provider: crate::analyzed_bridge::SharedAnalyzerProvider,\n    pub(crate) analyzed_shared: crate::analyzed_bridge::SharedAnalyzerRuntime,\n",
     )?;
-    build_support::append_struct_fields(
+    build_support::append::<ast::Struct>(
         &mut source,
         "GlobalStateSnapshot",
         "    pub(crate) analyzed_shared: crate::analyzed_bridge::SharedAnalyzerRuntime,\n",
     )?;
-    build_support::widen_struct_field_visibility(
+    build_support::set_visibility::<ast::RecordField>(
         &mut source,
-        "GlobalStateSnapshot",
-        "mem_docs",
+        "GlobalStateSnapshot::mem_docs",
         "pub(crate)",
     )?;
-    build_support::add_struct_field_attribute(
+    build_support::add_attr::<ast::RecordField>(
         &mut source,
-        "GlobalState",
-        "last_gc_revision",
+        "GlobalState::last_gc_revision",
         "#[allow(dead_code)]",
     )?;
 
-    build_support::rename_function(&mut source, "new", "new_analyzed")?;
-    build_support::append_function_params(
+    build_support::rename::<ast::Fn>(&mut source, "new", "new_analyzed")?;
+    build_support::append::<ast::Fn>(
         &mut source,
         "new_analyzed",
         ",\n        analyzed_provider: crate::analyzed_bridge::SharedAnalyzerProvider,\n        analyzed_shared: crate::analyzed_bridge::SharedAnalyzerRuntime,\n        analyzed_workspaces: Vec<ProjectWorkspace>",
     )?;
-    build_support::append_record_expr_fields_in_function(
+    build_support::append_record_fields(
         &mut source,
         "new_analyzed",
         "GlobalState",
         "            analyzed_provider,\n            analyzed_shared,\n",
     )?;
-    build_support::replace_record_expr_field_in_function(
+    build_support::set_record_field(
         &mut source,
         "new_analyzed",
         "GlobalState",
@@ -329,42 +331,53 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         "Arc::new(analyzed_workspaces)",
     )?;
 
-    build_support::replace_record_expr_field_in_function(
+    build_support::set_record_field(
         &mut source,
         "snapshot",
         "GlobalStateSnapshot",
         "analysis",
         "self.analyzed_shared.analysis()",
     )?;
-    build_support::append_record_expr_fields_in_function(
+    build_support::append_record_fields(
         &mut source,
         "snapshot",
         "GlobalStateSnapshot",
         "            analyzed_shared: self.analyzed_shared.clone(),\n",
     )?;
-    build_support::rename_function(&mut source, "target_spec_for_file", "_target_spec_for_file")?;
-    build_support::allow_dead_code_for_function(&mut source, "_target_spec_for_file")?;
-    build_support::extract_method_from_unique_for_loop(
+    build_support::rename::<ast::Fn>(&mut source, "target_spec_for_file", "_target_spec_for_file")?;
+    build_support::add_attr::<ast::Fn>(
         &mut source,
         "_target_spec_for_file",
-        "Option<TargetSpec>",
-        build_support::ExtractedMethod {
+        "#[allow(dead_code)]",
+    )?;
+    build_support::extract(
+        &mut source,
+        "_target_spec_for_file",
+        |function| {
+            let workspace_loop = build_support::one(
+                build_support::for_loops(function),
+                "for loop in `_target_spec_for_file`",
+            )?;
+            build_support::through_tail(&workspace_loop, function)
+        },
+        build_support::Method {
             name: "target_spec_from_workspaces",
             receiver: Some("&self"),
             params: &[
-                build_support::MethodParam {
+                build_support::Param {
                     name: "path",
                     ty: "&paths::AbsPath",
                 },
-                build_support::MethodParam {
+                build_support::Param {
                     name: "crate_id",
                     ty: "Crate",
                 },
             ],
             args: &["path", "crate_id"],
+            return_ty: Some("Option<TargetSpec>"),
         },
     )?;
-    build_support::widen_function_visibility(
+    build_support::set_visibility::<ast::Fn>(
         &mut source,
         "target_spec_from_workspaces",
         "pub(crate)",
@@ -381,10 +394,10 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         "file_exists",
     ] {
         let replacement = format!("_{name}");
-        build_support::rename_function(&mut source, name, &replacement)?;
-        build_support::allow_dead_code_for_function(&mut source, &replacement)?;
+        build_support::rename::<ast::Fn>(&mut source, name, &replacement)?;
+        build_support::add_attr::<ast::Fn>(&mut source, &replacement, "#[allow(dead_code)]")?;
     }
-    build_support::widen_function_visibility(&mut source, "enqueue_workspace_fetch", "pub(crate)")?;
+    build_support::set_visibility::<ast::Fn>(&mut source, "enqueue_workspace_fetch", "pub(crate)")?;
 
     fs::write(global_state_rs, source)?;
     Ok(())
@@ -398,20 +411,19 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
         .ok_or("main_loop source has no std use")?;
     source.insert_str(export_at, main_loop_export);
 
-    build_support::rename_function(&mut source, "main_loop", "_main_loop")?;
-    build_support::allow_dead_code_for_function(&mut source, "_main_loop")?;
-    build_support::widen_function_visibility(&mut source, "_main_loop", "pub(crate)")?;
-    build_support::allow_dead_code_for_function(&mut source, "run")?;
-    build_support::widen_enum_visibility(&mut source, "Event", "pub(crate)")?;
-    build_support::append_enum_variants(
+    build_support::rename::<ast::Fn>(&mut source, "main_loop", "_main_loop")?;
+    build_support::add_attr::<ast::Fn>(&mut source, "_main_loop", "#[allow(dead_code)]")?;
+    build_support::set_visibility::<ast::Fn>(&mut source, "_main_loop", "pub(crate)")?;
+    build_support::add_attr::<ast::Fn>(&mut source, "run", "#[allow(dead_code)]")?;
+    build_support::set_visibility::<ast::Enum>(&mut source, "Event", "pub(crate)")?;
+    build_support::append::<ast::Enum>(
         &mut source,
         "Task",
         "    AnalyzedFetchWorkspace(FetchWorkspaceResponse),\n",
     )?;
-    build_support::add_enum_variant_attribute(
+    build_support::add_attr::<ast::Variant>(
         &mut source,
-        "DiscoverProjectParam",
-        "Buildfile",
+        "DiscoverProjectParam::Buildfile",
         "#[allow(dead_code)]",
     )?;
 
@@ -422,151 +434,192 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
         "handle_task",
     ] {
         let replacement = format!("_{name}");
-        build_support::rename_function(&mut source, name, &replacement)?;
+        build_support::rename::<ast::Fn>(&mut source, name, &replacement)?;
     }
 
-    build_support::extract_method_tail_by_params(
+    build_support::extract(
         &mut source,
         "_update_diagnostics",
-        build_support::ExtractedMethod {
+        |_| Ok(build_support::params_tail()),
+        build_support::Method {
             name: "spawn_native_diagnostics",
             receiver: Some("&mut self"),
             params: &[
-                build_support::MethodParam {
+                build_support::Param {
                     name: "generation",
                     ty: "DiagnosticsGeneration",
                 },
-                build_support::MethodParam {
+                build_support::Param {
                     name: "subscriptions",
                     ty: "std::sync::Arc<[FileId]>",
                 },
             ],
             args: &["generation", "subscriptions"],
+            return_ty: None,
         },
     )?;
-    build_support::allow_dead_code_for_function(&mut source, "_update_diagnostics")?;
-    build_support::extract_method_tail_by_params(
+    build_support::add_attr::<ast::Fn>(&mut source, "_update_diagnostics", "#[allow(dead_code)]")?;
+    build_support::extract(
         &mut source,
         "_update_tests",
-        build_support::ExtractedMethod {
+        |_| Ok(build_support::params_tail()),
+        build_support::Method {
             name: "spawn_discover_tests",
             receiver: Some("&mut self"),
-            params: &[build_support::MethodParam {
+            params: &[build_support::Param {
                 name: "subscriptions",
                 ty: "Vec<FileId>",
             }],
             args: &["subscriptions"],
+            return_ty: None,
         },
     )?;
-    build_support::allow_dead_code_for_function(&mut source, "_update_tests")?;
+    build_support::add_attr::<ast::Fn>(&mut source, "_update_tests", "#[allow(dead_code)]")?;
 
-    build_support::extract_call_statement(
+    build_support::extract(
         &mut source,
         "_handle_event",
-        build_support::StructureContainer::MatchArm {
-            variant: "PrimeCachesProgress::End",
+        |function| {
+            let arm = build_support::one(
+                build_support::arms(function, "PrimeCachesProgress::End"),
+                "`PrimeCachesProgress::End` arm",
+            )?;
+            let call = build_support::one(
+                build_support::calls(&arm, "trigger_garbage_collection"),
+                "`trigger_garbage_collection` call in the arm",
+            )?;
+            build_support::stmt(&call)
         },
-        "trigger_garbage_collection",
-        build_support::ExtractedMethod {
+        build_support::Method {
             name: "mark_prime_caches_gc",
             receiver: Some("&mut self"),
             params: &[],
             args: &[],
+            return_ty: None,
         },
     )?;
-    build_support::rename_function(&mut source, "mark_prime_caches_gc", "_mark_prime_caches_gc")?;
-    build_support::allow_dead_code_for_function(&mut source, "_mark_prime_caches_gc")?;
+    build_support::rename::<ast::Fn>(&mut source, "mark_prime_caches_gc", "_mark_prime_caches_gc")?;
+    build_support::add_attr::<ast::Fn>(
+        &mut source,
+        "_mark_prime_caches_gc",
+        "#[allow(dead_code)]",
+    )?;
 
-    build_support::extract_call_statement(
+    build_support::extract(
         &mut source,
         "_handle_event",
-        build_support::StructureContainer::IfReferencingField {
-            field: "last_gc_revision",
+        |function| {
+            let idle = build_support::one(
+                build_support::ifs_referencing(function, "last_gc_revision"),
+                "idle gc guard",
+            )?;
+            let call = build_support::one(
+                build_support::calls(&idle, "trigger_garbage_collection"),
+                "`trigger_garbage_collection` call in the guard",
+            )?;
+            build_support::stmt(&call)
         },
-        "trigger_garbage_collection",
-        build_support::ExtractedMethod {
+        build_support::Method {
             name: "mark_gc_when_idle",
             receiver: Some("&mut self"),
             params: &[],
             args: &[],
+            return_ty: None,
         },
     )?;
-    build_support::rename_function(&mut source, "mark_gc_when_idle", "_mark_gc_when_idle")?;
-    build_support::allow_dead_code_for_function(&mut source, "_mark_gc_when_idle")?;
+    build_support::rename::<ast::Fn>(&mut source, "mark_gc_when_idle", "_mark_gc_when_idle")?;
+    build_support::add_attr::<ast::Fn>(&mut source, "_mark_gc_when_idle", "#[allow(dead_code)]")?;
 
-    build_support::extract_for_loop_body(
+    build_support::extract(
         &mut source,
         "_handle_event",
-        build_support::StructureContainer::IfCallingMethod {
-            method: "take_changes",
+        |function| {
+            let guard = build_support::one(
+                build_support::ifs_calling(function, "take_changes"),
+                "diagnostics change guard",
+            )?;
+            let changes_loop =
+                build_support::one(build_support::for_loops(&guard), "for loop in the guard")?;
+            build_support::for_body(&changes_loop)
         },
-        build_support::ExtractedMethod {
+        build_support::Method {
             name: "publish_changed_diagnostics",
             receiver: Some("&mut self"),
-            params: &[build_support::MethodParam {
+            params: &[build_support::Param {
                 name: "file_id",
                 ty: "FileId",
             }],
             args: &["file_id"],
+            return_ty: None,
         },
     )?;
-    build_support::rename_function(
+    build_support::rename::<ast::Fn>(
         &mut source,
         "publish_changed_diagnostics",
         "_publish_changed_diagnostics",
     )?;
-    build_support::allow_dead_code_for_function(&mut source, "_publish_changed_diagnostics")?;
+    build_support::add_attr::<ast::Fn>(
+        &mut source,
+        "_publish_changed_diagnostics",
+        "#[allow(dead_code)]",
+    )?;
 
-    build_support::extract_for_loop_body(
+    build_support::extract(
         &mut source,
         "handle_flycheck_msg",
-        build_support::StructureContainer::MatchArm {
-            variant: "FlycheckMessage::AddDiagnostic",
+        |function| {
+            let arm = build_support::one(
+                build_support::arms(function, "FlycheckMessage::AddDiagnostic"),
+                "`FlycheckMessage::AddDiagnostic` arm",
+            )?;
+            let diagnostics_loop =
+                build_support::one(build_support::for_loops(&arm), "for loop in the arm")?;
+            build_support::for_body(&diagnostics_loop)
         },
-        build_support::ExtractedMethod {
+        build_support::Method {
             name: "record_flycheck_diagnostic",
             receiver: Some("&mut self"),
             params: &[
-                build_support::MethodParam {
+                build_support::Param {
                     name: "id",
                     ty: "usize",
                 },
-                build_support::MethodParam {
+                build_support::Param {
                     name: "generation",
                     ty: "DiagnosticsGeneration",
                 },
-                build_support::MethodParam {
+                build_support::Param {
                     name: "package_id",
                     ty: "Option<crate::flycheck::PackageSpecifier>",
                 },
-                build_support::MethodParam {
+                build_support::Param {
                     name: "diag",
                     ty: "crate::diagnostics::flycheck_to_proto::MappedRustDiagnostic",
                 },
             ],
             args: &["id", "generation", "package_id.clone()", "diag"],
+            return_ty: None,
         },
     )?;
-    build_support::rename_function(
+    build_support::rename::<ast::Fn>(
         &mut source,
         "record_flycheck_diagnostic",
         "_record_flycheck_diagnostic",
     )?;
-    build_support::allow_dead_code_for_function(&mut source, "_record_flycheck_diagnostic")?;
+    build_support::add_attr::<ast::Fn>(
+        &mut source,
+        "_record_flycheck_diagnostic",
+        "#[allow(dead_code)]",
+    )?;
 
-    build_support::append_record_expr_fields_in_function(
+    build_support::append_record_fields(
         &mut source,
         "_handle_task",
         "FetchWorkspaceResponse",
         ", analyzed_shared: self.analyzed_shared.clone()",
     )?;
-    build_support::rename_path_root_in_function(
-        &mut source,
-        "_handle_task",
-        "Task",
-        "UpstreamTask",
-    )?;
-    build_support::inject_use(&mut source, "self::analyzed_session::UpstreamTask")?;
+    build_support::rename_path_root(&mut source, "_handle_task", "Task", "UpstreamTask")?;
+    build_support::add_use(&mut source, "self::analyzed_session::UpstreamTask")?;
 
     let analyzed_session = owned_source_path("analyzed_session.rs");
     source.push_str(&format!(
@@ -589,18 +642,14 @@ fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
         "recreate_crate_graph",
     ] {
         let replacement = format!("_{name}");
-        build_support::rename_function(&mut source, name, &replacement)?;
-        build_support::allow_dead_code_for_function(&mut source, &replacement)?;
+        build_support::rename::<ast::Fn>(&mut source, name, &replacement)?;
+        build_support::add_attr::<ast::Fn>(&mut source, &replacement, "#[allow(dead_code)]")?;
     }
 
-    build_support::widen_function_visibility(&mut source, "reload_flycheck", "pub(crate)")?;
+    build_support::set_visibility::<ast::Fn>(&mut source, "reload_flycheck", "pub(crate)")?;
 
-    build_support::add_record_pattern_rest(
-        &mut source,
-        "switch_workspaces",
-        "FetchWorkspaceResponse",
-    )?;
-    build_support::redirect_top_level_method_call(
+    build_support::add_rest_pattern(&mut source, "switch_workspaces", "FetchWorkspaceResponse")?;
+    build_support::redirect_call(
         &mut source,
         "switch_workspaces",
         "recreate_crate_graph",
@@ -614,9 +663,9 @@ fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
 fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(flycheck_to_proto_rs)?;
 
-    build_support::rename_function(&mut source, "location", "_location")?;
-    build_support::allow_dead_code_for_function(&mut source, "_location")?;
-    build_support::inject_use(&mut source, "self::analyzed_flycheck_location::location")?;
+    build_support::rename::<ast::Fn>(&mut source, "location", "_location")?;
+    build_support::add_attr::<ast::Fn>(&mut source, "_location", "#[allow(dead_code)]")?;
+    build_support::add_use(&mut source, "self::analyzed_flycheck_location::location")?;
     let analyzed_location = owned_source_path("diagnostics/flycheck_location.rs");
     source.push_str(&format!(
         "\n#[path = {:?}]\nmod analyzed_flycheck_location;\n",
@@ -630,19 +679,23 @@ fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box
 fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(notification_rs)?;
 
-    build_support::rename_function(&mut source, "run_flycheck", "_run_flycheck")?;
-    build_support::allow_dead_code_for_function(&mut source, "_run_flycheck")?;
-    build_support::inject_pub_use(
+    build_support::rename::<ast::Fn>(&mut source, "run_flycheck", "_run_flycheck")?;
+    build_support::add_attr::<ast::Fn>(&mut source, "_run_flycheck", "#[allow(dead_code)]")?;
+    build_support::add_pub_use(
         &mut source,
         "crate::handlers::analyzed_notification::run_flycheck",
     )?;
-    build_support::rename_function(
+    build_support::rename::<ast::Fn>(
         &mut source,
         "handle_did_save_text_document",
         "_handle_did_save_text_document",
     )?;
-    build_support::allow_dead_code_for_function(&mut source, "_handle_did_save_text_document")?;
-    build_support::inject_pub_use(
+    build_support::add_attr::<ast::Fn>(
+        &mut source,
+        "_handle_did_save_text_document",
+        "#[allow(dead_code)]",
+    )?;
+    build_support::add_pub_use(
         &mut source,
         "crate::handlers::analyzed_notification::handle_did_save_text_document",
     )?;
@@ -693,7 +746,7 @@ fn patch_slow_tests_imports(path: &Path) -> Result<(), Box<dyn Error>> {
             ".analyzed_uri_path()",
         );
     if source.contains(".analyzed_uri_path()") {
-        build_support::inject_use(&mut source, "crate::analyzed_slow_tests::AnalyzedUriPath")?;
+        build_support::add_use(&mut source, "crate::analyzed_slow_tests::AnalyzedUriPath")?;
     }
     fs::write(path, source)?;
     Ok(())
