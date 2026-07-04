@@ -1009,6 +1009,143 @@ pub fn redirect_top_level_method_call(
     Ok(())
 }
 
+pub enum StructureContainer<'a> {
+    MatchArm { variant: &'a str },
+    IfReferencingField { field: &'a str },
+    IfCallingMethod { method: &'a str },
+}
+
+fn find_container_block(
+    function: &ast::Fn,
+    container: &StructureContainer<'_>,
+) -> Result<ast::StmtList, Box<dyn Error>> {
+    match container {
+        StructureContainer::MatchArm { variant } => {
+            let mut arms = function
+                .syntax()
+                .descendants()
+                .filter_map(ast::MatchArm::cast)
+                .filter(|arm| {
+                    arm.pat().is_some_and(|pat| {
+                        pat.syntax()
+                            .descendants()
+                            .filter_map(ast::Path::cast)
+                            .any(|path| path.syntax().text() == *variant)
+                    })
+                });
+            let arm = arms
+                .next()
+                .ok_or_else(|| format!("no match arm matches `{variant}`"))?;
+            if arms.next().is_some() {
+                return Err(format!("more than one match arm matches `{variant}`").into());
+            }
+            let Some(ast::Expr::BlockExpr(block)) = arm.expr() else {
+                return Err(format!("match arm for `{variant}` has no block").into());
+            };
+            block
+                .stmt_list()
+                .ok_or_else(|| format!("match arm for `{variant}` has no statement list").into())
+        }
+        StructureContainer::IfReferencingField { field } => {
+            let mut ifs = function
+                .syntax()
+                .descendants()
+                .filter_map(ast::IfExpr::cast)
+                .filter(|if_expr| {
+                    if_expr.condition().is_some_and(|condition| {
+                        condition
+                            .syntax()
+                            .descendants()
+                            .filter_map(ast::FieldExpr::cast)
+                            .any(|expr| expr.name_ref().is_some_and(|name| name.text() == *field))
+                    })
+                });
+            let if_expr = ifs
+                .next()
+                .ok_or_else(|| format!("no if condition references `{field}`"))?;
+            if ifs.next().is_some() {
+                return Err(format!("more than one if condition references `{field}`").into());
+            }
+            if_expr
+                .then_branch()
+                .and_then(|block| block.stmt_list())
+                .ok_or_else(|| format!("if referencing `{field}` has no statement list").into())
+        }
+        StructureContainer::IfCallingMethod { method } => {
+            let mut ifs = function
+                .syntax()
+                .descendants()
+                .filter_map(ast::IfExpr::cast)
+                .filter(|if_expr| {
+                    if_expr.condition().is_some_and(|condition| {
+                        condition
+                            .syntax()
+                            .descendants()
+                            .filter_map(ast::MethodCallExpr::cast)
+                            .any(|call| call.name_ref().is_some_and(|name| name.text() == *method))
+                    })
+                });
+            let if_expr = ifs
+                .next()
+                .ok_or_else(|| format!("no if condition calls `{method}`"))?;
+            if ifs.next().is_some() {
+                return Err(format!("more than one if condition calls `{method}`").into());
+            }
+            if_expr
+                .then_branch()
+                .and_then(|block| block.stmt_list())
+                .ok_or_else(|| format!("if calling `{method}` has no statement list").into())
+        }
+    }
+}
+
+pub fn extract_call_statement(
+    source: &mut String,
+    function: &str,
+    container: StructureContainer<'_>,
+    callee: &str,
+    method: ExtractedMethod<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let function_node = find_function(source, function)?;
+    let function_end = text_offset(function_node.syntax().text_range().end());
+    let function_indent = line_indent(
+        source,
+        text_offset(function_node.syntax().text_range().start()),
+    )
+    .to_owned();
+    let stmt_list = find_container_block(&function_node, &container)?;
+    let mut statements = stmt_list.statements().filter(|statement| match statement {
+        ast::Stmt::ExprStmt(statement) => statement
+            .expr()
+            .and_then(|expr| match expr {
+                ast::Expr::MethodCallExpr(call) => Some(call),
+                _ => None,
+            })
+            .is_some_and(|call| call.name_ref().is_some_and(|name| name.text() == callee)),
+        _ => false,
+    });
+    let statement = statements
+        .next()
+        .ok_or_else(|| format!("container has no `{callee}` call statement"))?;
+    if statements.next().is_some() {
+        return Err(format!("container has more than one `{callee}` call statement").into());
+    }
+    let first_start = text_offset(statement.syntax().text_range().start());
+    let range =
+        line_start_offset(source, first_start)..text_offset(statement.syntax().text_range().end());
+    let call_indent = line_indent(source, first_start).to_owned();
+    let method_body_indent = format!("{function_indent}    ");
+    let extraction = Extraction {
+        call_indent: call_indent.clone(),
+        close_indent: String::new(),
+        body: normalize_statement_body(&source[range.clone()], &call_indent, &method_body_indent),
+        return_ty: None,
+        expression: false,
+        range,
+    };
+    apply_extraction(source, function_end, &function_indent, extraction, method)
+}
+
 struct Extraction {
     range: std::ops::Range<usize>,
     body: String,

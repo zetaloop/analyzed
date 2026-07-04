@@ -466,12 +466,13 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     )?;
     build_support::allow_dead_code_for_function(&mut source, "_update_tests")?;
 
-    build_support::extract_method(
+    build_support::extract_call_statement(
         &mut source,
         "_handle_event",
-        build_support::ExtractSelector::TopLevelMethodCall("trigger_garbage_collection"),
-        0,
-        build_support::ExtractRange::StatementSequence { len: 1 },
+        build_support::StructureContainer::MatchArm {
+            variant: "PrimeCachesProgress::End",
+        },
+        "trigger_garbage_collection",
         build_support::ExtractedMethod {
             name: "mark_prime_caches_gc",
             receiver: Some("&mut self"),
@@ -482,12 +483,13 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::rename_function(&mut source, "mark_prime_caches_gc", "_mark_prime_caches_gc")?;
     build_support::allow_dead_code_for_function(&mut source, "_mark_prime_caches_gc")?;
 
-    build_support::extract_method(
+    build_support::extract_call_statement(
         &mut source,
         "_handle_event",
-        build_support::ExtractSelector::TopLevelMethodCall("trigger_garbage_collection"),
-        0,
-        build_support::ExtractRange::StatementSequence { len: 1 },
+        build_support::StructureContainer::IfReferencingField {
+            field: "last_gc_revision",
+        },
+        "trigger_garbage_collection",
         build_support::ExtractedMethod {
             name: "mark_gc_when_idle",
             receiver: Some("&mut self"),
