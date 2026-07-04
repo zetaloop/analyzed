@@ -19,7 +19,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .git_revision
         .as_deref()
         .ok_or("ra_ap_rust-analyzer does not contain .cargo_vcs_info.json")?;
-    let release = rust_analyzer_release(revision)?;
+    let release = if env::var_os("DOCS_RS").is_some() {
+        "docs.rs".to_owned()
+    } else {
+        rust_analyzer_release(revision)?
+    };
     let generated_src = generated.join("src");
     patch_config_source(&generated_src.join("config.rs"))?;
     patch_discover_source(&generated_src.join("discover.rs"))?;
@@ -52,6 +56,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         slow_tests_wrapper.display()
     );
     println!("cargo:rerun-if-env-changed=GITHUB_TOKEN");
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())
 }
