@@ -1,7 +1,7 @@
 use std::{error::Error, path::Path};
 
 use ra_ap_syntax::{
-    AstNode, Edition, SourceFile, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
+    AstNode, Edition, SourceFile, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, hacks,
     ast::{self, HasLoopBody, HasName, HasVisibility},
     syntax_editor::{Position, SyntaxEditor},
 };
@@ -155,7 +155,7 @@ pub fn rename<N: Host>(
     let name = item
         .name()
         .ok_or_else(|| format!("{} has no name", N::KIND))?;
-    editor.replace(name.syntax(), name_element(replacement)?);
+    editor.replace(name.syntax(), ast::make::name(replacement).syntax().clone());
     commit(source, editor)
 }
 
@@ -196,11 +196,14 @@ pub fn set_visibility<N: VisibilityHost>(
     let (editor, root) = open(source)?;
     let item: N = named(&root, name)?;
     if let Some(existing) = item.visibility() {
-        editor.replace(existing.syntax(), visibility_element(visibility)?);
+        editor.replace(existing.syntax(), visibility_node(visibility)?.syntax().clone());
     } else {
         editor.insert_all(
             Position::before(item.visibility_slot()?),
-            vec![visibility_element(visibility)?, whitespace_element(" ")?],
+            vec![
+                visibility_node(visibility)?.syntax().clone().into(),
+                ast::make::tokens::single_space().into(),
+            ],
         );
     }
     commit(source, editor)
@@ -221,79 +224,128 @@ pub fn add_attr<N: Host>(
     commit(source, editor)
 }
 
+pub struct Field<'a> {
+    pub vis: Option<&'a str>,
+    pub name: &'a str,
+    pub ty: &'a str,
+}
+
+pub struct Variant<'a> {
+    pub name: &'a str,
+    pub tuple_fields: &'a [&'a str],
+}
+
 pub trait ListHost: Host {
-    fn list_close(&self) -> Result<SyntaxToken, Box<dyn Error>>;
-    fn parse_items(items: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>>;
+    type Item<'a>;
+    fn append_items(
+        &self,
+        editor: &SyntaxEditor,
+        items: &[Self::Item<'_>],
+    ) -> Result<(), Box<dyn Error>>;
 }
 
 impl ListHost for ast::Struct {
-    fn list_close(&self) -> Result<SyntaxToken, Box<dyn Error>> {
+    type Item<'a> = Field<'a>;
+
+    fn append_items(
+        &self,
+        editor: &SyntaxEditor,
+        items: &[Field<'_>],
+    ) -> Result<(), Box<dyn Error>> {
         let Some(ast::FieldList::RecordFieldList(fields)) = self.field_list() else {
             return Err("struct has no record field list".into());
         };
-        fields
+        let close = fields
             .r_curly_token()
-            .ok_or_else(|| "record struct has no closing brace".into())
-    }
-
-    fn parse_items(items: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
-        braced_elements(&format!("struct W {{{items}}}"))
+            .ok_or("record struct has no closing brace")?;
+        let indent = ast::edit::IndentLevel::from_node(fields.syntax()) + 1;
+        let mut elements = Vec::new();
+        for item in items {
+            elements.extend([
+                ast::make::tokens::whitespace(&indent.to_string()).into(),
+                ast::make::record_field(
+                    item.vis.map(visibility_node).transpose()?,
+                    ast::make::name(item.name),
+                    ast::make::ty(item.ty),
+                )
+                .syntax()
+                .clone()
+                .into(),
+                ast::make::token(SyntaxKind::COMMA).into(),
+                ast::make::tokens::single_newline().into(),
+            ]);
+        }
+        editor.insert_all(Position::before(close), elements);
+        Ok(())
     }
 }
 
 impl ListHost for ast::Enum {
-    fn list_close(&self) -> Result<SyntaxToken, Box<dyn Error>> {
-        self.variant_list()
-            .ok_or("enum has no variant list")?
-            .r_curly_token()
-            .ok_or_else(|| "enum has no closing brace".into())
-    }
+    type Item<'a> = Variant<'a>;
 
-    fn parse_items(items: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
-        braced_elements(&format!("enum W {{{items}}}"))
+    fn append_items(
+        &self,
+        editor: &SyntaxEditor,
+        items: &[Variant<'_>],
+    ) -> Result<(), Box<dyn Error>> {
+        let list = self.variant_list().ok_or("enum has no variant list")?;
+        for item in items {
+            let fields = (!item.tuple_fields.is_empty()).then(|| {
+                ast::make::tuple_field_list(
+                    item.tuple_fields
+                        .iter()
+                        .map(|ty| ast::make::tuple_field(None, ast::make::ty(ty))),
+                )
+                .into()
+            });
+            list.add_variant(
+                editor,
+                &ast::make::variant(None, ast::make::name(item.name), fields, None),
+            );
+        }
+        Ok(())
     }
 }
 
 impl ListHost for ast::Fn {
-    fn list_close(&self) -> Result<SyntaxToken, Box<dyn Error>> {
-        self.param_list()
-            .ok_or("function has no parameter list")?
-            .r_paren_token()
-            .ok_or_else(|| "parameter list has no closing paren".into())
-    }
+    type Item<'a> = Param<'a>;
 
-    fn parse_items(items: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
-        let file = parse_file(&format!("fn w(w0: W0{items}) {{}}"))?;
-        let params = file
-            .syntax()
-            .descendants()
-            .find_map(ast::ParamList::cast)
-            .ok_or("parameter wrapper has no list")?;
-        let seed = params
-            .params()
-            .next()
-            .ok_or("parameter wrapper has no seed")?;
-        let elements = params.syntax().children_with_tokens().collect::<Vec<_>>();
-        let start = elements
-            .iter()
-            .position(|element| element.as_node() == Some(seed.syntax()))
-            .ok_or("seed is not a direct child")?;
-        let end = elements
-            .iter()
-            .position(|element| element.kind() == SyntaxKind::R_PAREN)
-            .ok_or("parameter wrapper has no closing paren")?;
-        Ok(elements[start + 1..end].to_vec())
+    fn append_items(
+        &self,
+        editor: &SyntaxEditor,
+        items: &[Param<'_>],
+    ) -> Result<(), Box<dyn Error>> {
+        let list = self.param_list().ok_or("function has no parameter list")?;
+        let close = list
+            .r_paren_token()
+            .ok_or("parameter list has no closing paren")?;
+        let mut elements = Vec::new();
+        for item in items {
+            elements.extend([
+                ast::make::token(SyntaxKind::COMMA).into(),
+                ast::make::tokens::single_space().into(),
+                ast::make::param(
+                    ast::make::ident_pat(false, false, ast::make::name(item.name)).into(),
+                    ast::make::ty(item.ty),
+                )
+                .syntax()
+                .clone()
+                .into(),
+            ]);
+        }
+        editor.insert_all(Position::before(close), elements);
+        Ok(())
     }
 }
 
 pub fn append<N: ListHost>(
     source: &mut String,
     name: &str,
-    items: &str,
+    items: &[N::Item<'_>],
 ) -> Result<(), Box<dyn Error>> {
     let (editor, root) = open(source)?;
     let item: N = named(&root, name)?;
-    editor.insert_all(Position::before(item.list_close()?), N::parse_items(items)?);
+    item.append_items(&editor, items)?;
     commit(source, editor)
 }
 
@@ -310,11 +362,16 @@ fn record_exprs_in(function: &ast::Fn, path_tail: &str) -> Vec<ast::RecordExpr> 
         .collect()
 }
 
+pub struct FieldInit<'a> {
+    pub name: &'a str,
+    pub value: Option<&'a str>,
+}
+
 pub fn append_record_fields(
     source: &mut String,
     function: &str,
     path_tail: &str,
-    fields: &str,
+    fields: &[FieldInit<'_>],
 ) -> Result<(), Box<dyn Error>> {
     let (editor, root) = open(source)?;
     let function: ast::Fn = named(&root, function)?;
@@ -322,10 +379,16 @@ pub fn append_record_fields(
         let Some(field_list) = record.record_expr_field_list() else {
             continue;
         };
-        let token = field_list
-            .r_curly_token()
-            .ok_or("record expression has no closing brace")?;
-        editor.insert_all(Position::before(token), record_field_elements(fields)?);
+        let fields = fields
+            .iter()
+            .map(|field| {
+                Ok(ast::make::record_expr_field(
+                    ast::make::name_ref(field.name),
+                    field.value.map(expr_node).transpose()?,
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        field_list.add_fields(&editor, fields);
         return commit(source, editor);
     }
     Err(format!("function has no `{path_tail}` record expression").into())
@@ -354,7 +417,7 @@ pub fn set_record_field(
             let Some(expr) = record_field.expr() else {
                 return Err(format!("record field `{field}` has no expression").into());
             };
-            editor.replace(expr.syntax(), expr_element(value)?);
+            editor.replace(expr.syntax(), expr_node(value)?.syntax().clone());
             return commit(source, editor);
         }
     }
@@ -385,10 +448,18 @@ pub fn add_rest_pattern(
         if fields.rest_pat().is_some() {
             return Ok(());
         }
-        let token = fields
-            .r_curly_token()
-            .ok_or("record pattern has no closing brace")?;
-        editor.insert_all(Position::before(token), rest_pattern_elements()?);
+        let last = fields
+            .fields()
+            .last()
+            .ok_or("record pattern has no fields")?;
+        editor.insert_all(
+            Position::after(last.syntax()),
+            vec![
+                ast::make::token(SyntaxKind::COMMA).into(),
+                ast::make::tokens::single_space().into(),
+                ast::make::rest_pat().syntax().clone().into(),
+            ],
+        );
         return commit(source, editor);
     }
     Err(format!("function has no `{path_tail}` record pattern").into())
@@ -419,7 +490,7 @@ pub fn rename_path_root(
         if path.qualifier().is_some() {
             continue;
         }
-        editor.replace(name.syntax(), name_ref_element(replacement)?);
+        editor.replace(name.syntax(), ast::make::name_ref(replacement).syntax().clone());
         count += 1;
     }
     if count > 0 {
@@ -428,17 +499,19 @@ pub fn rename_path_root(
     Ok(count)
 }
 
-pub fn add_use(source: &mut String, path: &str) -> Result<(), Box<dyn Error>> {
-    insert_use(source, &format!("use {path};\n"))
-}
-
-pub fn add_pub_use(source: &mut String, path: &str) -> Result<(), Box<dyn Error>> {
-    insert_use(source, &format!("pub(crate) use {path};\n"))
-}
-
-fn insert_use(source: &mut String, statement: &str) -> Result<(), Box<dyn Error>> {
-    if source.contains(statement) {
-        return Err(format!("source already contains `{}`", statement.trim_end()).into());
+pub fn add_use(
+    source: &mut String,
+    visibility: Option<&str>,
+    path: &str,
+) -> Result<(), Box<dyn Error>> {
+    let item = ast::make::use_(
+        std::iter::empty(),
+        visibility.map(visibility_node).transpose()?,
+        ast::make::use_tree(ast::make::path_from_text(path), None, None, false),
+    );
+    let statement = item.to_string();
+    if source.contains(&statement) {
+        return Err(format!("source already contains `{statement}`").into());
     }
 
     let (editor, root) = open(source)?;
@@ -450,7 +523,13 @@ fn insert_use(source: &mut String, statement: &str) -> Result<(), Box<dyn Error>
                 .find(|node| ast::Item::can_cast(node.kind()))
         })
         .ok_or("source has no items")?;
-    editor.insert_all(Position::before(&anchor), item_elements(statement)?);
+    editor.insert_all(
+        Position::before(&anchor),
+        vec![
+            item.syntax().clone().into(),
+            ast::make::tokens::single_newline().into(),
+        ],
+    );
     commit(source, editor)
 }
 
@@ -482,7 +561,7 @@ pub fn retarget_use(
                     editor.delete(element);
                 }
                 commit(source, editor)?;
-                add_use(source, path)
+                add_use(source, None, path)
             } else {
                 let replacement =
                     ast::make::use_tree(ast::make::path_from_text(path), None, None, false);
@@ -787,8 +866,21 @@ pub fn redirect_call(
     let name = call
         .name_ref()
         .ok_or_else(|| format!("`{from}` call has no method name"))?;
-    editor.replace(name.syntax(), name_ref_element(to)?);
+    editor.replace(name.syntax(), ast::make::name_ref(to).syntax().clone());
     commit(source, editor)
+}
+
+fn visibility_node(visibility: &str) -> Result<ast::Visibility, Box<dyn Error>> {
+    match visibility {
+        "pub" => Ok(ast::make::visibility_pub()),
+        "pub(crate)" => Ok(ast::make::visibility_pub_crate()),
+        _ => Err(format!("unsupported visibility `{visibility}`").into()),
+    }
+}
+
+fn expr_node(expr: &str) -> Result<ast::Expr, Box<dyn Error>> {
+    hacks::parse_expr_from_str(expr, Edition::CURRENT)
+        .ok_or_else(|| format!("could not parse expression `{expr}`").into())
 }
 
 fn parse_file(source: &str) -> Result<SourceFile, Box<dyn Error>> {
@@ -874,10 +966,7 @@ fn indent_before(element: &SyntaxElement) -> String {
     text.rsplit('\n').next().unwrap_or_default().to_owned()
 }
 
-fn item_elements(text: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
-    let file = parse_file(text)?;
-    Ok(file.syntax().children_with_tokens().collect())
-}
+
 
 fn braced_elements(wrapper: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
     let file = parse_file(wrapper)?;
@@ -903,67 +992,9 @@ fn braced_elements(wrapper: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> 
     elements_between(&list, &open, &close)
 }
 
-fn record_field_elements(fields: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
-    if fields.trim_start().starts_with(',') {
-        let file = parse_file(&format!("fn w() {{ W {{ w0: 0{fields} }}; }}"))?;
-        let list = file
-            .syntax()
-            .descendants()
-            .find_map(ast::RecordExprFieldList::cast)
-            .ok_or("record wrapper has no field list")?;
-        let seed = list
-            .fields()
-            .next()
-            .ok_or("record wrapper has no seed field")?;
-        let elements = list.syntax().children_with_tokens().collect::<Vec<_>>();
-        let start = elements
-            .iter()
-            .position(|element| element.as_node() == Some(seed.syntax()))
-            .ok_or("seed is not a direct child")?;
-        let end = elements
-            .iter()
-            .rposition(|element| element.kind() == SyntaxKind::WHITESPACE)
-            .ok_or("record wrapper has no closing whitespace")?;
-        Ok(elements[start + 1..end].to_vec())
-    } else {
-        let file = parse_file(&format!("fn w() {{ W {{{fields}}}; }}"))?;
-        let list = file
-            .syntax()
-            .descendants()
-            .find_map(ast::RecordExprFieldList::cast)
-            .ok_or("record wrapper has no field list")?;
-        let open = list
-            .l_curly_token()
-            .ok_or("record wrapper has no opening brace")?;
-        let close = list
-            .r_curly_token()
-            .ok_or("record wrapper has no closing brace")?;
-        elements_between(list.syntax(), &open, &close)
-    }
-}
 
-fn rest_pattern_elements() -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
-    let file = parse_file("fn w() { if let W { w0, .. } = 0 {} }")?;
-    let list = file
-        .syntax()
-        .descendants()
-        .find_map(ast::RecordPatFieldList::cast)
-        .ok_or("pattern wrapper has no field list")?;
-    let seed = list
-        .fields()
-        .next()
-        .ok_or("pattern wrapper has no seed field")?;
-    let elements = list.syntax().children_with_tokens().collect::<Vec<_>>();
-    let start = elements
-        .iter()
-        .position(|element| element.as_node() == Some(seed.syntax()))
-        .ok_or("seed is not a direct child")?;
-    let rest = elements
-        .iter()
-        .position(|element| element.kind() == SyntaxKind::REST_PAT)
-        .ok_or("pattern wrapper has no rest pattern")?;
-    Ok(elements[start + 1..=rest].to_vec())
-}
+
+
 
 fn statement_element(statement: &str) -> Result<SyntaxElement, Box<dyn Error>> {
     let file = parse_file(&format!("fn w() {{ {statement} }}"))?;
@@ -984,35 +1015,13 @@ fn expr_element(expr: &str) -> Result<SyntaxElement, Box<dyn Error>> {
         .ok_or_else(|| "could not parse expression".into())
 }
 
-fn name_element(name: &str) -> Result<SyntaxElement, Box<dyn Error>> {
-    let file = parse_file(&format!("fn {name}() {{}}"))?;
-    file.syntax()
-        .descendants()
-        .find_map(ast::Name::cast)
-        .map(|name| name.syntax().clone().into())
-        .ok_or_else(|| "could not parse name".into())
-}
-
-fn name_ref_element(name: &str) -> Result<SyntaxElement, Box<dyn Error>> {
-    let file = parse_file(&format!("fn w() {{ self.{name}(); }}"))?;
-    file.syntax()
-        .descendants()
-        .filter_map(ast::NameRef::cast)
-        .find(|it| it.text() == name)
-        .map(|name| name.syntax().clone().into())
-        .ok_or_else(|| "could not parse method name".into())
-}
 
 
 
-fn visibility_element(visibility: &str) -> Result<SyntaxElement, Box<dyn Error>> {
-    let file = parse_file(&format!("{visibility} fn w() {{}}"))?;
-    file.syntax()
-        .descendants()
-        .find_map(ast::Visibility::cast)
-        .map(|visibility| visibility.syntax().clone().into())
-        .ok_or_else(|| "could not parse visibility".into())
-}
+
+
+
+
 
 fn attr_elements(attribute: &str, indent: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
     let file = parse_file(&format!("{attribute}\n{indent}fn w() {{}}"))?;
@@ -1034,15 +1043,7 @@ fn attr_elements(attribute: &str, indent: &str) -> Result<Vec<SyntaxElement>, Bo
     Ok(elements)
 }
 
-fn whitespace_element(text: &str) -> Result<SyntaxElement, Box<dyn Error>> {
-    let file = parse_file(&format!("fn w(){text}{{}}"))?;
-    file.syntax()
-        .descendants_with_tokens()
-        .filter_map(|element| element.into_token())
-        .find(|token| token.kind() == SyntaxKind::WHITESPACE && token.text() == text)
-        .map(SyntaxElement::from)
-        .ok_or_else(|| "could not parse whitespace".into())
-}
+
 
 fn normalize_statement_body(body: &str, source_indent: &str, target_indent: &str) -> String {
     let mut normalized = String::new();
@@ -1062,7 +1063,7 @@ mod tests {
     fn injects_use_before_existing_imports() {
         let mut source = String::from("#![allow(clippy::all)]\n\nuse std::path::Path;\n");
 
-        add_use(&mut source, "crate::patched::run_flycheck").unwrap();
+        add_use(&mut source, None, "crate::patched::run_flycheck").unwrap();
 
         assert_eq!(
             source,

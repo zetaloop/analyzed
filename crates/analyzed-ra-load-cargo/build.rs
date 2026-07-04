@@ -21,11 +21,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn patch_analyzed_workspace_load_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(lib_rs)?;
 
-    build_support::add_use(
-        &mut source,
-        "ide_db::base_db::{CrateBuilderId, ProcMacroPaths}",
-    )?;
-    build_support::add_use(&mut source, "vfs::file_set::FileSet")?;
+    build_support::add_use(&mut source, None, "ide_db::base_db::CrateBuilderId")?;
+    build_support::add_use(&mut source, None, "ide_db::base_db::ProcMacroPaths")?;
+    build_support::add_use(&mut source, None, "vfs::file_set::FileSet")?;
 
     let analyzed = owned_source_path("analyzed.rs");
     source.insert_str(

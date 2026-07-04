@@ -29,19 +29,29 @@ fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::append::<ast::Struct>(
         &mut source,
         "RootDatabase",
-        "    analyzed_visible_files: Option<std::sync::Arc<rustc_hash::FxHashSet<vfs::FileId>>>,\n",
+        &[build_support::Field {
+            vis: None,
+            name: "analyzed_visible_files",
+            ty: "Option<std::sync::Arc<rustc_hash::FxHashSet<vfs::FileId>>>",
+        }],
     )?;
     build_support::append_record_fields(
         &mut source,
         "clone",
         "Self",
-        "            analyzed_visible_files: self.analyzed_visible_files.clone(),\n",
+        &[build_support::FieldInit {
+            name: "analyzed_visible_files",
+            value: Some("self.analyzed_visible_files.clone()"),
+        }],
     )?;
     build_support::append_record_fields(
         &mut source,
         "new",
         "RootDatabase",
-        "            analyzed_visible_files: None,\n",
+        &[build_support::FieldInit {
+            name: "analyzed_visible_files",
+            value: Some("None"),
+        }],
     )?;
     fs::write(lib_rs, source)?;
     Ok(())
@@ -89,7 +99,7 @@ fn patch_symbol_index_source(symbol_index_rs: &Path) -> Result<(), Box<dyn Error
         "_resolve_path_to_modules",
         "#[allow(dead_code)]",
     )?;
-    build_support::add_use(&mut source, "crate::analyzed::resolve_path_to_modules")?;
+    build_support::add_use(&mut source, None, "crate::analyzed::resolve_path_to_modules")?;
 
     fs::write(symbol_index_rs, source)?;
     Ok(())

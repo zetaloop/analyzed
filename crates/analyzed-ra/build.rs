@@ -283,7 +283,11 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
     build_support::append::<ast::Struct>(
         &mut source,
         "FetchWorkspaceResponse",
-        "    pub(crate) analyzed_shared: crate::analyzed_bridge::SharedAnalyzerRuntime,\n",
+        &[build_support::Field {
+            vis: Some("pub(crate)"),
+            name: "analyzed_shared",
+            ty: "crate::analyzed_bridge::SharedAnalyzerRuntime",
+        }],
     )?;
     build_support::add_attr::<ast::Struct>(
         &mut source,
@@ -293,12 +297,27 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
     build_support::append::<ast::Struct>(
         &mut source,
         "GlobalState",
-        "    pub(crate) analyzed_provider: crate::analyzed_bridge::SharedAnalyzerProvider,\n    pub(crate) analyzed_shared: crate::analyzed_bridge::SharedAnalyzerRuntime,\n",
+        &[
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "analyzed_provider",
+                ty: "crate::analyzed_bridge::SharedAnalyzerProvider",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "analyzed_shared",
+                ty: "crate::analyzed_bridge::SharedAnalyzerRuntime",
+            },
+        ],
     )?;
     build_support::append::<ast::Struct>(
         &mut source,
         "GlobalStateSnapshot",
-        "    pub(crate) analyzed_shared: crate::analyzed_bridge::SharedAnalyzerRuntime,\n",
+        &[build_support::Field {
+            vis: Some("pub(crate)"),
+            name: "analyzed_shared",
+            ty: "crate::analyzed_bridge::SharedAnalyzerRuntime",
+        }],
     )?;
     build_support::set_visibility::<ast::RecordField>(
         &mut source,
@@ -315,13 +334,35 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
     build_support::append::<ast::Fn>(
         &mut source,
         "new_analyzed",
-        ",\n        analyzed_provider: crate::analyzed_bridge::SharedAnalyzerProvider,\n        analyzed_shared: crate::analyzed_bridge::SharedAnalyzerRuntime,\n        analyzed_workspaces: Vec<ProjectWorkspace>",
+        &[
+            build_support::Param {
+                name: "analyzed_provider",
+                ty: "crate::analyzed_bridge::SharedAnalyzerProvider",
+            },
+            build_support::Param {
+                name: "analyzed_shared",
+                ty: "crate::analyzed_bridge::SharedAnalyzerRuntime",
+            },
+            build_support::Param {
+                name: "analyzed_workspaces",
+                ty: "Vec<ProjectWorkspace>",
+            },
+        ],
     )?;
     build_support::append_record_fields(
         &mut source,
         "new_analyzed",
         "GlobalState",
-        "            analyzed_provider,\n            analyzed_shared,\n",
+        &[
+            build_support::FieldInit {
+                name: "analyzed_provider",
+                value: None,
+            },
+            build_support::FieldInit {
+                name: "analyzed_shared",
+                value: None,
+            },
+        ],
     )?;
     build_support::set_record_field(
         &mut source,
@@ -342,7 +383,10 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         &mut source,
         "snapshot",
         "GlobalStateSnapshot",
-        "            analyzed_shared: self.analyzed_shared.clone(),\n",
+        &[build_support::FieldInit {
+            name: "analyzed_shared",
+            value: Some("self.analyzed_shared.clone()"),
+        }],
     )?;
     build_support::rename::<ast::Fn>(&mut source, "target_spec_for_file", "_target_spec_for_file")?;
     build_support::add_attr::<ast::Fn>(
@@ -405,11 +449,7 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
 
 fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(main_loop_rs)?;
-    let main_loop_export = "pub use crate::analyzed_main_loop::main_loop;\n";
-    let export_at = source
-        .find("use std::")
-        .ok_or("main_loop source has no std use")?;
-    source.insert_str(export_at, main_loop_export);
+    build_support::add_use(&mut source, Some("pub"), "crate::analyzed_main_loop::main_loop")?;
 
     build_support::rename::<ast::Fn>(&mut source, "main_loop", "_main_loop")?;
     build_support::add_attr::<ast::Fn>(&mut source, "_main_loop", "#[allow(dead_code)]")?;
@@ -419,7 +459,10 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::append::<ast::Enum>(
         &mut source,
         "Task",
-        "    AnalyzedFetchWorkspace(FetchWorkspaceResponse),\n",
+        &[build_support::Variant {
+            name: "AnalyzedFetchWorkspace",
+            tuple_fields: &["FetchWorkspaceResponse"],
+        }],
     )?;
     build_support::add_attr::<ast::Variant>(
         &mut source,
@@ -616,10 +659,13 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
         &mut source,
         "_handle_task",
         "FetchWorkspaceResponse",
-        ", analyzed_shared: self.analyzed_shared.clone()",
+        &[build_support::FieldInit {
+            name: "analyzed_shared",
+            value: Some("self.analyzed_shared.clone()"),
+        }],
     )?;
     build_support::rename_path_root(&mut source, "_handle_task", "Task", "UpstreamTask")?;
-    build_support::add_use(&mut source, "self::analyzed_session::UpstreamTask")?;
+    build_support::add_use(&mut source, None, "self::analyzed_session::UpstreamTask")?;
 
     let analyzed_session = owned_source_path("analyzed_session.rs");
     source.push_str(&format!(
@@ -665,7 +711,7 @@ fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box
 
     build_support::rename::<ast::Fn>(&mut source, "location", "_location")?;
     build_support::add_attr::<ast::Fn>(&mut source, "_location", "#[allow(dead_code)]")?;
-    build_support::add_use(&mut source, "self::analyzed_flycheck_location::location")?;
+    build_support::add_use(&mut source, None, "self::analyzed_flycheck_location::location")?;
     let analyzed_location = owned_source_path("diagnostics/flycheck_location.rs");
     source.push_str(&format!(
         "\n#[path = {:?}]\nmod analyzed_flycheck_location;\n",
@@ -681,8 +727,9 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
 
     build_support::rename::<ast::Fn>(&mut source, "run_flycheck", "_run_flycheck")?;
     build_support::add_attr::<ast::Fn>(&mut source, "_run_flycheck", "#[allow(dead_code)]")?;
-    build_support::add_pub_use(
+    build_support::add_use(
         &mut source,
+        Some("pub(crate)"),
         "crate::handlers::analyzed_notification::run_flycheck",
     )?;
     build_support::rename::<ast::Fn>(
@@ -695,8 +742,9 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
         "_handle_did_save_text_document",
         "#[allow(dead_code)]",
     )?;
-    build_support::add_pub_use(
+    build_support::add_use(
         &mut source,
+        Some("pub(crate)"),
         "crate::handlers::analyzed_notification::handle_did_save_text_document",
     )?;
 
@@ -746,7 +794,7 @@ fn patch_slow_tests_imports(path: &Path) -> Result<(), Box<dyn Error>> {
             ".analyzed_uri_path()",
         );
     if source.contains(".analyzed_uri_path()") {
-        build_support::add_use(&mut source, "crate::analyzed_slow_tests::AnalyzedUriPath")?;
+        build_support::add_use(&mut source, None, "crate::analyzed_slow_tests::AnalyzedUriPath")?;
     }
     fs::write(path, source)?;
     Ok(())

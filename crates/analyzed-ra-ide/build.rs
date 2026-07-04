@@ -29,19 +29,29 @@ fn patch_ide_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::append::<ast::Struct>(
         &mut source,
         "Analysis",
-        "    analyzed_guard: Option<crate::analyzed::AnalyzedAnalysisGuard>,\n",
+        &[build_support::Field {
+            vis: None,
+            name: "analyzed_guard",
+            ty: "Option<crate::analyzed::AnalyzedAnalysisGuard>",
+        }],
     )?;
     build_support::append_record_fields(
         &mut source,
         "analysis",
         "Analysis",
-        ", analyzed_guard: None",
+        &[build_support::FieldInit {
+            name: "analyzed_guard",
+            value: Some("None"),
+        }],
     )?;
     build_support::append_record_fields(
         &mut source,
         "from_ra_fixture_with_on_cursor",
         "Analysis",
-        ", analyzed_guard: None",
+        &[build_support::FieldInit {
+            name: "analyzed_guard",
+            value: Some("None"),
+        }],
     )?;
 
     fs::write(lib_rs, source)?;
