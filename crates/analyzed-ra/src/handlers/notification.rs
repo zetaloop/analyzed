@@ -79,8 +79,8 @@ pub(crate) fn handle_did_save_text_document(
 pub(crate) fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
     let _p = tracing::info_span!("run_flycheck").entered();
 
-    let base_file_id = state.analyzed_shared.base_vfs_path_to_file_id(&vfs_path);
-    let file_id = state.analyzed_shared.vfs_path_to_file_id(&vfs_path);
+    let base_file_id = state.shared.base_vfs_path_to_file_id(&vfs_path);
+    let file_id = state.shared.vfs_path_to_file_id(&vfs_path);
     if let (Ok(Some(_)), Ok(Some(file_id))) = (base_file_id, file_id) {
         let world = state.snapshot();
         let invocation_strategy = state.config.flycheck(None).invocation_strategy();

@@ -9,54 +9,54 @@ use vfs::FileId;
 use crate::RootDatabase;
 
 impl RootDatabase {
-    pub fn analyzed_with_visible_files(
+    pub fn with_visible_files(
         mut self,
         visible_files: Arc<FxHashSet<FileId>>,
     ) -> RootDatabase {
-        self.analyzed_visible_files = Some(visible_files);
+        self.visible_files = Some(visible_files);
         self
     }
 
-    pub fn analyzed_is_file_visible(&self, file_id: FileId) -> bool {
-        self.analyzed_visible_files
+    pub fn is_file_visible(&self, file_id: FileId) -> bool {
+        self.visible_files
             .as_ref()
             .is_none_or(|visible_files| visible_files.contains(&file_id))
     }
 
-    pub fn analyzed_is_crate_visible(&self, krate: BaseCrate) -> bool {
-        self.analyzed_is_file_visible(krate.data(self).root_file_id)
+    pub fn is_crate_visible(&self, krate: BaseCrate) -> bool {
+        self.is_file_visible(krate.data(self).root_file_id)
     }
 
-    pub fn analyzed_is_hir_crate_visible(&self, krate: HirCrate) -> bool {
-        self.analyzed_is_file_visible(krate.root_file(self))
+    pub fn is_hir_crate_visible(&self, krate: HirCrate) -> bool {
+        self.is_file_visible(krate.root_file(self))
     }
 
-    pub fn analyzed_visible_base_crates(
+    pub fn visible_base_crates(
         &self,
         crates: impl IntoIterator<Item = BaseCrate>,
     ) -> Vec<BaseCrate> {
-        crates.into_iter().filter(|&krate| self.analyzed_is_crate_visible(krate)).collect()
+        crates.into_iter().filter(|&krate| self.is_crate_visible(krate)).collect()
     }
 
-    pub fn analyzed_visible_hir_crates(
+    pub fn visible_hir_crates(
         &self,
         crates: impl IntoIterator<Item = HirCrate>,
     ) -> Vec<HirCrate> {
-        crates.into_iter().filter(|&krate| self.analyzed_is_hir_crate_visible(krate)).collect()
+        crates.into_iter().filter(|&krate| self.is_hir_crate_visible(krate)).collect()
     }
 }
 
 pub(crate) fn is_symbol_visible(db: &RootDatabase, symbol: &FileSymbol<'_>) -> bool {
     let file_id = symbol.loc.hir_file_id.original_file(db).file_id(db);
-    db.analyzed_is_file_visible(file_id)
+    db.is_file_visible(file_id)
 }
 
 pub(crate) fn all_crates(db: &RootDatabase) -> Vec<BaseCrate> {
-    db.analyzed_visible_base_crates(base_db::all_crates(db).iter().copied())
+    db.visible_base_crates(base_db::all_crates(db).iter().copied())
 }
 
 pub(crate) fn all_hir_crates(db: &RootDatabase) -> Vec<HirCrate> {
-    db.analyzed_visible_hir_crates(HirCrate::all(db))
+    db.visible_hir_crates(HirCrate::all(db))
 }
 
 pub(crate) fn resolve_path_to_modules(
@@ -85,7 +85,7 @@ pub(crate) fn resolve_path_to_modules(
 
     if !anchor_to_crate {
         for &root in LocalRoots::get(db).roots(db) {
-            for krate in db.analyzed_visible_base_crates(source_root_crates(db, root).iter().copied()) {
+            for krate in db.visible_base_crates(source_root_crates(db, root).iter().copied()) {
                 let root_module = HirCrate::from(krate).root_module(db);
                 candidates.extend(root_module.children(db).filter_map(|child| {
                     let name = child.name(db)?;

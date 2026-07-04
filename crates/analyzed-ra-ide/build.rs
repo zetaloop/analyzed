@@ -31,8 +31,8 @@ fn patch_ide_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
         "Analysis",
         &[build_support::Field {
             vis: None,
-            name: "analyzed_guard",
-            ty: "Option<crate::analyzed::AnalyzedAnalysisGuard>",
+            name: "guard",
+            ty: "Option<crate::analyzed::AnalysisGuard>",
         }],
     )?;
     build_support::append_record_fields(
@@ -40,7 +40,7 @@ fn patch_ide_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
         "analysis",
         "Analysis",
         &[build_support::FieldInit {
-            name: "analyzed_guard",
+            name: "guard",
             value: Some("None"),
         }],
     )?;
@@ -49,7 +49,7 @@ fn patch_ide_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
         "from_ra_fixture_with_on_cursor",
         "Analysis",
         &[build_support::FieldInit {
-            name: "analyzed_guard",
+            name: "guard",
             value: Some("None"),
         }],
     )?;

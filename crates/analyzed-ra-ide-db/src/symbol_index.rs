@@ -63,6 +63,6 @@ fn visible_local_crates(db: &RootDatabase) -> Vec<BaseCrate> {
         .roots(db)
         .iter()
         .flat_map(|&root| source_root_crates(db, root).iter().copied())
-        .filter(|&krate| db.analyzed_is_crate_visible(krate))
+        .filter(|&krate| db.is_crate_visible(krate))
         .collect()
 }

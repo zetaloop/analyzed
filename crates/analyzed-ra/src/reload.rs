@@ -47,9 +47,9 @@ impl GlobalState {
         tracing::info!(%cause, "will fetch workspaces");
         let reload_path = path.clone();
 
-        let provider = self.analyzed_provider.clone();
+        let provider = self.provider.clone();
         let shared_context = crate::analyzed_bridge::shared_analyzer_context_from_config(&self.config);
-        let current_shared = self.analyzed_shared.clone();
+        let current_shared = self.shared.clone();
         self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {
             if sender.send(Task::FetchWorkspace(ProjectWorkspaceProgress::Begin)).is_err() {
                 return;
@@ -58,40 +58,40 @@ impl GlobalState {
                 Ok((key, config)) => provider
                     .resolve_reloading(key, config, reload_path)
                     .and_then(|session| {
-                        let analyzed_shared = session.runtime();
+                        let shared = session.runtime();
                         let workspaces = session.workspaces()?;
                         Ok(FetchWorkspaceResponse {
                             workspaces: workspaces.into_iter().map(Ok).collect(),
                             force_crate_graph_reload,
-                            analyzed_shared,
+                            shared,
                         })
                     })
                     .unwrap_or_else(|error| FetchWorkspaceResponse {
                         workspaces: vec![Err(error)],
                         force_crate_graph_reload,
-                        analyzed_shared: current_shared.clone(),
+                        shared: current_shared.clone(),
                     }),
                 Err(error) => FetchWorkspaceResponse {
                     workspaces: vec![Err(error)],
                     force_crate_graph_reload,
-                    analyzed_shared: current_shared.clone(),
+                    shared: current_shared.clone(),
                 },
             };
-            _ = sender.send(Task::AnalyzedFetchWorkspace(response));
+            _ = sender.send(Task::FetchedWorkspace(response));
         });
     }
 
-    pub(crate) fn recreate_crate_graph_after_shared_reload(
+    pub(crate) fn recreate_crate_graph_from_shared(
         &mut self,
         cause: String,
         switching_from_empty_workspace: bool,
     ) -> Option<Duration> {
-        if let Some(FetchWorkspaceResponse { analyzed_shared, .. }) =
+        if let Some(FetchWorkspaceResponse { shared, .. }) =
             self.fetch_workspaces_queue.last_op_result()
         {
-            self.analyzed_shared = analyzed_shared.clone();
+            self.shared = shared.clone();
         }
-        self.analyzed_reload_config_from_shared();
+        self.reload_config_from_shared();
         self.recreate_crate_graph(cause, switching_from_empty_workspace)
     }
 

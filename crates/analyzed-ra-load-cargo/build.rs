@@ -29,7 +29,7 @@ fn patch_analyzed_workspace_load_source(lib_rs: &Path) -> Result<(), Box<dyn Err
     source.insert_str(
         0,
         &format!(
-            "#[path = {:?}]\nmod analyzed;\npub use analyzed::{{\n    AnalyzedProcMacroLoad, AnalyzedWorkspaceLoad, analyzed_load_workspace_change,\n}};\nuse analyzed::load_crate_graph_into_db;\n\n",
+            "#[path = {:?}]\nmod analyzed;\npub use analyzed::{{\n    ProcMacroLoad, WorkspaceLoad, load_workspace_change,\n}};\nuse analyzed::load_crate_graph_into_db;\n\n",
             analyzed.to_string_lossy().into_owned()
         ),
     );

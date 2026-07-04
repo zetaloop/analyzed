@@ -26,37 +26,37 @@ impl GlobalState {
         let session = provider
             .resolve(key, shared_config)
             .expect("shared analyzer context must resolve");
-        Self::new_analyzed(sender, config, provider, session.runtime(), Vec::new())
+        Self::new_with_shared(sender, config, provider, session.runtime(), Vec::new())
     }
 
     pub(crate) fn process_changes(&mut self) -> (bool, Option<Duration>) {
         let _p = tracing::span!(tracing::Level::INFO, "GlobalState::process_changes").entered();
-        self.analyzed_process_shared_changes()
+        self.process_shared_changes()
     }
 }
 
 impl GlobalStateSnapshot {
     pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {
-        self.analyzed_shared.url_to_file_id(url)
+        self.shared.url_to_file_id(url)
     }
 
     pub(crate) fn file_id_to_url(&self, id: FileId) -> Url {
-        self.analyzed_shared.file_id_to_url(id).expect("shared analyzer file id must have a url")
+        self.shared.file_id_to_url(id).expect("shared analyzer file id must have a url")
     }
 
     pub(crate) fn vfs_path_to_file_id(&self, vfs_path: &VfsPath) -> anyhow::Result<Option<FileId>> {
-        self.analyzed_shared.vfs_path_to_file_id(vfs_path)
+        self.shared.vfs_path_to_file_id(vfs_path)
     }
 
     pub(crate) fn base_vfs_path_to_file_id(
         &self,
         vfs_path: &VfsPath,
     ) -> anyhow::Result<Option<FileId>> {
-        self.analyzed_shared.base_vfs_path_to_file_id(vfs_path)
+        self.shared.base_vfs_path_to_file_id(vfs_path)
     }
 
     pub(crate) fn file_line_index(&self, id: FileId) -> Cancellable<LineIndex> {
-        let endings = self.analyzed_shared.line_endings(id).expect("shared line endings");
+        let endings = self.shared.line_endings(id).expect("shared line endings");
         let index = self.analysis.file_line_index(id)?;
         let encoding = self.config.caps().negotiated_encoding();
         Ok(LineIndex { index, endings, encoding })
@@ -74,13 +74,13 @@ impl GlobalStateSnapshot {
     }
 
     pub(crate) fn file_id_to_file_path(&self, id: FileId) -> vfs::VfsPath {
-        self.analyzed_shared
+        self.shared
             .file_id_to_vfs_path(id)
             .unwrap_or_else(|| panic!("shared analyzer file id {id:?} must have a path"))
     }
 
     pub(crate) fn file_exists(&self, id: FileId) -> bool {
-        self.analyzed_shared.file_exists(id).unwrap_or(false)
+        self.shared.file_exists(id).unwrap_or(false)
     }
 
     pub(crate) fn target_spec_for_file(

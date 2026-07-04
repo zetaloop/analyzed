@@ -19,8 +19,8 @@
 	    },
 	};
 	use load_cargo::{
-	    AnalyzedProcMacroLoad, AnalyzedWorkspaceLoad, LoadCargoConfig, ProcMacroServerChoice,
-	    analyzed_load_workspace_change,
+	    ProcMacroLoad, WorkspaceLoad, LoadCargoConfig, ProcMacroServerChoice,
+	    load_workspace_change,
 	};
 	use lsp_types::Url;
 	use proc_macro_api::ProcMacroClient;
@@ -1285,8 +1285,8 @@ impl SharedAnalyzerRuntime {
         drop(cache);
         let analysis = world
             .host
-            .analyzed_analysis_with_visible_files(visible_files);
-        analysis.analyzed_with_guard((read_permit, gc_read_permit))
+            .analysis_with_visible_files(visible_files);
+        analysis.with_guard((read_permit, gc_read_permit))
     }
 
     pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {
@@ -1854,7 +1854,7 @@ struct ActiveOverlayFile {
 struct LoadedWorkspaceInput {
     source_roots: Vec<SourceRoot>,
     crate_graph: CrateGraphBuilder,
-    proc_macros: Vec<AnalyzedProcMacroLoad>,
+    proc_macros: Vec<ProcMacroLoad>,
 }
 
 struct LoadedWorkspaceFile {
@@ -1942,7 +1942,7 @@ struct PreparedWorkspaceLoad {
     root_key: String,
     summary: WorkspaceSummary,
     workspace: ProjectWorkspace,
-    loaded: AnalyzedWorkspaceLoad,
+    loaded: WorkspaceLoad,
     line_endings: BTreeMap<FileId, crate::line_index::LineEndings>,
 }
 
@@ -2038,7 +2038,7 @@ impl SharedWorld {
             workspace.set_build_scripts(build_scripts);
         }
         let workspace_for_session = workspace.clone();
-        let loaded = analyzed_load_workspace_change(
+        let loaded = load_workspace_change(
             workspace,
             &config.cargo_config.extra_env,
             &config.load.to_load_cargo_config(),

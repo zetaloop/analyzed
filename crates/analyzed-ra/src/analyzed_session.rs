@@ -22,25 +22,25 @@ use crate::{
     line_index::LineEndings,
 };
 
-pub(crate) struct RustAnalyzerSession {
+pub(crate) struct Session {
     state: crate::global_state::GlobalState,
 }
 
-impl RustAnalyzerSession {
+impl Session {
     pub(crate) fn new(
         sender: Sender<Message>,
         config: crate::config::Config,
         provider: SharedAnalyzerProvider,
-        analyzed_shared: SharedAnalyzerRuntime,
-        analyzed_workspaces: Vec<project_model::ProjectWorkspace>,
+        shared: SharedAnalyzerRuntime,
+        workspaces: Vec<project_model::ProjectWorkspace>,
     ) -> Self {
         Self {
-            state: crate::global_state::GlobalState::new_analyzed(
+            state: crate::global_state::GlobalState::new_with_shared(
                 sender,
                 config,
                 provider,
-                analyzed_shared,
-                analyzed_workspaces,
+                shared,
+                workspaces,
             ),
         }
     }
@@ -87,10 +87,10 @@ pub(crate) fn run_shared_lsp_session_with_config(
     let (key, shared_config) =
         crate::analyzed_bridge::shared_analyzer_context_from_config(&config)?;
     let session = provider.resolve(key, shared_config)?;
-    let analyzed_shared = session.runtime();
-    let analyzed_workspaces = Vec::new();
+    let shared = session.runtime();
+    let workspaces = Vec::new();
     let Connection { sender, receiver } = connection;
-    RustAnalyzerSession::new(sender, config, provider, analyzed_shared, analyzed_workspaces)
+    Session::new(sender, config, provider, shared, workspaces)
         .run_shared(receiver)
 }
 
@@ -137,20 +137,20 @@ fn run_shared_state(
         ) {
             return Ok(());
         }
-        state.analyzed_shared.set_busy(true);
+        state.shared.set_busy(true);
         state.handle_event(event);
         let idle = state.is_quiescent()
             && state.task_pool.handle.is_empty()
             && state.fmt_pool.handle.is_empty();
-        state.analyzed_shared.set_busy(!idle);
+        state.shared.set_busy(!idle);
     }
 
     anyhow::bail!("A receiver has been dropped, something panicked!")
 }
 
 impl crate::global_state::GlobalState {
-    pub(crate) fn analyzed_process_shared_changes(&mut self) -> (bool, Option<Duration>) {
-        let shared = self.analyzed_shared.clone();
+    pub(crate) fn process_shared_changes(&mut self) -> (bool, Option<Duration>) {
+        let shared = self.shared.clone();
         let generation_changed = shared.config_generation_changed();
         let mut modified_ratoml_files = Vec::new();
         let mut workspace_structure_change = None;
@@ -305,7 +305,7 @@ impl crate::global_state::GlobalState {
                         .and_then(|path| fs::read_to_string(path).ok())
                 });
             let shared_source_root_parent_map = Arc::new(shared.source_root_parent_map());
-            let config_change = self.analyzed_config_change_from_ratoml(
+            let config_change = self.config_change_from_ratoml(
                 modified_ratoml_files,
                 shared_ratoml_files,
                 user_config_text,
@@ -346,8 +346,8 @@ impl crate::global_state::GlobalState {
         (changed, cancellation_time)
     }
 
-    pub(crate) fn analyzed_reload_config_from_shared(&mut self) {
-        let shared = &self.analyzed_shared;
+    pub(crate) fn reload_config_from_shared(&mut self) {
+        let shared = &self.shared;
         let shared_ratoml_files = shared.ratoml_files();
         let user_config_path = (|| {
             let mut path = Config::user_config_dir_path()?;
@@ -364,7 +364,7 @@ impl crate::global_state::GlobalState {
             })
             .or_else(|| user_config_path.as_ref().and_then(|path| fs::read_to_string(path).ok()));
         let shared_source_root_parent_map = Arc::new(shared.source_root_parent_map());
-        let config_change = self.analyzed_config_change_from_ratoml(
+        let config_change = self.config_change_from_ratoml(
             Vec::new(),
             shared_ratoml_files,
             user_config_text,
@@ -380,7 +380,7 @@ impl crate::global_state::GlobalState {
         }
     }
 
-    fn analyzed_config_change_from_ratoml(
+    fn config_change_from_ratoml(
         &self,
         modified_ratoml_files: Vec<(ChangeKind, VfsPath, Option<String>)>,
         shared_ratoml_files: Vec<(VfsPath, SourceRootId, bool, String)>,
@@ -424,7 +424,7 @@ impl crate::global_state::GlobalState {
             }
 
             let Some((source_root_id, is_library)) =
-                self.analyzed_shared.source_root_for_path(&vfs_path)
+                self.shared.source_root_for_path(&vfs_path)
             else {
                 continue;
             };
@@ -469,21 +469,21 @@ impl crate::global_state::GlobalState {
         change
     }
 
-    pub(crate) fn analyzed_base_url_to_file_id(
+    pub(crate) fn base_url_to_file_id(
         &self,
         url: &Url,
     ) -> anyhow::Result<Option<FileId>> {
-        self.analyzed_shared.base_url_to_file_id(url)
+        self.shared.base_url_to_file_id(url)
     }
 
-    pub(crate) fn analyzed_filter_diagnostics(
+    pub(crate) fn filter_diagnostics(
         &self,
         diagnostics: Vec<lsp_types::Diagnostic>,
     ) -> Vec<lsp_types::Diagnostic> {
         let rustc_diagnostics = diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.source.as_deref() == Some("rustc"))
-            .map(analyzed_diagnostic_key)
+            .map(diagnostic_key)
             .collect::<Vec<_>>();
 
         diagnostics
@@ -492,13 +492,13 @@ impl crate::global_state::GlobalState {
                 diagnostic.source.as_deref() != Some("rust-analyzer")
                     || !rustc_diagnostics
                         .iter()
-                        .any(|key| *key == analyzed_diagnostic_key(diagnostic))
+                        .any(|key| *key == diagnostic_key(diagnostic))
             })
             .collect()
     }
 
     pub(crate) fn publish_changed_diagnostics(&mut self, file_id: FileId) {
-        let Some(uri) = self.analyzed_shared.file_id_to_url(file_id) else {
+        let Some(uri) = self.shared.file_id_to_url(file_id) else {
             return;
         };
         let version = crate::lsp::from_proto::vfs_path(&uri)
@@ -510,7 +510,7 @@ impl crate::global_state::GlobalState {
             .diagnostics_for(file_id)
             .cloned()
             .collect::<Vec<_>>();
-        let diagnostics = self.analyzed_filter_diagnostics(diagnostics);
+        let diagnostics = self.filter_diagnostics(diagnostics);
         self.publish_diagnostics(uri, version, diagnostics);
     }
 
@@ -521,7 +521,7 @@ impl crate::global_state::GlobalState {
         package_id: Option<crate::flycheck::PackageSpecifier>,
         diag: crate::diagnostics::flycheck_to_proto::MappedRustDiagnostic,
     ) {
-        match self.analyzed_base_url_to_file_id(&diag.url) {
+        match self.base_url_to_file_id(&diag.url) {
             Ok(Some(file_id)) => self.diagnostics.add_check_diagnostic(
                 id,
                 generation,
@@ -555,7 +555,7 @@ impl crate::global_state::GlobalState {
         task: super::Task,
     ) -> Option<Duration> {
         match task {
-            super::Task::AnalyzedFetchWorkspace(resp) => {
+            super::Task::FetchedWorkspace(resp) => {
                 self.fetch_workspaces_queue.op_completed(resp);
                 if let Err(e) = self.fetch_workspace_error() {
                     tracing::error!("FetchWorkspaceError: {e}");
@@ -582,7 +582,7 @@ impl crate::global_state::GlobalState {
     pub(crate) fn update_diagnostics(&mut self) {
         let generation = self.diagnostics.next_generation();
         let subscriptions: std::sync::Arc<[FileId]> = self
-            .analyzed_workspace_file_ids()
+            .workspace_file_ids()
             .into_iter()
             .collect();
         self.spawn_native_diagnostics(generation, subscriptions);
@@ -592,12 +592,12 @@ impl crate::global_state::GlobalState {
         if !self.vfs_done {
             return;
         }
-        let subscriptions = self.analyzed_workspace_file_ids();
+        let subscriptions = self.workspace_file_ids();
         self.spawn_discover_tests(subscriptions);
     }
 
-    fn analyzed_workspace_file_ids(&self) -> Vec<FileId> {
-        let shared = &self.analyzed_shared;
+    fn workspace_file_ids(&self) -> Vec<FileId> {
+        let shared = &self.shared;
         let file_ids = self
             .mem_docs
             .iter()
@@ -649,7 +649,7 @@ impl TryFrom<super::Task> for UpstreamTask {
     }
 }
 
-fn analyzed_diagnostic_key(
+fn diagnostic_key(
     diagnostic: &lsp_types::Diagnostic,
 ) -> (lsp_types::Range, Option<String>) {
     let code = diagnostic.code.as_ref().map(|code| match code {

@@ -31,7 +31,7 @@ fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
         "RootDatabase",
         &[build_support::Field {
             vis: None,
-            name: "analyzed_visible_files",
+            name: "visible_files",
             ty: "Option<std::sync::Arc<rustc_hash::FxHashSet<vfs::FileId>>>",
         }],
     )?;
@@ -40,8 +40,8 @@ fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
         "clone",
         "Self",
         &[build_support::FieldInit {
-            name: "analyzed_visible_files",
-            value: Some("self.analyzed_visible_files.clone()"),
+            name: "visible_files",
+            value: Some("self.visible_files.clone()"),
         }],
     )?;
     build_support::append_record_fields(
@@ -49,7 +49,7 @@ fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
         "new",
         "RootDatabase",
         &[build_support::FieldInit {
-            name: "analyzed_visible_files",
+            name: "visible_files",
             value: Some("None"),
         }],
     )?;

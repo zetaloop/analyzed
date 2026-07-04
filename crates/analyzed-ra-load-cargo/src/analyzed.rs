@@ -1,11 +1,11 @@
 use super::*;
 
-pub type AnalyzedProcMacroLoad = (CrateBuilderId, ProcMacroLoadResult);
+pub type ProcMacroLoad = (CrateBuilderId, ProcMacroLoadResult);
 
-pub struct AnalyzedWorkspaceLoad {
+pub struct WorkspaceLoad {
     pub change: ChangeWithProcMacros,
     pub crate_graph: CrateGraphBuilder,
-    pub proc_macros: Vec<AnalyzedProcMacroLoad>,
+    pub proc_macros: Vec<ProcMacroLoad>,
     pub source_roots: Vec<SourceRoot>,
     pub vfs: vfs::Vfs,
     pub file_id_map: FxHashMap<FileId, FileId>,
@@ -14,12 +14,12 @@ pub struct AnalyzedWorkspaceLoad {
     pub proc_macro_server: Option<ProcMacroClient>,
 }
 
-pub fn analyzed_load_workspace_change(
+pub fn load_workspace_change(
     ws: ProjectWorkspace,
     extra_env: &FxHashMap<String, Option<String>>,
     load_config: &LoadCargoConfig,
     mut allocate_file_id: impl FnMut(FileId) -> FileId,
-) -> anyhow::Result<AnalyzedWorkspaceLoad> {
+) -> anyhow::Result<WorkspaceLoad> {
     let (sender, receiver) = unbounded();
     let mut vfs = vfs::Vfs::default();
     let mut loader = {
@@ -54,7 +54,7 @@ pub fn analyzed_load_workspace_change(
         version: 0,
     });
 
-    let (change, file_texts, source_roots) = analyzed_crate_graph_change(
+    let (change, file_texts, source_roots) = crate_graph_change(
         crate_graph.clone(),
         proc_macros.iter().cloned().collect(),
         project_folders.source_root_config,
@@ -64,7 +64,7 @@ pub fn analyzed_load_workspace_change(
         &mut allocate_file_id,
     );
 
-    Ok(AnalyzedWorkspaceLoad {
+    Ok(WorkspaceLoad {
         change,
         crate_graph,
         proc_macros,
@@ -77,7 +77,7 @@ pub fn analyzed_load_workspace_change(
     })
 }
 
-pub(crate) fn analyzed_crate_graph_change(
+pub(crate) fn crate_graph_change(
     crate_graph: CrateGraphBuilder,
     proc_macros: ProcMacrosBuilder,
     source_root_config: SourceRootConfig,
@@ -123,7 +123,7 @@ pub(crate) fn load_crate_graph_into_db(
 ) {
     let mut file_id_map = FxHashMap::default();
     let mut allocate_file_id = |file_id| file_id;
-    let (analysis_change, _, _) = analyzed_crate_graph_change(
+    let (analysis_change, _, _) = crate_graph_change(
         crate_graph,
         proc_macros,
         source_root_config,
@@ -191,7 +191,7 @@ fn log_proc_macro_server(
 fn collect_proc_macros(
     proc_macro_server: &Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
     proc_macro_paths: ProcMacroPaths,
-) -> Vec<AnalyzedProcMacroLoad> {
+) -> Vec<ProcMacroLoad> {
     let server = match proc_macro_server {
         Some(Ok(server)) => Ok(server),
         Some(Err(error)) => {
