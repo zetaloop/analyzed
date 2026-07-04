@@ -449,7 +449,11 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
 
 fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(main_loop_rs)?;
-    build_support::add_use(&mut source, Some("pub"), "crate::analyzed_main_loop::main_loop")?;
+    build_support::add_use(
+        &mut source,
+        Some("pub"),
+        "crate::analyzed_main_loop::main_loop",
+    )?;
 
     build_support::rename::<ast::Fn>(&mut source, "main_loop", "_main_loop")?;
     build_support::add_attr::<ast::Fn>(&mut source, "_main_loop", "#[allow(dead_code)]")?;
@@ -711,7 +715,11 @@ fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box
 
     build_support::rename::<ast::Fn>(&mut source, "location", "_location")?;
     build_support::add_attr::<ast::Fn>(&mut source, "_location", "#[allow(dead_code)]")?;
-    build_support::add_use(&mut source, None, "self::analyzed_flycheck_location::location")?;
+    build_support::add_use(
+        &mut source,
+        None,
+        "self::analyzed_flycheck_location::location",
+    )?;
     let analyzed_location = owned_source_path("diagnostics/flycheck_location.rs");
     source.push_str(&format!(
         "\n#[path = {:?}]\nmod analyzed_flycheck_location;\n",
@@ -794,7 +802,11 @@ fn patch_slow_tests_imports(path: &Path) -> Result<(), Box<dyn Error>> {
             ".analyzed_uri_path()",
         );
     if source.contains(".analyzed_uri_path()") {
-        build_support::add_use(&mut source, None, "crate::analyzed_slow_tests::AnalyzedUriPath")?;
+        build_support::add_use(
+            &mut source,
+            None,
+            "crate::analyzed_slow_tests::AnalyzedUriPath",
+        )?;
     }
     fs::write(path, source)?;
     Ok(())

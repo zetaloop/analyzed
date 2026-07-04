@@ -99,7 +99,11 @@ fn patch_symbol_index_source(symbol_index_rs: &Path) -> Result<(), Box<dyn Error
         "_resolve_path_to_modules",
         "#[allow(dead_code)]",
     )?;
-    build_support::add_use(&mut source, None, "crate::analyzed::resolve_path_to_modules")?;
+    build_support::add_use(
+        &mut source,
+        None,
+        "crate::analyzed::resolve_path_to_modules",
+    )?;
 
     fs::write(symbol_index_rs, source)?;
     Ok(())
