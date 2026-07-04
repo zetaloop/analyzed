@@ -225,9 +225,17 @@ pub fn add_attr<N: Host>(
     let (editor, root) = open(source)?;
     let item: N = named(&root, name)?;
     let indent = indent_before(&item.syntax().clone().into());
+    let file = parse_file(&format!("{attribute}\nfn w() {{}}"))?;
+    let attr = one(
+        file.syntax().descendants().filter_map(ast::Attr::cast),
+        "attribute in wrapper",
+    )?;
     editor.insert_all(
         Position::first_child_of(item.syntax()),
-        attr_elements(attribute, &indent)?,
+        vec![
+            attr.syntax().clone().into(),
+            make::tokens::whitespace(&format!("\n{indent}")).into(),
+        ],
     );
     commit(source, editor)
 }
@@ -1028,26 +1036,6 @@ fn indent_before(element: &SyntaxElement) -> String {
     };
     let text = whitespace.to_string();
     text.rsplit('\n').next().unwrap_or_default().to_owned()
-}
-
-fn attr_elements(attribute: &str, indent: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
-    let file = parse_file(&format!("{attribute}\n{indent}fn w() {{}}"))?;
-    let function = file
-        .syntax()
-        .descendants()
-        .find_map(ast::Fn::cast)
-        .ok_or("attribute wrapper has no function")?;
-    let elements = function
-        .syntax()
-        .children_with_tokens()
-        .take_while(|element| {
-            element.kind() == SyntaxKind::ATTR || element.kind() == SyntaxKind::WHITESPACE
-        })
-        .collect::<Vec<_>>();
-    if elements.is_empty() {
-        return Err("could not parse attribute".into());
-    }
-    Ok(elements)
 }
 
 #[cfg(test)]
