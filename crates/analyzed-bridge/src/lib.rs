@@ -1204,6 +1204,69 @@ pub fn extract_for_loop_body(
     apply_extraction(source, function_end, &function_indent, extraction, method)
 }
 
+pub fn extract_method_tail_by_params(
+    source: &mut String,
+    function: &str,
+    method: ExtractedMethod<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let function_node = find_function(source, function)?;
+    let function_end = text_offset(function_node.syntax().text_range().end());
+    let function_indent = line_indent(
+        source,
+        text_offset(function_node.syntax().text_range().start()),
+    )
+    .to_owned();
+    let body = function_node
+        .body()
+        .ok_or_else(|| format!("function `{function}` has no body"))?;
+    let stmt_list = body
+        .stmt_list()
+        .ok_or_else(|| format!("function `{function}` has no statement list"))?;
+    let mut anchor = None;
+    for param in method.params {
+        let mut end = None;
+        for statement in stmt_list.statements() {
+            if let ast::Stmt::LetStmt(let_statement) = &statement
+                && let_statement_has_ident_binding(let_statement, param.name)
+            {
+                end = Some(statement.syntax().text_range().end());
+            }
+        }
+        let end = end.ok_or_else(|| {
+            format!(
+                "function `{function}` does not define parameter `{}`",
+                param.name
+            )
+        })?;
+        if anchor.is_none_or(|current| current < end) {
+            anchor = Some(end);
+        }
+    }
+    let anchor = anchor
+        .ok_or_else(|| format!("extracted method for `{function}` declares no parameters"))?;
+    let first_extracted_stmt = stmt_list
+        .statements()
+        .find(|statement| statement.syntax().text_range().start() > anchor)
+        .ok_or_else(|| format!("function `{function}` has no statements after its parameters"))?;
+    let closing_brace = stmt_list
+        .r_curly_token()
+        .ok_or_else(|| format!("function `{function}` has no closing brace"))?;
+    let range = text_offset(anchor)..text_offset(closing_brace.text_range().start());
+    let extraction = Extraction {
+        call_indent: line_indent(
+            source,
+            text_offset(first_extracted_stmt.syntax().text_range().start()),
+        )
+        .to_owned(),
+        close_indent: function_indent.clone(),
+        body: source[range.clone()].trim_end().to_owned(),
+        return_ty: None,
+        expression: false,
+        range,
+    };
+    apply_extraction(source, function_end, &function_indent, extraction, method)
+}
+
 struct Extraction {
     range: std::ops::Range<usize>,
     body: String,

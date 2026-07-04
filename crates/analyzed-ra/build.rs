@@ -425,12 +425,9 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
         build_support::rename_function(&mut source, name, &replacement)?;
     }
 
-    build_support::extract_method(
+    build_support::extract_method_tail_by_params(
         &mut source,
         "_update_diagnostics",
-        build_support::ExtractSelector::LetBinding("subscriptions"),
-        0,
-        build_support::ExtractRange::TailToBlockEnd,
         build_support::ExtractedMethod {
             name: "spawn_native_diagnostics",
             receiver: Some("&mut self"),
@@ -448,12 +445,9 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
         },
     )?;
     build_support::allow_dead_code_for_function(&mut source, "_update_diagnostics")?;
-    build_support::extract_method(
+    build_support::extract_method_tail_by_params(
         &mut source,
         "_update_tests",
-        build_support::ExtractSelector::LetBinding("subscriptions"),
-        0,
-        build_support::ExtractRange::TailToBlockEnd,
         build_support::ExtractedMethod {
             name: "spawn_discover_tests",
             receiver: Some("&mut self"),
