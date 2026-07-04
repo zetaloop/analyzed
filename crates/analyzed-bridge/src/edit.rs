@@ -2,7 +2,11 @@ use std::{error::Error, path::Path};
 
 use ra_ap_syntax::{
     AstNode, Edition, SourceFile, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
-    ast::{self, HasLoopBody, HasName, HasVisibility, edit::AstNodeEdit},
+    ast::{
+        self, HasLoopBody, HasName, HasVisibility,
+        edit::{AstNodeEdit, IndentLevel},
+        make,
+    },
     hacks,
     syntax_editor::{Position, SyntaxEditor},
 };
@@ -156,7 +160,7 @@ pub fn rename<N: Host>(
     let name = item
         .name()
         .ok_or_else(|| format!("{} has no name", N::KIND))?;
-    editor.replace(name.syntax(), ast::make::name(replacement).syntax().clone());
+    editor.replace(name.syntax(), make::name(replacement).syntax().clone());
     commit(source, editor)
 }
 
@@ -206,7 +210,7 @@ pub fn set_visibility<N: VisibilityHost>(
             Position::before(item.visibility_slot()?),
             vec![
                 visibility_node(visibility)?.syntax().clone().into(),
-                ast::make::tokens::single_space().into(),
+                make::tokens::single_space().into(),
             ],
         );
     }
@@ -262,21 +266,21 @@ impl ListHost for ast::Struct {
         let close = fields
             .r_curly_token()
             .ok_or("record struct has no closing brace")?;
-        let indent = ast::edit::IndentLevel::from_node(fields.syntax()) + 1;
+        let indent = IndentLevel::from_node(fields.syntax()) + 1;
         let mut elements = Vec::new();
         for item in items {
             elements.extend([
-                ast::make::tokens::whitespace(&indent.to_string()).into(),
-                ast::make::record_field(
+                make::tokens::whitespace(&indent.to_string()).into(),
+                make::record_field(
                     item.vis.map(visibility_node).transpose()?,
-                    ast::make::name(item.name),
-                    ast::make::ty(item.ty),
+                    make::name(item.name),
+                    make::ty(item.ty),
                 )
                 .syntax()
                 .clone()
                 .into(),
-                ast::make::token(SyntaxKind::COMMA).into(),
-                ast::make::tokens::single_newline().into(),
+                make::token(SyntaxKind::COMMA).into(),
+                make::tokens::single_newline().into(),
             ]);
         }
         editor.insert_all(Position::before(close), elements);
@@ -295,16 +299,16 @@ impl ListHost for ast::Enum {
         let list = self.variant_list().ok_or("enum has no variant list")?;
         for item in items {
             let fields = (!item.tuple_fields.is_empty()).then(|| {
-                ast::make::tuple_field_list(
+                make::tuple_field_list(
                     item.tuple_fields
                         .iter()
-                        .map(|ty| ast::make::tuple_field(None, ast::make::ty(ty))),
+                        .map(|ty| make::tuple_field(None, make::ty(ty))),
                 )
                 .into()
             });
             list.add_variant(
                 editor,
-                &ast::make::variant(None, ast::make::name(item.name), fields, None),
+                &make::variant(None, make::name(item.name), fields, None),
             );
         }
         Ok(())
@@ -326,11 +330,11 @@ impl ListHost for ast::Fn {
         let mut elements = Vec::new();
         for item in items {
             elements.extend([
-                ast::make::token(SyntaxKind::COMMA).into(),
-                ast::make::tokens::single_space().into(),
-                ast::make::param(
-                    ast::make::ident_pat(false, false, ast::make::name(item.name)).into(),
-                    ast::make::ty(item.ty),
+                make::token(SyntaxKind::COMMA).into(),
+                make::tokens::single_space().into(),
+                make::param(
+                    make::ident_pat(false, false, make::name(item.name)).into(),
+                    make::ty(item.ty),
                 )
                 .syntax()
                 .clone()
@@ -386,8 +390,8 @@ pub fn append_record_fields(
         let fields = fields
             .iter()
             .map(|field| {
-                Ok(ast::make::record_expr_field(
-                    ast::make::name_ref(field.name),
+                Ok(make::record_expr_field(
+                    make::name_ref(field.name),
                     field.value.map(expr_node).transpose()?,
                 ))
             })
@@ -459,9 +463,9 @@ pub fn add_rest_pattern(
         editor.insert_all(
             Position::after(last.syntax()),
             vec![
-                ast::make::token(SyntaxKind::COMMA).into(),
-                ast::make::tokens::single_space().into(),
-                ast::make::rest_pat().syntax().clone().into(),
+                make::token(SyntaxKind::COMMA).into(),
+                make::tokens::single_space().into(),
+                make::rest_pat().syntax().clone().into(),
             ],
         );
         return commit(source, editor);
@@ -494,10 +498,7 @@ pub fn rename_path_root(
         if path.qualifier().is_some() {
             continue;
         }
-        editor.replace(
-            name.syntax(),
-            ast::make::name_ref(replacement).syntax().clone(),
-        );
+        editor.replace(name.syntax(), make::name_ref(replacement).syntax().clone());
         count += 1;
     }
     if count > 0 {
@@ -511,10 +512,10 @@ pub fn add_use(
     visibility: Option<&str>,
     path: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let item = ast::make::use_(
+    let item = make::use_(
         std::iter::empty(),
         visibility.map(visibility_node).transpose()?,
-        ast::make::use_tree(ast::make::path_from_text(path), None, None, false),
+        make::use_tree(make::path_from_text(path), None, None, false),
     );
     let statement = item.to_string();
     if source.contains(&statement) {
@@ -534,7 +535,7 @@ pub fn add_use(
         Position::before(&anchor),
         vec![
             item.syntax().clone().into(),
-            ast::make::tokens::single_newline().into(),
+            make::tokens::single_newline().into(),
         ],
     );
     commit(source, editor)
@@ -566,8 +567,7 @@ pub fn retarget_use(source: &mut String, name: &str, path: &str) -> Result<(), B
                 commit(source, editor)?;
                 add_use(source, None, path)
             } else {
-                let replacement =
-                    ast::make::use_tree(ast::make::path_from_text(path), None, None, false);
+                let replacement = make::use_tree(make::path_from_text(path), None, None, false);
                 editor.replace(tree.syntax(), replacement.syntax().clone());
                 commit(source, editor)
             }
@@ -706,12 +706,12 @@ pub fn extract(
 ) -> Result<(), Box<dyn Error>> {
     let (editor, root) = open(source)?;
     let function_node: ast::Fn = named(&root, function)?;
-    let function_level = ast::edit::IndentLevel::from_node(function_node.syntax());
+    let function_level = IndentLevel::from_node(function_node.syntax());
     let selection = select(&function_node)?;
-    let call = ast::make::expr_method_call(
-        ast::make::ext::expr_self(),
-        ast::make::name_ref(method.name),
-        ast::make::arg_list(
+    let call = make::expr_method_call(
+        make::ext::expr_self(),
+        make::name_ref(method.name),
+        make::arg_list(
             method
                 .args
                 .iter()
@@ -722,10 +722,7 @@ pub fn extract(
     let mut body = match selection.kind {
         SelectionKind::Statement { statement } => {
             let region = vec![SyntaxElement::from(statement.clone())];
-            editor.replace(
-                &statement,
-                ast::make::expr_stmt(call.into()).syntax().clone(),
-            );
+            editor.replace(&statement, make::expr_stmt(call.into()).syntax().clone());
             region
         }
         SelectionKind::LoopBody { list } => {
@@ -743,9 +740,9 @@ pub fn extract(
                 &editor,
                 inner.clone(),
                 vec![
-                    ast::make::tokens::whitespace(&format!("\n{call_indent}")).into(),
-                    ast::make::expr_stmt(call.into()).syntax().clone().into(),
-                    ast::make::tokens::whitespace(&format!("\n{close_indent}")).into(),
+                    make::tokens::whitespace(&format!("\n{call_indent}")).into(),
+                    make::expr_stmt(call.into()).syntax().clone().into(),
+                    make::tokens::whitespace(&format!("\n{close_indent}")).into(),
                 ],
             )?;
             inner
@@ -815,9 +812,9 @@ pub fn extract(
                 &editor,
                 range.clone(),
                 vec![
-                    ast::make::tokens::whitespace(&format!("\n{call_indent}")).into(),
-                    ast::make::expr_stmt(call.into()).syntax().clone().into(),
-                    ast::make::tokens::whitespace(&format!("\n{function_level}")).into(),
+                    make::tokens::whitespace(&format!("\n{call_indent}")).into(),
+                    make::expr_stmt(call.into()).syntax().clone().into(),
+                    make::tokens::whitespace(&format!("\n{function_level}")).into(),
                 ],
             )?;
             range
@@ -836,36 +833,34 @@ pub fn extract(
         body.pop();
     }
     let first = body.first().ok_or("extracted selection is empty")?;
-    let body_level = ast::edit::IndentLevel::from_element(first);
+    let body_level = IndentLevel::from_element(first);
 
     let receiver = method
         .receiver
         .map(|receiver| match receiver {
-            "&self" => Ok(ast::make::self_param()),
-            "&mut self" => Ok(ast::make::mut_self_param()),
+            "&self" => Ok(make::self_param()),
+            "&mut self" => Ok(make::mut_self_param()),
             _ => Err(format!("unsupported receiver `{receiver}`")),
         })
         .transpose()?;
-    let params = ast::make::param_list(
+    let params = make::param_list(
         receiver,
         method.params.iter().map(|param| {
-            ast::make::param(
-                ast::make::ident_pat(false, false, ast::make::name(param.name)).into(),
-                ast::make::ty(param.ty),
+            make::param(
+                make::ident_pat(false, false, make::name(param.name)).into(),
+                make::ty(param.ty),
             )
         }),
     );
-    let method_node = ast::make::fn_(
+    let method_node = make::fn_(
         std::iter::empty(),
         None,
-        ast::make::name(method.name),
+        make::name(method.name),
         None,
         None,
         params,
-        ast::make::block_expr(std::iter::empty(), None),
-        method
-            .return_ty
-            .map(|ty| ast::make::ret_type(ast::make::ty(ty))),
+        make::block_expr(std::iter::empty(), None),
+        method.return_ty.map(|ty| make::ret_type(make::ty(ty))),
         false,
         false,
         false,
@@ -888,27 +883,24 @@ pub fn extract(
         }
     }
     let mut content = Vec::with_capacity(body.len() + 2);
-    content.push(ast::make::tokens::whitespace(&format!("\n{body_level}")).into());
+    content.push(make::tokens::whitespace(&format!("\n{body_level}")).into());
     content.extend(body);
-    content.push(
-        ast::make::tokens::whitespace(&format!("\n{}", ast::edit::IndentLevel(body_level.0 - 1)))
-            .into(),
-    );
+    content.push(make::tokens::whitespace(&format!("\n{}", IndentLevel(body_level.0 - 1))).into());
     body_editor.insert_all(Position::after(open_brace), content);
     let method_node = ast::Fn::cast(body_editor.finish().new_root().clone())
         .ok_or("extracted method is not a function")?;
     let target_level = function_level + 1;
     let method_node = if target_level.0 > body_level.0 {
-        method_node.indent(ast::edit::IndentLevel(target_level.0 - body_level.0))
+        method_node.indent(IndentLevel(target_level.0 - body_level.0))
     } else if body_level.0 > target_level.0 {
-        method_node.dedent(ast::edit::IndentLevel(body_level.0 - target_level.0))
+        method_node.dedent(IndentLevel(body_level.0 - target_level.0))
     } else {
         method_node
     };
     editor.insert_all(
         Position::after(function_node.syntax()),
         vec![
-            ast::make::tokens::whitespace(&format!("\n\n{function_level}")).into(),
+            make::tokens::whitespace(&format!("\n\n{function_level}")).into(),
             method_node.syntax().clone().into(),
         ],
     );
@@ -942,14 +934,14 @@ pub fn redirect_call(
     let name = call
         .name_ref()
         .ok_or_else(|| format!("`{from}` call has no method name"))?;
-    editor.replace(name.syntax(), ast::make::name_ref(to).syntax().clone());
+    editor.replace(name.syntax(), make::name_ref(to).syntax().clone());
     commit(source, editor)
 }
 
 fn visibility_node(visibility: &str) -> Result<ast::Visibility, Box<dyn Error>> {
     match visibility {
-        "pub" => Ok(ast::make::visibility_pub()),
-        "pub(crate)" => Ok(ast::make::visibility_pub_crate()),
+        "pub" => Ok(make::visibility_pub()),
+        "pub(crate)" => Ok(make::visibility_pub_crate()),
         _ => Err(format!("unsupported visibility `{visibility}`").into()),
     }
 }
