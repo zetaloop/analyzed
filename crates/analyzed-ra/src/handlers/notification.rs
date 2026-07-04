@@ -21,6 +21,7 @@ pub(crate) fn handle_did_save_text_document(
         let snap = state.snapshot();
         let file_id = try_default!(snap.vfs_path_to_file_id(&vfs_path)?);
         let sr = snap.analysis.source_root_id(file_id)?;
+        drop(snap);
 
         if state.config.script_rebuild_on_save(Some(sr)) && state.build_deps_changed {
             state.build_deps_changed = false;
