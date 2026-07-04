@@ -75,7 +75,7 @@ pub fn run_shared_rust_analyzer_lsp_session(
     connection: lsp_server::Connection,
     provider: SharedAnalyzerProvider,
 ) -> anyhow::Result<()> {
-    crate::main_loop::analyzed_session::run_shared_lsp_session(connection, provider)
+    crate::main_loop::session::run_shared_lsp_session(connection, provider)
 }
 
 pub fn run_shared_rust_analyzer_lsp_session_with_config(
@@ -87,7 +87,7 @@ pub fn run_shared_rust_analyzer_lsp_session_with_config(
         registry.register(key, config, reload_path)
     });
 
-    crate::main_loop::analyzed_session::run_shared_lsp_session_with_config(
+    crate::main_loop::session::run_shared_lsp_session_with_config(
         config,
         connection,
         provider,

@@ -48,7 +48,7 @@ impl GlobalState {
         let reload_path = path.clone();
 
         let provider = self.provider.clone();
-        let shared_context = crate::analyzed_bridge::shared_analyzer_context_from_config(&self.config);
+        let shared_context = crate::shared_analyzer::shared_analyzer_context_from_config(&self.config);
         let current_shared = self.shared.clone();
         self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {
             if sender.send(Task::FetchWorkspace(ProjectWorkspaceProgress::Begin)).is_err() {

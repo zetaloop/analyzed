@@ -29,8 +29,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     patch_flycheck_to_proto_source(&generated_src.join("diagnostics/flycheck_to_proto.rs"))?;
     patch_notification_source(&generated_src.join("handlers/notification.rs"))?;
     patch_test_tool_attributes(&generated_src)?;
-    write_analyzed_root_module(
-        &generated_src.join("analyzed_root.rs"),
+    write_root_module(
+        &generated_src.join("root.rs"),
         &generated_src.join("lib.rs"),
     )?;
     let slow_tests = generated.join("tests/slow-tests");
@@ -172,12 +172,12 @@ fn release_version(body: &str) -> Option<&str> {
     }
 }
 
-fn write_analyzed_root_module(root_rs: &Path, lib_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let analyzed_bridge = owned_source_path("analyzed_bridge.rs");
-    let analyzed_global_state = owned_source_path("global_state.rs");
-    let analyzed_main_loop = owned_source_path("main_loop.rs");
-    let analyzed_reload = owned_source_path("reload.rs");
-    let analyzed_notification = owned_source_path("handlers/notification.rs");
+fn write_root_module(root_rs: &Path, lib_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let shared_analyzer = owned_source_path("shared_analyzer.rs");
+    let shared_global_state = owned_source_path("global_state.rs");
+    let shared_main_loop = owned_source_path("main_loop.rs");
+    let shared_reload = owned_source_path("reload.rs");
+    let shared_notification = owned_source_path("handlers/notification.rs");
     let mut upstream_root = fs::read_to_string(lib_rs)?;
     let handlers_start = "mod handlers {\n";
     let insert_at = upstream_root
@@ -187,27 +187,27 @@ fn write_analyzed_root_module(root_rs: &Path, lib_rs: &Path) -> Result<(), Box<d
     upstream_root.insert_str(
         insert_at,
         &format!(
-            "    #[path = {:?}]\n    pub(crate) mod analyzed_notification;\n",
-            analyzed_notification.to_string_lossy().into_owned()
+            "    #[path = {:?}]\n    pub(crate) mod shared_notification;\n",
+            shared_notification.to_string_lossy().into_owned()
         ),
     );
     let source = format!(
         r#"
 #[path = {:?}]
-pub mod analyzed_bridge;
+pub mod shared_analyzer;
 
 #[path = {:?}]
-pub(crate) mod analyzed_global_state;
+pub(crate) mod shared_global_state;
 
 #[path = {:?}]
-pub(crate) mod analyzed_main_loop;
+pub(crate) mod shared_main_loop;
 
 #[path = {:?}]
-pub(crate) mod analyzed_reload;
+pub(crate) mod shared_reload;
 
 {upstream_root}
 
-pub use analyzed_bridge::{{
+pub use shared_analyzer::{{
     RUST_ANALYZER_COMMIT_HASH, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_RELEASE_VERSION,
     RUST_ANALYZER_VERSION,
     PackageInstance, PackageInstanceKey, RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary,
@@ -222,17 +222,17 @@ pub use analyzed_bridge::{{
     rust_analyzer_private_boundary, shared_analyzer_registry,
 }};
 "#,
-        analyzed_bridge.to_string_lossy().into_owned(),
-        analyzed_global_state.to_string_lossy().into_owned(),
-        analyzed_main_loop.to_string_lossy().into_owned(),
-        analyzed_reload.to_string_lossy().into_owned()
+        shared_analyzer.to_string_lossy().into_owned(),
+        shared_global_state.to_string_lossy().into_owned(),
+        shared_main_loop.to_string_lossy().into_owned(),
+        shared_reload.to_string_lossy().into_owned()
     );
     fs::write(root_rs, source)?;
-    println!("cargo:rerun-if-changed={}", analyzed_bridge.display());
-    println!("cargo:rerun-if-changed={}", analyzed_global_state.display());
-    println!("cargo:rerun-if-changed={}", analyzed_main_loop.display());
-    println!("cargo:rerun-if-changed={}", analyzed_reload.display());
-    println!("cargo:rerun-if-changed={}", analyzed_notification.display());
+    println!("cargo:rerun-if-changed={}", shared_analyzer.display());
+    println!("cargo:rerun-if-changed={}", shared_global_state.display());
+    println!("cargo:rerun-if-changed={}", shared_main_loop.display());
+    println!("cargo:rerun-if-changed={}", shared_reload.display());
+    println!("cargo:rerun-if-changed={}", shared_notification.display());
 
     Ok(())
 }
@@ -286,7 +286,7 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         &[build_support::Field {
             vis: Some("pub(crate)"),
             name: "shared",
-            ty: "crate::analyzed_bridge::SharedAnalyzerRuntime",
+            ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
         }],
     )?;
     build_support::add_attr::<ast::Struct>(
@@ -301,12 +301,12 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
             build_support::Field {
                 vis: Some("pub(crate)"),
                 name: "provider",
-                ty: "crate::analyzed_bridge::SharedAnalyzerProvider",
+                ty: "crate::shared_analyzer::SharedAnalyzerProvider",
             },
             build_support::Field {
                 vis: Some("pub(crate)"),
                 name: "shared",
-                ty: "crate::analyzed_bridge::SharedAnalyzerRuntime",
+                ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
             },
         ],
     )?;
@@ -316,7 +316,7 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         &[build_support::Field {
             vis: Some("pub(crate)"),
             name: "shared",
-            ty: "crate::analyzed_bridge::SharedAnalyzerRuntime",
+            ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
         }],
     )?;
     build_support::set_visibility::<ast::RecordField>(
@@ -337,11 +337,11 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         &[
             build_support::Param {
                 name: "provider",
-                ty: "crate::analyzed_bridge::SharedAnalyzerProvider",
+                ty: "crate::shared_analyzer::SharedAnalyzerProvider",
             },
             build_support::Param {
                 name: "shared",
-                ty: "crate::analyzed_bridge::SharedAnalyzerRuntime",
+                ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
             },
             build_support::Param {
                 name: "workspaces",
@@ -452,7 +452,7 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::add_use(
         &mut source,
         Some("pub"),
-        "crate::analyzed_main_loop::main_loop",
+        "crate::shared_main_loop::main_loop",
     )?;
 
     build_support::rename::<ast::Fn>(&mut source, "main_loop", "_main_loop")?;
@@ -669,12 +669,12 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
         }],
     )?;
     build_support::rename_path_root(&mut source, "_handle_task", "Task", "UpstreamTask")?;
-    build_support::add_use(&mut source, None, "self::analyzed_session::UpstreamTask")?;
+    build_support::add_use(&mut source, None, "self::session::UpstreamTask")?;
 
-    let analyzed_session = owned_source_path("analyzed_session.rs");
+    let session = owned_source_path("session.rs");
     source.push_str(&format!(
-        "\n#[path = {:?}]\npub(crate) mod analyzed_session;\n",
-        analyzed_session.to_string_lossy().into_owned()
+        "\n#[path = {:?}]\npub(crate) mod session;\n",
+        session.to_string_lossy().into_owned()
     ));
 
     fs::write(main_loop_rs, source)?;
@@ -715,17 +715,13 @@ fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box
 
     build_support::rename::<ast::Fn>(&mut source, "location", "_location")?;
     build_support::add_attr::<ast::Fn>(&mut source, "_location", "#[allow(dead_code)]")?;
-    build_support::add_use(
-        &mut source,
-        None,
-        "self::analyzed_flycheck_location::location",
-    )?;
-    let analyzed_location = owned_source_path("diagnostics/flycheck_location.rs");
+    build_support::add_use(&mut source, None, "self::flycheck_location::location")?;
+    let flycheck_location = owned_source_path("diagnostics/flycheck_location.rs");
     source.push_str(&format!(
-        "\n#[path = {:?}]\nmod analyzed_flycheck_location;\n",
-        analyzed_location.to_string_lossy().into_owned()
+        "\n#[path = {:?}]\nmod flycheck_location;\n",
+        flycheck_location.to_string_lossy().into_owned()
     ));
-    println!("cargo:rerun-if-changed={}", analyzed_location.display());
+    println!("cargo:rerun-if-changed={}", flycheck_location.display());
     fs::write(flycheck_to_proto_rs, source)?;
     Ok(())
 }
@@ -738,7 +734,7 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
     build_support::add_use(
         &mut source,
         Some("pub(crate)"),
-        "crate::handlers::analyzed_notification::run_flycheck",
+        "crate::handlers::shared_notification::run_flycheck",
     )?;
     build_support::rename::<ast::Fn>(
         &mut source,
@@ -753,7 +749,7 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
     build_support::add_use(
         &mut source,
         Some("pub(crate)"),
-        "crate::handlers::analyzed_notification::handle_did_save_text_document",
+        "crate::handlers::shared_notification::handle_did_save_text_document",
     )?;
 
     fs::write(notification_rs, source)?;
@@ -795,21 +791,21 @@ fn patch_slow_tests_imports(path: &Path) -> Result<(), Box<dyn Error>> {
         .replace("<rust_analyzer::", "<ra_ap_rust_analyzer::")
         .replace(
             "use test_utils::skip_slow_tests;\n",
-            "use crate::analyzed_slow_tests::skip_slow_tests;\n",
+            "use crate::test_support::skip_slow_tests;\n",
         )
         .replace(
             r#".replace("C:\\", "/c:/").replace('\\', "/")"#,
             ".uri_path()",
         );
     if source.contains(".uri_path()") {
-        build_support::add_use(&mut source, None, "crate::analyzed_slow_tests::UriPath")?;
+        build_support::add_use(&mut source, None, "crate::test_support::UriPath")?;
     }
     fs::write(path, source)?;
     Ok(())
 }
 
 fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<PathBuf, Box<dyn Error>> {
-    let analyzed_slow_tests = owned_source_path("slow_tests.rs");
+    let test_support = owned_source_path("slow_tests.rs");
     let main_rs = slow_tests.join("main.rs");
     let mut body = String::new();
     for line in fs::read_to_string(&main_rs)?.lines() {
@@ -831,14 +827,14 @@ fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<PathBuf, Box<dyn Error>
         body.push('\n');
     }
 
-    let body_rs = slow_tests.join("analyzed-slow-tests-main.rs");
+    let body_rs = slow_tests.join("test-support-main.rs");
     fs::write(&body_rs, body)?;
-    let wrapper_rs = slow_tests.join("analyzed-slow-tests.rs");
+    let wrapper_rs = slow_tests.join("test-support.rs");
     fs::write(
         &wrapper_rs,
         format!(
-            "#[path = {:?}]\nmod analyzed_slow_tests;\n#[path = {:?}]\nmod cli;\n#[path = {:?}]\nmod flycheck;\n#[path = {:?}]\nmod ratoml;\n#[path = {:?}]\nmod support;\n#[path = {:?}]\nmod testdir;\ninclude!({:?});\n",
-            analyzed_slow_tests.to_string_lossy().into_owned(),
+            "#[path = {:?}]\nmod test_support;\n#[path = {:?}]\nmod cli;\n#[path = {:?}]\nmod flycheck;\n#[path = {:?}]\nmod ratoml;\n#[path = {:?}]\nmod support;\n#[path = {:?}]\nmod testdir;\ninclude!({:?});\n",
+            test_support.to_string_lossy().into_owned(),
             slow_tests.join("cli.rs").to_string_lossy().into_owned(),
             slow_tests
                 .join("flycheck.rs")
@@ -850,6 +846,6 @@ fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<PathBuf, Box<dyn Error>
             body_rs.to_string_lossy().into_owned(),
         ),
     )?;
-    println!("cargo:rerun-if-changed={}", analyzed_slow_tests.display());
+    println!("cargo:rerun-if-changed={}", test_support.display());
     Ok(wrapper_rs)
 }

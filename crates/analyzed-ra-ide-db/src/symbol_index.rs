@@ -13,7 +13,7 @@ pub fn world_symbols(db: &RootDatabase, mut query: Query) -> Vec<hir::symbols::F
         vec![SymbolIndex::extern_prelude_symbols(db)]
     } else if !query.path_filter.is_empty() {
         query.only_types = false;
-        let modules = crate::analyzed::resolve_path_to_modules(
+        let modules = crate::visibility::resolve_path_to_modules(
             db,
             &query.path_filter,
             query.anchor_to_crate,
@@ -31,7 +31,7 @@ pub fn world_symbols(db: &RootDatabase, mut query: Query) -> Vec<hir::symbols::F
 
     let mut symbols = Vec::new();
     query.search::<()>(db, &indices, |symbol| {
-        if crate::analyzed::is_symbol_visible(db, symbol) {
+        if crate::visibility::is_symbol_visible(db, symbol) {
             symbols.push(symbol.clone());
         }
         ControlFlow::Continue(())

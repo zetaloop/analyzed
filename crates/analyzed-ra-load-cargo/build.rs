@@ -13,27 +13,27 @@ const GENERATED_DIR: &str = "ra_ap_load_cargo_bridge";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (generated, _) = build_support::prepare_bridge_package(PACKAGE, GENERATED_DIR)?;
-    patch_analyzed_workspace_load_source(&generated.join("src/lib.rs"))?;
+    patch_load_cargo_source(&generated.join("src/lib.rs"))?;
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())
 }
 
-fn patch_analyzed_workspace_load_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
+fn patch_load_cargo_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(lib_rs)?;
 
     build_support::add_use(&mut source, None, "ide_db::base_db::CrateBuilderId")?;
     build_support::add_use(&mut source, None, "ide_db::base_db::ProcMacroPaths")?;
     build_support::add_use(&mut source, None, "vfs::file_set::FileSet")?;
 
-    let analyzed = owned_source_path("analyzed.rs");
+    let workspace_load = owned_source_path("workspace_load.rs");
     source.insert_str(
         0,
         &format!(
-            "#[path = {:?}]\nmod analyzed;\npub use analyzed::{{\n    ProcMacroLoad, WorkspaceLoad, load_workspace_change,\n}};\nuse analyzed::load_crate_graph_into_db;\n\n",
-            analyzed.to_string_lossy().into_owned()
+            "#[path = {:?}]\nmod workspace_load;\npub use workspace_load::{{\n    ProcMacroLoad, WorkspaceLoad, load_workspace_change,\n}};\nuse workspace_load::load_crate_graph_into_db;\n\n",
+            workspace_load.to_string_lossy().into_owned()
         ),
     );
-    println!("cargo:rerun-if-changed={}", analyzed.display());
+    println!("cargo:rerun-if-changed={}", workspace_load.display());
 
     build_support::rename::<ast::Fn>(
         &mut source,

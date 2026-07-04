@@ -15,7 +15,7 @@ use triomphe::Arc;
 use vfs::{AbsPathBuf, ChangeKind, VfsPath};
 
 use crate::{
-    analyzed_bridge::{SharedAnalyzerProvider, SharedAnalyzerRuntime, patch_path_prefix},
+    shared_analyzer::{SharedAnalyzerProvider, SharedAnalyzerRuntime, patch_path_prefix},
     config::{Config, ConfigChange, ConfigErrors},
     from_json, server_capabilities,
     global_state::FetchWorkspaceRequest,
@@ -85,7 +85,7 @@ pub(crate) fn run_shared_lsp_session_with_config(
 
     initialize_rayon();
     let (key, shared_config) =
-        crate::analyzed_bridge::shared_analyzer_context_from_config(&config)?;
+        crate::shared_analyzer::shared_analyzer_context_from_config(&config)?;
     let session = provider.resolve(key, shared_config)?;
     let shared = session.runtime();
     let workspaces = Vec::new();
@@ -192,7 +192,7 @@ impl crate::global_state::GlobalState {
                 {
                     modified_ratoml_files.push((
                         file_kind,
-                        crate::analyzed_bridge::normalize_vfs_path(&vfs_path),
+                        crate::shared_analyzer::normalize_vfs_path(&vfs_path),
                         text.clone(),
                     ));
                 }
@@ -280,7 +280,7 @@ impl crate::global_state::GlobalState {
                     let doc = self.mem_docs.get(path)?;
                     let text = std::str::from_utf8(&doc.data).ok()?.to_owned();
                     let (source_root_id, is_library) = shared.source_root_for_path(path)?;
-                    let path = crate::analyzed_bridge::normalize_vfs_path(path);
+                    let path = crate::shared_analyzer::normalize_vfs_path(path);
                     Some((path, source_root_id, is_library, text))
                 }));
                 files
@@ -402,21 +402,21 @@ impl crate::global_state::GlobalState {
                     path.push("rust-analyzer.toml");
                     path
                 });
-                crate::analyzed_bridge::path_key(&path)
+                crate::shared_analyzer::path_key(&path)
             })
             .collect::<BTreeSet<_>>();
         let mut change = ConfigChange::default();
         let mut ratoml_files = shared_ratoml_files
             .into_iter()
             .map(|(path, source_root_id, is_library, text)| {
-                let path = crate::analyzed_bridge::normalize_vfs_path(&path);
+                let path = crate::shared_analyzer::normalize_vfs_path(&path);
                 (path, source_root_id, is_library, Some(Arc::<str>::from(text)))
             })
             .collect::<Vec<_>>();
         let mut user_config_changed = false;
 
         for (_kind, vfs_path, text) in modified_ratoml_files {
-            let vfs_path = crate::analyzed_bridge::normalize_vfs_path(&vfs_path);
+            let vfs_path = crate::shared_analyzer::normalize_vfs_path(&vfs_path);
             let text = text.map(Arc::<str>::from);
             if vfs_path.as_path() == user_config_abs_path {
                 change.change_user_config(text.clone());
@@ -438,7 +438,7 @@ impl crate::global_state::GlobalState {
         }
 
         for (vfs_path, source_root_id, is_library, text) in ratoml_files {
-            let key = crate::analyzed_bridge::path_key(&vfs_path);
+            let key = crate::shared_analyzer::path_key(&vfs_path);
             let is_workspace_ratoml = workspace_ratoml_paths.contains(&key);
             if is_library {
                 continue;
@@ -451,8 +451,8 @@ impl crate::global_state::GlobalState {
             };
 
             if let Some((kind, old_path, old_text)) = entry
-                && crate::analyzed_bridge::path_key(&old_path)
-                    < crate::analyzed_bridge::path_key(&vfs_path)
+                && crate::shared_analyzer::path_key(&old_path)
+                    < crate::shared_analyzer::path_key(&vfs_path)
             {
                 match kind {
                     crate::config::RatomlFileKind::Crate => {
@@ -540,7 +540,7 @@ impl crate::global_state::GlobalState {
     }
 
     pub(crate) fn mark_prime_caches_gc(&mut self) {
-        crate::analyzed_bridge::shared_analyzer_registry().request_gc();
+        crate::shared_analyzer::shared_analyzer_registry().request_gc();
     }
 
     pub(crate) fn mark_gc_when_idle(&mut self) {}

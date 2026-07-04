@@ -5,5 +5,5 @@
 
 include!(concat!(
     env!("OUT_DIR"),
-    "/ra_ap_rust_analyzer_bridge/src/analyzed_root.rs"
+    "/ra_ap_rust_analyzer_bridge/src/root.rs"
 ));

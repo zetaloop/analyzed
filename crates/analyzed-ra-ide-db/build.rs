@@ -23,9 +23,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(lib_rs)?;
 
-    let analyzed = owned_source_path("analyzed.rs");
-    build_support::mount_module(&mut source, None, "analyzed", &analyzed);
-    println!("cargo:rerun-if-changed={}", analyzed.display());
+    let visibility = owned_source_path("visibility.rs");
+    build_support::mount_module(&mut source, None, "visibility", &visibility);
+    println!("cargo:rerun-if-changed={}", visibility.display());
     build_support::append::<ast::Struct>(
         &mut source,
         "RootDatabase",
@@ -60,13 +60,13 @@ fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 fn patch_search_source(search_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(search_rs)?;
 
-    build_support::retarget_use(&mut source, "all_crates", "crate::analyzed::all_crates")?;
-    let analyzed_search_scope = owned_source_path("search_scope.rs");
+    build_support::retarget_use(&mut source, "all_crates", "crate::visibility::all_crates")?;
+    let search_scope = owned_source_path("search_scope.rs");
     source.push_str(&format!(
-        "\n#[path = {:?}]\nmod analyzed_search_scope;\n",
-        analyzed_search_scope.to_string_lossy().into_owned()
+        "\n#[path = {:?}]\nmod search_scope;\n",
+        search_scope.to_string_lossy().into_owned()
     ));
-    println!("cargo:rerun-if-changed={}", analyzed_search_scope.display());
+    println!("cargo:rerun-if-changed={}", search_scope.display());
     build_support::rename::<ast::Fn>(&mut source, "reverse_dependencies", "_reverse_dependencies")?;
     build_support::add_attr::<ast::Fn>(
         &mut source,
@@ -81,12 +81,12 @@ fn patch_search_source(search_rs: &Path) -> Result<(), Box<dyn Error>> {
 fn patch_symbol_index_source(symbol_index_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(symbol_index_rs)?;
 
-    let analyzed_symbol_index = owned_source_path("symbol_index.rs");
+    let world_symbols = owned_source_path("symbol_index.rs");
     source.push_str(&format!(
-        "\n#[path = {:?}]\nmod analyzed_symbol_index;\npub use analyzed_symbol_index::world_symbols;\n",
-        analyzed_symbol_index.to_string_lossy().into_owned()
+        "\n#[path = {:?}]\nmod world_symbols;\npub use world_symbols::world_symbols;\n",
+        world_symbols.to_string_lossy().into_owned()
     ));
-    println!("cargo:rerun-if-changed={}", analyzed_symbol_index.display());
+    println!("cargo:rerun-if-changed={}", world_symbols.display());
     build_support::rename::<ast::Fn>(&mut source, "world_symbols", "_world_symbols")?;
     build_support::add_attr::<ast::Fn>(&mut source, "_world_symbols", "#[allow(dead_code)]")?;
     build_support::rename::<ast::Fn>(
@@ -102,7 +102,7 @@ fn patch_symbol_index_source(symbol_index_rs: &Path) -> Result<(), Box<dyn Error
     build_support::add_use(
         &mut source,
         None,
-        "crate::analyzed::resolve_path_to_modules",
+        "crate::visibility::resolve_path_to_modules",
     )?;
 
     fs::write(symbol_index_rs, source)?;

@@ -23,16 +23,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn patch_ide_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(lib_rs)?;
 
-    let analyzed = owned_source_path("analyzed.rs");
-    build_support::mount_module(&mut source, None, "analyzed", &analyzed);
-    println!("cargo:rerun-if-changed={}", analyzed.display());
+    let visibility = owned_source_path("visibility.rs");
+    build_support::mount_module(&mut source, None, "visibility", &visibility);
+    println!("cargo:rerun-if-changed={}", visibility.display());
     build_support::append::<ast::Struct>(
         &mut source,
         "Analysis",
         &[build_support::Field {
             vis: None,
             name: "guard",
-            ty: "Option<crate::analyzed::AnalysisGuard>",
+            ty: "Option<crate::visibility::AnalysisGuard>",
         }],
     )?;
     build_support::append_record_fields(
@@ -61,7 +61,7 @@ fn patch_ide_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 fn patch_view_crate_graph_source(view_crate_graph_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(view_crate_graph_rs)?;
 
-    build_support::retarget_use(&mut source, "all_crates", "crate::analyzed::all_crates")?;
+    build_support::retarget_use(&mut source, "all_crates", "crate::visibility::all_crates")?;
 
     fs::write(view_crate_graph_rs, source)?;
     Ok(())

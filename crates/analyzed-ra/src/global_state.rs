@@ -17,11 +17,11 @@ impl GlobalState {
         sender: crossbeam_channel::Sender<lsp_server::Message>,
         config: crate::config::Config,
     ) -> Self {
-        let registry = crate::analyzed_bridge::shared_analyzer_registry();
-        let provider = crate::analyzed_bridge::SharedAnalyzerProvider::new(
+        let registry = crate::shared_analyzer::shared_analyzer_registry();
+        let provider = crate::shared_analyzer::SharedAnalyzerProvider::new(
             move |key, config, reload_path| registry.register(key, config, reload_path),
         );
-        let (key, shared_config) = crate::analyzed_bridge::shared_analyzer_context_from_config(&config)
+        let (key, shared_config) = crate::shared_analyzer::shared_analyzer_context_from_config(&config)
             .expect("global state config must describe a shared analyzer context");
         let session = provider
             .resolve(key, shared_config)
