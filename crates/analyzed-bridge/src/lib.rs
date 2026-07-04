@@ -9,10 +9,15 @@ use std::{
 use flate2::read::GzDecoder;
 use ra_ap_syntax::{
     AstNode, Edition, SourceFile, SyntaxNode,
-    ast::{self, HasLoopBody, HasName, HasVisibility},
+    ast::{HasLoopBody, HasName, HasVisibility},
 };
 use sha2::{Digest, Sha256};
 use toml::{Table, Value, map::Map};
+
+mod edit;
+
+pub use edit::*;
+pub use ra_ap_syntax::ast;
 
 #[derive(Debug)]
 pub struct LockedPackage {
