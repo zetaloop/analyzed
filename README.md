@@ -1,20 +1,18 @@
 # <img height="80" alt="analyzed logo" src="./analyzed.svg" />
 
-A shared rust-analyzer daemon.
+`analyzed` is a drop-in replacement for [rust-analyzer](https://github.com/rust-lang/rust-analyzer) that runs the analysis in a shared daemon.
 
-`analyzed` runs one analysis process for all your editors and projects. The first connection starts a daemon in the background; later sessions attach to it and share the work where they can.
-
-Every rust-analyzer instance loads its own copy of the standard library, dependency crates, and inferred types. Open the same project in two editors, or two projects on the same toolchain: most of that data is identical. `analyzed` keeps it once: sessions that share a compatible toolchain and configuration share the same analysis.
+Most of what an instance loads (standard library, dependencies, inferred types) is identical across editors and projects on the same toolchain; the daemon keeps one copy. A second editor on an already-indexed workspace doesn't re-index.
 
 ## Installation
 
 ```sh
-cargo install analyzed
-brew install analyzed    # macOS
-scoop install analyzed   # Windows
+brew install analyzed     # macOS
+scoop install analyzed    # Windows
+cargo binstall analyzed
 ```
 
-Or from source:
+Or from a checkout:
 
 ```sh
 cargo install --path crates/analyzed
@@ -22,22 +20,22 @@ cargo install --path crates/analyzed
 
 ## Usage
 
-Point your editor's rust-analyzer binary path at `analyzed`. It talks LSP on stdio, just like `rust-analyzer`.
-
-Managing the daemon:
+Point your editor's rust-analyzer path at `analyzed`. It serves LSP over stdio, same as rust-analyzer. The first connection starts the daemon in the background.
 
 ```sh
 analyzed status              # daemon state, as JSON
-analyzed stop                # shut the daemon down
-analyzed daemon --foreground # run the daemon in the current terminal
+analyzed stop
+analyzed daemon --foreground # run in the current terminal
 ```
+
+## Sharing
+
+Sessions share a backend only when their toolchain and Cargo configuration match; anything else gets its own. Unsaved edits stay private; other sessions see the on-disk version until the buffer is saved. Every session runs the upstream rust-analyzer main loop and behaves like a normal rust-analyzer instance.
 
 ## How it works
 
-The daemon runs the upstream rust-analyzer main loop for every session, so each editor connection behaves like a normal rust-analyzer instance: same configuration, same features, same diagnostics.
-
-`analyzed` is built from the published rust-analyzer crates (`ra_ap_*`) with modifications applied at build time. Each release targets one upstream version and passes its test suites, including the LSP end-to-end tests.
+The build fetches the checksum-verified `ra_ap_*` sources from crates.io and patches them with structural edits; there is no fork. Each release targets one upstream version, reports it, and passes the upstream test suites, including the LSP end-to-end tests.
 
 ## License
 
-MIT. The rust-analyzer code it builds on remains under the upstream MIT/Apache-2.0 dual license.
+MIT OR Apache-2.0, same as rust-analyzer.
