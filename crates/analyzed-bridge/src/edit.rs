@@ -1,8 +1,9 @@
 use std::{error::Error, path::Path};
 
 use ra_ap_syntax::{
-    AstNode, Edition, SourceFile, SyntaxNode, TextRange, TextSize,
+    AstNode, Edition, SourceFile, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
     ast::{self, HasLoopBody, HasName, HasVisibility},
+    syntax_editor::{Position, SyntaxEditor},
 };
 
 pub trait Host: AstNode + HasName {
@@ -29,8 +30,19 @@ impl Host for ast::Variant {
     const KIND: &'static str = "variant";
 }
 
-fn named<N: Host>(source: &str, name: &str) -> Result<N, Box<dyn Error>> {
-    let root = parse(source)?;
+fn open(source: &str) -> Result<(SyntaxEditor, SyntaxNode), Box<dyn Error>> {
+    let file = parse_file(source)?;
+    Ok(SyntaxEditor::new(file.syntax().clone()))
+}
+
+fn commit(source: &mut String, editor: SyntaxEditor) -> Result<(), Box<dyn Error>> {
+    let text = editor.finish().new_root().to_string();
+    parse_file(&text)?;
+    *source = text;
+    Ok(())
+}
+
+fn named<N: Host>(root: &SyntaxNode, name: &str) -> Result<N, Box<dyn Error>> {
     let (scope, name) = match name.split_once("::") {
         Some((parent, child)) => {
             let adt = root
@@ -40,7 +52,7 @@ fn named<N: Host>(source: &str, name: &str) -> Result<N, Box<dyn Error>> {
                 .ok_or_else(|| format!("could not find item `{parent}`"))?;
             (adt.syntax().clone(), child)
         }
-        None => (root, name),
+        None => (root.clone(), name),
     };
     scope
         .descendants()
@@ -138,42 +150,41 @@ pub fn rename<N: Host>(
     name: &str,
     replacement: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let item: N = named(source, name)?;
+    let (editor, root) = open(source)?;
+    let item: N = named(&root, name)?;
     let name = item
         .name()
         .ok_or_else(|| format!("{} has no name", N::KIND))?;
-    replace_text_range(source, name.syntax().text_range(), replacement);
-    Ok(())
+    editor.replace(name.syntax(), name_element(replacement)?);
+    commit(source, editor)
 }
 
 pub trait VisibilityHost: Host + HasVisibility {
-    fn visibility_offset(&self) -> Result<TextSize, Box<dyn Error>>;
+    fn visibility_slot(&self) -> Result<SyntaxElement, Box<dyn Error>>;
 }
 
 impl VisibilityHost for ast::Fn {
-    fn visibility_offset(&self) -> Result<TextSize, Box<dyn Error>> {
-        Ok(self
-            .fn_token()
-            .ok_or("function has no fn token")?
-            .text_range()
-            .start())
+    fn visibility_slot(&self) -> Result<SyntaxElement, Box<dyn Error>> {
+        Ok(self.fn_token().ok_or("function has no fn token")?.into())
     }
 }
 
 impl VisibilityHost for ast::Enum {
-    fn visibility_offset(&self) -> Result<TextSize, Box<dyn Error>> {
-        Ok(self.syntax().text_range().start())
+    fn visibility_slot(&self) -> Result<SyntaxElement, Box<dyn Error>> {
+        self.syntax()
+            .first_child_or_token()
+            .ok_or_else(|| "enum has no content".into())
     }
 }
 
 impl VisibilityHost for ast::RecordField {
-    fn visibility_offset(&self) -> Result<TextSize, Box<dyn Error>> {
+    fn visibility_slot(&self) -> Result<SyntaxElement, Box<dyn Error>> {
         Ok(self
             .name()
             .ok_or("field has no name")?
             .syntax()
-            .text_range()
-            .start())
+            .clone()
+            .into())
     }
 }
 
@@ -182,14 +193,17 @@ pub fn set_visibility<N: VisibilityHost>(
     name: &str,
     visibility: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let item: N = named(source, name)?;
+    let (editor, root) = open(source)?;
+    let item: N = named(&root, name)?;
     if let Some(existing) = item.visibility() {
-        replace_text_range(source, existing.syntax().text_range(), visibility);
+        editor.replace(existing.syntax(), visibility_element(visibility)?);
     } else {
-        let start = text_offset(item.visibility_offset()?);
-        source.insert_str(start, &format!("{visibility} "));
+        editor.insert_all(
+            Position::before(item.visibility_slot()?),
+            vec![visibility_element(visibility)?, whitespace_element(" ")?],
+        );
     }
-    Ok(())
+    commit(source, editor)
 }
 
 pub fn add_attr<N: Host>(
@@ -197,51 +211,78 @@ pub fn add_attr<N: Host>(
     name: &str,
     attribute: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let item: N = named(source, name)?;
-    let start = text_offset(item.syntax().text_range().start());
-    let indent = line_indent(source, start);
-    source.insert_str(start, &format!("{indent}{attribute}\n"));
-    Ok(())
+    let (editor, root) = open(source)?;
+    let item: N = named(&root, name)?;
+    let indent = indent_before(&item.syntax().clone().into());
+    editor.insert_all(
+        Position::first_child_of(item.syntax()),
+        attr_elements(attribute, &indent)?,
+    );
+    commit(source, editor)
 }
 
 pub trait ListHost: Host {
-    fn list_end(&self) -> Result<TextSize, Box<dyn Error>>;
+    fn list_close(&self) -> Result<SyntaxToken, Box<dyn Error>>;
+    fn parse_items(items: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>>;
 }
 
 impl ListHost for ast::Struct {
-    fn list_end(&self) -> Result<TextSize, Box<dyn Error>> {
+    fn list_close(&self) -> Result<SyntaxToken, Box<dyn Error>> {
         let Some(ast::FieldList::RecordFieldList(fields)) = self.field_list() else {
             return Err("struct has no record field list".into());
         };
-        Ok(fields
+        fields
             .r_curly_token()
-            .ok_or("record struct has no closing brace")?
-            .text_range()
-            .start())
+            .ok_or_else(|| "record struct has no closing brace".into())
+    }
+
+    fn parse_items(items: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
+        braced_elements(&format!("struct W {{{items}}}"))
     }
 }
 
 impl ListHost for ast::Enum {
-    fn list_end(&self) -> Result<TextSize, Box<dyn Error>> {
-        Ok(self
-            .variant_list()
+    fn list_close(&self) -> Result<SyntaxToken, Box<dyn Error>> {
+        self.variant_list()
             .ok_or("enum has no variant list")?
             .r_curly_token()
-            .ok_or("enum has no closing brace")?
-            .text_range()
-            .start())
+            .ok_or_else(|| "enum has no closing brace".into())
+    }
+
+    fn parse_items(items: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
+        braced_elements(&format!("enum W {{{items}}}"))
     }
 }
 
 impl ListHost for ast::Fn {
-    fn list_end(&self) -> Result<TextSize, Box<dyn Error>> {
-        Ok(self
-            .param_list()
+    fn list_close(&self) -> Result<SyntaxToken, Box<dyn Error>> {
+        self.param_list()
             .ok_or("function has no parameter list")?
             .r_paren_token()
-            .ok_or("parameter list has no closing paren")?
-            .text_range()
-            .start())
+            .ok_or_else(|| "parameter list has no closing paren".into())
+    }
+
+    fn parse_items(items: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
+        let file = parse_file(&format!("fn w(w0: W0{items}) {{}}"))?;
+        let params = file
+            .syntax()
+            .descendants()
+            .find_map(ast::ParamList::cast)
+            .ok_or("parameter wrapper has no list")?;
+        let seed = params
+            .params()
+            .next()
+            .ok_or("parameter wrapper has no seed")?;
+        let elements = params.syntax().children_with_tokens().collect::<Vec<_>>();
+        let start = elements
+            .iter()
+            .position(|element| element.as_node() == Some(seed.syntax()))
+            .ok_or("seed is not a direct child")?;
+        let end = elements
+            .iter()
+            .position(|element| element.kind() == SyntaxKind::R_PAREN)
+            .ok_or("parameter wrapper has no closing paren")?;
+        Ok(elements[start + 1..end].to_vec())
     }
 }
 
@@ -250,25 +291,23 @@ pub fn append<N: ListHost>(
     name: &str,
     items: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let item: N = named(source, name)?;
-    let start = text_offset(item.list_end()?);
-    source.insert_str(start, items);
-    Ok(())
+    let (editor, root) = open(source)?;
+    let item: N = named(&root, name)?;
+    editor.insert_all(Position::before(item.list_close()?), N::parse_items(items)?);
+    commit(source, editor)
 }
 
-fn record_expr_in(function: &ast::Fn, path_tail: &str) -> impl Iterator<Item = ast::RecordExpr> {
-    let path_tail = path_tail.to_owned();
+fn record_exprs_in(function: &ast::Fn, path_tail: &str) -> Vec<ast::RecordExpr> {
     function
         .syntax()
         .descendants()
         .filter_map(ast::RecordExpr::cast)
-        .filter(move |record| {
+        .filter(|record| {
             record
                 .path()
-                .is_some_and(|path| path.syntax().text().to_string().ends_with(&path_tail))
+                .is_some_and(|path| path.syntax().text().to_string().ends_with(path_tail))
         })
-        .collect::<Vec<_>>()
-        .into_iter()
+        .collect()
 }
 
 pub fn append_record_fields(
@@ -277,17 +316,17 @@ pub fn append_record_fields(
     path_tail: &str,
     fields: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let function: ast::Fn = named(source, function)?;
-    for record in record_expr_in(&function, path_tail) {
+    let (editor, root) = open(source)?;
+    let function: ast::Fn = named(&root, function)?;
+    for record in record_exprs_in(&function, path_tail) {
         let Some(field_list) = record.record_expr_field_list() else {
             continue;
         };
         let token = field_list
             .r_curly_token()
             .ok_or("record expression has no closing brace")?;
-        let start = text_offset(token.text_range().start());
-        source.insert_str(start, fields);
-        return Ok(());
+        editor.insert_all(Position::before(token), record_field_elements(fields)?);
+        return commit(source, editor);
     }
     Err(format!("function has no `{path_tail}` record expression").into())
 }
@@ -299,8 +338,9 @@ pub fn set_record_field(
     field: &str,
     value: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let function: ast::Fn = named(source, function)?;
-    for record in record_expr_in(&function, path_tail) {
+    let (editor, root) = open(source)?;
+    let function: ast::Fn = named(&root, function)?;
+    for record in record_exprs_in(&function, path_tail) {
         let Some(field_list) = record.record_expr_field_list() else {
             continue;
         };
@@ -314,8 +354,8 @@ pub fn set_record_field(
             let Some(expr) = record_field.expr() else {
                 return Err(format!("record field `{field}` has no expression").into());
             };
-            replace_text_range(source, expr.syntax().text_range(), value);
-            return Ok(());
+            editor.replace(expr.syntax(), expr_element(value)?);
+            return commit(source, editor);
         }
     }
     Err(format!("function has no `{path_tail}.{field}` field").into())
@@ -326,11 +366,13 @@ pub fn add_rest_pattern(
     function: &str,
     path_tail: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let function: ast::Fn = named(source, function)?;
-    for node in function.syntax().descendants() {
-        let Some(record) = ast::RecordPat::cast(node) else {
-            continue;
-        };
+    let (editor, root) = open(source)?;
+    let function: ast::Fn = named(&root, function)?;
+    for record in function
+        .syntax()
+        .descendants()
+        .filter_map(ast::RecordPat::cast)
+    {
         let Some(path) = record.path() else {
             continue;
         };
@@ -346,9 +388,8 @@ pub fn add_rest_pattern(
         let token = fields
             .r_curly_token()
             .ok_or("record pattern has no closing brace")?;
-        let start = text_offset(token.text_range().start());
-        source.insert_str(start, ", ..");
-        return Ok(());
+        editor.insert_all(Position::before(token), rest_pattern_elements()?);
+        return commit(source, editor);
     }
     Err(format!("function has no `{path_tail}` record pattern").into())
 }
@@ -356,11 +397,12 @@ pub fn add_rest_pattern(
 pub fn rename_path_root(
     source: &mut String,
     function: &str,
-    root: &str,
+    root_name: &str,
     replacement: &str,
 ) -> Result<usize, Box<dyn Error>> {
-    let function: ast::Fn = named(source, function)?;
-    let mut ranges = Vec::new();
+    let (editor, root) = open(source)?;
+    let function: ast::Fn = named(&root, function)?;
+    let mut count = 0;
     for node in function.syntax().descendants() {
         let Some(segment) = ast::PathSegment::cast(node) else {
             continue;
@@ -368,7 +410,7 @@ pub fn rename_path_root(
         let Some(name) = segment.name_ref() else {
             continue;
         };
-        if name.text() != root {
+        if name.text() != root_name {
             continue;
         }
         let Some(path) = segment.syntax().parent().and_then(ast::Path::cast) else {
@@ -377,11 +419,11 @@ pub fn rename_path_root(
         if path.qualifier().is_some() {
             continue;
         }
-        ranges.push(name.syntax().text_range());
+        editor.replace(name.syntax(), name_ref_element(replacement)?);
+        count += 1;
     }
-    let count = ranges.len();
-    for range in ranges.into_iter().rev() {
-        replace_text_range(source, range, replacement);
+    if count > 0 {
+        commit(source, editor)?;
     }
     Ok(count)
 }
@@ -399,10 +441,17 @@ fn insert_use(source: &mut String, statement: &str) -> Result<(), Box<dyn Error>
         return Err(format!("source already contains `{}`", statement.trim_end()).into());
     }
 
-    let index =
-        first_use_index(source).unwrap_or_else(|| insertion_index_after_inner_attrs(source));
-    source.insert_str(index, statement);
-    Ok(())
+    let (editor, root) = open(source)?;
+    let anchor = root
+        .children()
+        .find(|node| ast::Use::can_cast(node.kind()))
+        .or_else(|| {
+            root.children()
+                .find(|node| ast::Item::can_cast(node.kind()))
+        })
+        .ok_or("source has no items")?;
+    editor.insert_all(Position::before(&anchor), item_elements(statement)?);
+    commit(source, editor)
 }
 
 pub fn retarget_use(
@@ -411,8 +460,8 @@ pub fn retarget_use(
     path: &str,
     alias: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let file = parse(source)?;
-    let matches = file
+    let (editor, root) = open(source)?;
+    let matches = root
         .descendants()
         .filter_map(ast::UseTree::cast)
         .filter_map(|tree| {
@@ -430,22 +479,65 @@ pub fn retarget_use(
                 .find_map(ast::UseTreeList::cast)
                 .is_some()
             {
-                let range = use_tree_removal_range(source, tree)?;
-                source.replace_range(range, "");
-                add_use(source, &format!("{path} as {alias}"))?;
+                for element in use_tree_removal(tree) {
+                    editor.delete(element);
+                }
+                commit(source, editor)?;
+                insert_use(source, &format!("use {path} as {alias};\n"))
             } else {
-                replace_text_range(
-                    source,
-                    tree.syntax().text_range(),
-                    &format!("{path} as {alias}"),
+                editor.replace(
+                    tree.syntax(),
+                    use_tree_element(&format!("{path} as {alias}"))?,
                 );
+                commit(source, editor)
             }
-            parse(source)?;
-            Ok(())
         }
         [] => Err(format!("could not find use tree `{name}`").into()),
         _ => Err(format!("found multiple use trees `{name}`").into()),
     }
+}
+
+fn use_tree_removal(tree: &ast::UseTree) -> Vec<SyntaxElement> {
+    let mut elements = vec![SyntaxElement::from(tree.syntax().clone())];
+
+    let mut after = Vec::new();
+    let mut cursor = tree.syntax().next_sibling_or_token();
+    while let Some(element) = cursor {
+        cursor = element.next_sibling_or_token();
+        match element.kind() {
+            SyntaxKind::WHITESPACE => after.push(element),
+            SyntaxKind::COMMA => {
+                after.push(element);
+                while let Some(trailing) = cursor.clone() {
+                    if trailing.kind() != SyntaxKind::WHITESPACE {
+                        break;
+                    }
+                    cursor = trailing.next_sibling_or_token();
+                    after.push(trailing);
+                }
+                elements.extend(after);
+                return elements;
+            }
+            _ => break,
+        }
+    }
+
+    let mut before = Vec::new();
+    let mut cursor = tree.syntax().prev_sibling_or_token();
+    while let Some(element) = cursor {
+        cursor = element.prev_sibling_or_token();
+        match element.kind() {
+            SyntaxKind::WHITESPACE => before.push(element),
+            SyntaxKind::COMMA => {
+                before.push(element);
+                elements.extend(before);
+                return elements;
+            }
+            _ => break,
+        }
+    }
+
+    elements
 }
 
 pub fn mount_module(source: &mut String, visibility: Option<&str>, name: &str, path: &Path) {
@@ -477,18 +569,9 @@ pub struct Selection {
 }
 
 enum SelectionKind {
-    Statement {
-        range: TextRange,
-    },
-    LoopBody {
-        open_end: TextSize,
-        close_start: TextSize,
-        first_stmt_start: TextSize,
-    },
-    ThroughTail {
-        start: TextSize,
-        end: TextSize,
-    },
+    Statement { statement: SyntaxNode },
+    LoopBody { list: ast::StmtList },
+    ThroughTail { from: SyntaxNode, tail: SyntaxNode },
     ParamsTail,
 }
 
@@ -500,30 +583,18 @@ pub fn stmt(node: &impl AstNode) -> Result<Selection, Box<dyn Error>> {
         .ok_or("node is not part of a statement")?;
     Ok(Selection {
         kind: SelectionKind::Statement {
-            range: statement.syntax().text_range(),
+            statement: statement.syntax().clone(),
         },
     })
 }
 
 pub fn for_body(loop_expr: &ast::ForExpr) -> Result<Selection, Box<dyn Error>> {
-    let body = loop_expr.loop_body().ok_or("for loop has no body")?;
-    let stmt_list = body.stmt_list().ok_or("for loop has no statement list")?;
-    let first_statement = stmt_list
-        .statements()
-        .next()
-        .ok_or("for loop has empty body")?;
-    let opening_brace = stmt_list
-        .l_curly_token()
-        .ok_or("for loop has no opening brace")?;
-    let closing_brace = stmt_list
-        .r_curly_token()
-        .ok_or("for loop has no closing brace")?;
+    let list = loop_expr
+        .loop_body()
+        .and_then(|body| body.stmt_list())
+        .ok_or("for loop has no statement list")?;
     Ok(Selection {
-        kind: SelectionKind::LoopBody {
-            open_end: opening_brace.text_range().end(),
-            close_start: closing_brace.text_range().start(),
-            first_stmt_start: first_statement.syntax().text_range().start(),
-        },
+        kind: SelectionKind::LoopBody { list },
     })
 }
 
@@ -533,13 +604,11 @@ pub fn through_tail(from: &impl AstNode, function: &ast::Fn) -> Result<Selection
         .and_then(|body| body.stmt_list())
         .and_then(|list| list.tail_expr())
         .ok_or("function has no tail expression")?;
-    let start = from.syntax().text_range().start();
-    let end = tail.syntax().text_range().end();
-    if end <= start {
-        return Err("function tail expression precedes the selection".into());
-    }
     Ok(Selection {
-        kind: SelectionKind::ThroughTail { start, end },
+        kind: SelectionKind::ThroughTail {
+            from: from.syntax().clone(),
+            tail: tail.syntax().clone(),
+        },
     })
 }
 
@@ -555,106 +624,116 @@ pub fn extract(
     select: impl FnOnce(&ast::Fn) -> Result<Selection, Box<dyn Error>>,
     method: Method<'_>,
 ) -> Result<(), Box<dyn Error>> {
-    let function_node: ast::Fn = named(source, function)?;
-    let function_end = text_offset(function_node.syntax().text_range().end());
-    let function_indent = line_indent(
-        source,
-        text_offset(function_node.syntax().text_range().start()),
-    )
-    .to_owned();
+    let (editor, root) = open(source)?;
+    let function_node: ast::Fn = named(&root, function)?;
+    let function_indent = indent_before(&function_node.syntax().clone().into());
     let selection = select(&function_node)?;
-    let extraction = match selection.kind {
-        SelectionKind::Statement { range } => {
-            let first_start = text_offset(range.start());
-            let range = line_start_offset(source, first_start)..text_offset(range.end());
-            let call_indent = line_indent(source, first_start).to_owned();
+    let args = method.args.join(", ");
+    let body = match selection.kind {
+        SelectionKind::Statement { statement } => {
+            let call_indent = indent_before(&statement.clone().into());
             let method_body_indent = format!("{function_indent}    ");
-            Extraction {
-                call_indent: call_indent.clone(),
-                close_indent: String::new(),
-                body: normalize_statement_body(
-                    &source[range.clone()],
-                    &call_indent,
-                    &method_body_indent,
-                ),
-                expression: false,
-                range,
-            }
+            let body =
+                normalize_statement_body(&statement.to_string(), &call_indent, &method_body_indent);
+            editor.replace(
+                &statement,
+                statement_element(&format!("self.{}({args});", method.name))?,
+            );
+            body
         }
-        SelectionKind::LoopBody {
-            open_end,
-            close_start,
-            first_stmt_start,
-        } => {
-            let range = text_offset(open_end)..text_offset(close_start);
-            Extraction {
-                call_indent: line_indent(source, text_offset(first_stmt_start)).to_owned(),
-                close_indent: line_indent(source, text_offset(close_start)).to_owned(),
-                body: source[range.clone()].trim_end().to_owned(),
-                expression: false,
-                range,
-            }
+        SelectionKind::LoopBody { list } => {
+            let open_brace = list
+                .l_curly_token()
+                .ok_or("for loop has no opening brace")?;
+            let close_brace = list
+                .r_curly_token()
+                .ok_or("for loop has no closing brace")?;
+            let first_statement = list.statements().next().ok_or("for loop has empty body")?;
+            let inner = elements_between(list.syntax(), &open_brace, &close_brace)?;
+            let body = elements_text(&inner).trim_end().to_owned();
+            let call_indent = indent_before(&first_statement.syntax().clone().into());
+            let close_indent = indent_before(&close_brace.into());
+            let replacement = braced_elements(&format!(
+                "fn w() {{\n{call_indent}self.{}({args});\n{close_indent}}}",
+                method.name,
+            ))?;
+            replace_elements(&editor, inner, replacement)?;
+            body
         }
-        SelectionKind::ThroughTail { start, end } => {
-            let range = text_offset(start)..text_offset(end);
-            let call_indent = line_indent(source, range.start).to_owned();
-            Extraction {
-                body: format!("\n{call_indent}{}", &source[range.clone()]),
-                call_indent,
-                close_indent: String::new(),
-                expression: true,
+        SelectionKind::ThroughTail { from, tail } => {
+            let list = tail
+                .parent()
+                .ok_or_else(|| format!("function `{function}` has no statement list"))?;
+            let start = child_of(&list, &from)?;
+            let call_indent = indent_before(&start.clone().into());
+            let range = element_range(&list, &start.into(), &tail.into())?;
+            let body = format!("\n{call_indent}{}", elements_text(&range));
+            replace_elements(
+                &editor,
                 range,
-            }
+                vec![expr_element(&format!("self.{}({args})", method.name))?],
+            )?;
+            body
         }
         SelectionKind::ParamsTail => {
-            let stmt_list = function_node
+            let list = function_node
                 .body()
                 .and_then(|body| body.stmt_list())
                 .ok_or_else(|| format!("function `{function}` has no statement list"))?;
-            let mut anchor = None;
+            let mut anchor: Option<SyntaxNode> = None;
             for param in method.params {
-                let mut end = None;
-                for statement in stmt_list.statements() {
+                let mut definition = None;
+                for statement in list.statements() {
                     if let ast::Stmt::LetStmt(let_statement) = &statement
                         && pat_is_ident(let_statement.pat(), param.name)
                     {
-                        end = Some(statement.syntax().text_range().end());
+                        definition = Some(statement.syntax().clone());
                     }
                 }
-                let end = end.ok_or_else(|| {
+                let definition = definition.ok_or_else(|| {
                     format!(
                         "function `{function}` does not define parameter `{}`",
                         param.name
                     )
                 })?;
-                if anchor.is_none_or(|current| current < end) {
-                    anchor = Some(end);
+                if anchor.as_ref().is_none_or(|current| {
+                    current.text_range().end() < definition.text_range().end()
+                }) {
+                    anchor = Some(definition);
                 }
             }
             let anchor = anchor.ok_or_else(|| {
                 format!("extracted method for `{function}` declares no parameters")
             })?;
-            let first_extracted_stmt = stmt_list
+            let first_statement = list
                 .statements()
-                .find(|statement| statement.syntax().text_range().start() > anchor)
+                .find(|statement| {
+                    statement.syntax().text_range().start() > anchor.text_range().end()
+                })
                 .ok_or_else(|| {
                     format!("function `{function}` has no statements after its parameters")
                 })?;
-            let closing_brace = stmt_list
+            let close_brace = list
                 .r_curly_token()
                 .ok_or_else(|| format!("function `{function}` has no closing brace"))?;
-            let range = text_offset(anchor)..text_offset(closing_brace.text_range().start());
-            Extraction {
-                call_indent: line_indent(
-                    source,
-                    text_offset(first_extracted_stmt.syntax().text_range().start()),
-                )
-                .to_owned(),
-                close_indent: function_indent.clone(),
-                body: source[range.clone()].trim_end().to_owned(),
-                expression: false,
-                range,
-            }
+            let elements = list.syntax().children_with_tokens().collect::<Vec<_>>();
+            let start = elements
+                .iter()
+                .position(|element| element.as_node() == Some(&anchor))
+                .ok_or("anchor is not a direct child")?;
+            let end = elements
+                .iter()
+                .position(|element| element.as_token() == Some(&close_brace))
+                .ok_or("closing brace is not a direct child")?;
+            let range = elements[start + 1..end].to_vec();
+            let body = elements_text(&range).trim_end().to_owned();
+            let call_indent = indent_before(&first_statement.syntax().clone().into());
+            let replacement = braced_elements(&format!(
+                "fn w() {{\n{call_indent}self.{}({args});\n{function_indent}}}",
+                method.name,
+            ))?;
+            replace_elements(&editor, range, replacement)?;
+            body
         }
     };
 
@@ -669,27 +748,18 @@ pub fn extract(
         (Some(receiver), false) => format!("{receiver}, {params}"),
         (None, _) => params,
     };
-    let args = method.args.join(", ");
-    let replacement = if extraction.expression {
-        format!("self.{}({args})", method.name)
-    } else {
-        format!(
-            "\n{}self.{}({args});\n{}",
-            extraction.call_indent, method.name, extraction.close_indent,
-        )
-    };
-
     let return_ty = method
         .return_ty
         .map_or(String::new(), |ty| format!(" -> {ty}"));
     let extracted = format!(
-        "\n\n{function_indent}fn {}({params}){return_ty} {{{}\n{function_indent}}}",
-        method.name, extraction.body,
+        "\n\n{function_indent}fn {}({params}){return_ty} {{{body}\n{function_indent}}}",
+        method.name,
     );
-    source.insert_str(function_end, &extracted);
-    source.replace_range(extraction.range, &replacement);
-    parse(source)?;
-    Ok(())
+    editor.insert_all(
+        Position::after(function_node.syntax()),
+        braced_elements(&format!("impl W {{{extracted}}}"))?,
+    );
+    commit(source, editor)
 }
 
 pub fn redirect_call(
@@ -698,7 +768,8 @@ pub fn redirect_call(
     from: &str,
     to: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let function_node: ast::Fn = named(source, function)?;
+    let (editor, root) = open(source)?;
+    let function_node: ast::Fn = named(&root, function)?;
     let body_stmt_list = function_node
         .body()
         .and_then(|body| body.stmt_list())
@@ -718,30 +789,268 @@ pub fn redirect_call(
     let name = call
         .name_ref()
         .ok_or_else(|| format!("`{from}` call has no method name"))?;
-    source.replace_range(text_range(name.syntax().text_range()), to);
-    parse(source)?;
-    Ok(())
+    editor.replace(name.syntax(), name_ref_element(to)?);
+    commit(source, editor)
 }
 
-struct Extraction {
-    range: std::ops::Range<usize>,
-    body: String,
-    call_indent: String,
-    close_indent: String,
-    expression: bool,
-}
-
-fn parse(source: &str) -> Result<SyntaxNode, Box<dyn Error>> {
+fn parse_file(source: &str) -> Result<SourceFile, Box<dyn Error>> {
     let parsed = SourceFile::parse(source, Edition::CURRENT);
     let errors = parsed.errors();
     if !errors.is_empty() {
         return Err(format!("could not parse Rust source: {errors:?}").into());
     }
-    Ok(parsed.syntax_node())
+    Ok(parsed.tree())
 }
 
 fn pat_is_ident(pattern: Option<ast::Pat>, name: &str) -> bool {
     matches!(pattern, Some(ast::Pat::IdentPat(pattern)) if pattern.name().is_some_and(|it| it.text() == name))
+}
+
+fn child_of(list: &SyntaxNode, node: &SyntaxNode) -> Result<SyntaxNode, Box<dyn Error>> {
+    node.ancestors()
+        .find(|candidate| candidate.parent().as_ref() == Some(list))
+        .ok_or_else(|| "node is not part of the statement list".into())
+}
+
+fn element_range(
+    parent: &SyntaxNode,
+    first: &SyntaxElement,
+    last: &SyntaxElement,
+) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
+    let elements = parent.children_with_tokens().collect::<Vec<_>>();
+    let start = elements
+        .iter()
+        .position(|element| element == first)
+        .ok_or("range start is not a direct child")?;
+    let end = elements
+        .iter()
+        .position(|element| element == last)
+        .ok_or("range end is not a direct child")?;
+    if end < start {
+        return Err("range end precedes its start".into());
+    }
+    Ok(elements[start..=end].to_vec())
+}
+
+fn elements_between(
+    parent: &SyntaxNode,
+    open: &SyntaxToken,
+    close: &SyntaxToken,
+) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
+    let elements = parent.children_with_tokens().collect::<Vec<_>>();
+    let start = elements
+        .iter()
+        .position(|element| element.as_token() == Some(open))
+        .ok_or("opening token is not a direct child")?;
+    let end = elements
+        .iter()
+        .position(|element| element.as_token() == Some(close))
+        .ok_or("closing token is not a direct child")?;
+    if end <= start + 1 {
+        return Err("delimited range is empty".into());
+    }
+    Ok(elements[start + 1..end].to_vec())
+}
+
+fn replace_elements(
+    editor: &SyntaxEditor,
+    old: Vec<SyntaxElement>,
+    new: Vec<SyntaxElement>,
+) -> Result<(), Box<dyn Error>> {
+    let first = old.first().ok_or("nothing to replace")?.clone();
+    let last = old.last().ok_or("nothing to replace")?.clone();
+    editor.replace_all(first..=last, new);
+    Ok(())
+}
+
+fn elements_text(elements: &[SyntaxElement]) -> String {
+    elements.iter().map(ToString::to_string).collect()
+}
+
+fn indent_before(element: &SyntaxElement) -> String {
+    let whitespace = match element.prev_sibling_or_token() {
+        Some(previous) if previous.kind() == SyntaxKind::WHITESPACE => previous,
+        _ => return String::new(),
+    };
+    let text = whitespace.to_string();
+    text.rsplit('\n').next().unwrap_or_default().to_owned()
+}
+
+fn item_elements(text: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
+    let file = parse_file(text)?;
+    Ok(file.syntax().children_with_tokens().collect())
+}
+
+fn braced_elements(wrapper: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
+    let file = parse_file(wrapper)?;
+    let list = file
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find(|token| token.kind() == SyntaxKind::L_CURLY)
+        .ok_or("wrapper has no braces")?
+        .parent()
+        .ok_or("wrapper brace has no parent")?;
+    let open = list
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find(|token| token.kind() == SyntaxKind::L_CURLY)
+        .ok_or("wrapper has no opening brace")?;
+    let close = list
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| token.kind() == SyntaxKind::R_CURLY)
+        .last()
+        .ok_or("wrapper has no closing brace")?;
+    elements_between(&list, &open, &close)
+}
+
+fn record_field_elements(fields: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
+    if fields.trim_start().starts_with(',') {
+        let file = parse_file(&format!("fn w() {{ W {{ w0: 0{fields} }}; }}"))?;
+        let list = file
+            .syntax()
+            .descendants()
+            .find_map(ast::RecordExprFieldList::cast)
+            .ok_or("record wrapper has no field list")?;
+        let seed = list
+            .fields()
+            .next()
+            .ok_or("record wrapper has no seed field")?;
+        let elements = list.syntax().children_with_tokens().collect::<Vec<_>>();
+        let start = elements
+            .iter()
+            .position(|element| element.as_node() == Some(seed.syntax()))
+            .ok_or("seed is not a direct child")?;
+        let end = elements
+            .iter()
+            .rposition(|element| element.kind() == SyntaxKind::WHITESPACE)
+            .ok_or("record wrapper has no closing whitespace")?;
+        Ok(elements[start + 1..end].to_vec())
+    } else {
+        let file = parse_file(&format!("fn w() {{ W {{{fields}}}; }}"))?;
+        let list = file
+            .syntax()
+            .descendants()
+            .find_map(ast::RecordExprFieldList::cast)
+            .ok_or("record wrapper has no field list")?;
+        let open = list
+            .l_curly_token()
+            .ok_or("record wrapper has no opening brace")?;
+        let close = list
+            .r_curly_token()
+            .ok_or("record wrapper has no closing brace")?;
+        elements_between(list.syntax(), &open, &close)
+    }
+}
+
+fn rest_pattern_elements() -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
+    let file = parse_file("fn w() { if let W { w0, .. } = 0 {} }")?;
+    let list = file
+        .syntax()
+        .descendants()
+        .find_map(ast::RecordPatFieldList::cast)
+        .ok_or("pattern wrapper has no field list")?;
+    let seed = list
+        .fields()
+        .next()
+        .ok_or("pattern wrapper has no seed field")?;
+    let elements = list.syntax().children_with_tokens().collect::<Vec<_>>();
+    let start = elements
+        .iter()
+        .position(|element| element.as_node() == Some(seed.syntax()))
+        .ok_or("seed is not a direct child")?;
+    let rest = elements
+        .iter()
+        .position(|element| element.kind() == SyntaxKind::REST_PAT)
+        .ok_or("pattern wrapper has no rest pattern")?;
+    Ok(elements[start + 1..=rest].to_vec())
+}
+
+fn statement_element(statement: &str) -> Result<SyntaxElement, Box<dyn Error>> {
+    let file = parse_file(&format!("fn w() {{ {statement} }}"))?;
+    file.syntax()
+        .descendants()
+        .find_map(ast::ExprStmt::cast)
+        .map(|statement| statement.syntax().clone().into())
+        .ok_or_else(|| "could not parse statement".into())
+}
+
+fn expr_element(expr: &str) -> Result<SyntaxElement, Box<dyn Error>> {
+    let file = parse_file(&format!("fn w() {{ let w0 = {expr}; }}"))?;
+    file.syntax()
+        .descendants()
+        .find_map(ast::LetStmt::cast)
+        .and_then(|statement| statement.initializer())
+        .map(|expr| expr.syntax().clone().into())
+        .ok_or_else(|| "could not parse expression".into())
+}
+
+fn name_element(name: &str) -> Result<SyntaxElement, Box<dyn Error>> {
+    let file = parse_file(&format!("fn {name}() {{}}"))?;
+    file.syntax()
+        .descendants()
+        .find_map(ast::Name::cast)
+        .map(|name| name.syntax().clone().into())
+        .ok_or_else(|| "could not parse name".into())
+}
+
+fn name_ref_element(name: &str) -> Result<SyntaxElement, Box<dyn Error>> {
+    let file = parse_file(&format!("fn w() {{ self.{name}(); }}"))?;
+    file.syntax()
+        .descendants()
+        .filter_map(ast::NameRef::cast)
+        .find(|it| it.text() == name)
+        .map(|name| name.syntax().clone().into())
+        .ok_or_else(|| "could not parse method name".into())
+}
+
+fn use_tree_element(tree: &str) -> Result<SyntaxElement, Box<dyn Error>> {
+    let file = parse_file(&format!("use {tree};\n"))?;
+    file.syntax()
+        .descendants()
+        .find_map(ast::UseTree::cast)
+        .map(|tree| tree.syntax().clone().into())
+        .ok_or_else(|| "could not parse use tree".into())
+}
+
+fn visibility_element(visibility: &str) -> Result<SyntaxElement, Box<dyn Error>> {
+    let file = parse_file(&format!("{visibility} fn w() {{}}"))?;
+    file.syntax()
+        .descendants()
+        .find_map(ast::Visibility::cast)
+        .map(|visibility| visibility.syntax().clone().into())
+        .ok_or_else(|| "could not parse visibility".into())
+}
+
+fn attr_elements(attribute: &str, indent: &str) -> Result<Vec<SyntaxElement>, Box<dyn Error>> {
+    let file = parse_file(&format!("{attribute}\n{indent}fn w() {{}}"))?;
+    let function = file
+        .syntax()
+        .descendants()
+        .find_map(ast::Fn::cast)
+        .ok_or("attribute wrapper has no function")?;
+    let elements = function
+        .syntax()
+        .children_with_tokens()
+        .take_while(|element| {
+            element.kind() == SyntaxKind::ATTR || element.kind() == SyntaxKind::WHITESPACE
+        })
+        .collect::<Vec<_>>();
+    if elements.is_empty() {
+        return Err("could not parse attribute".into());
+    }
+    Ok(elements)
+}
+
+fn whitespace_element(text: &str) -> Result<SyntaxElement, Box<dyn Error>> {
+    let file = parse_file(&format!("fn w(){text}{{}}"))?;
+    file.syntax()
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find(|token| token.kind() == SyntaxKind::WHITESPACE && token.text() == text)
+        .map(SyntaxElement::from)
+        .ok_or_else(|| "could not parse whitespace".into())
 }
 
 fn normalize_statement_body(body: &str, source_indent: &str, target_indent: &str) -> String {
@@ -752,84 +1061,6 @@ fn normalize_statement_body(body: &str, source_indent: &str, target_indent: &str
         normalized.push_str(line.strip_prefix(source_indent).unwrap_or(line));
     }
     normalized
-}
-
-fn use_tree_removal_range(
-    source: &str,
-    tree: &ast::UseTree,
-) -> Result<std::ops::Range<usize>, Box<dyn Error>> {
-    let start = text_offset(tree.syntax().text_range().start());
-    let end = text_offset(tree.syntax().text_range().end());
-    let bytes = source.as_bytes();
-
-    let mut after = end;
-    while after < bytes.len() && bytes[after].is_ascii_whitespace() {
-        after += 1;
-    }
-    if after < bytes.len() && bytes[after] == b',' {
-        after += 1;
-        while after < bytes.len() && bytes[after].is_ascii_whitespace() {
-            after += 1;
-        }
-        return Ok(start..after);
-    }
-
-    let mut before = start;
-    while before > 0 && bytes[before - 1].is_ascii_whitespace() {
-        before -= 1;
-    }
-    if before > 0 && bytes[before - 1] == b',' {
-        return Ok(before - 1..end);
-    }
-    Ok(start..end)
-}
-
-fn replace_text_range(source: &mut String, range: TextRange, replacement: &str) {
-    source.replace_range(text_range(range), replacement);
-}
-
-fn text_range(range: TextRange) -> std::ops::Range<usize> {
-    text_offset(range.start())..text_offset(range.end())
-}
-
-fn text_offset(size: TextSize) -> usize {
-    u32::from(size) as usize
-}
-
-fn line_indent(source: &str, offset: usize) -> &str {
-    let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
-    let indent_len = source[line_start..offset]
-        .chars()
-        .take_while(|value| value.is_whitespace())
-        .map(char::len_utf8)
-        .sum::<usize>();
-    &source[line_start..line_start + indent_len]
-}
-
-fn line_start_offset(source: &str, offset: usize) -> usize {
-    source[..offset].rfind('\n').map_or(0, |index| index + 1)
-}
-
-fn first_use_index(source: &str) -> Option<usize> {
-    let mut index = 0;
-    for line in source.split_inclusive('\n') {
-        if line.starts_with("use ") || line.starts_with("pub use ") {
-            return Some(index);
-        }
-        index += line.len();
-    }
-    None
-}
-
-fn insertion_index_after_inner_attrs(source: &str) -> usize {
-    let mut index = 0;
-    for line in source.split_inclusive('\n') {
-        if !(line.starts_with("#![") || line.starts_with("//!")) {
-            return index;
-        }
-        index += line.len();
-    }
-    index
 }
 
 #[cfg(test)]
