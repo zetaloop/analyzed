@@ -500,12 +500,12 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::rename_function(&mut source, "mark_gc_when_idle", "_mark_gc_when_idle")?;
     build_support::allow_dead_code_for_function(&mut source, "_mark_gc_when_idle")?;
 
-    build_support::extract_method(
+    build_support::extract_for_loop_body(
         &mut source,
         "_handle_event",
-        build_support::ExtractSelector::ForLoopBinding("file_id"),
-        0,
-        build_support::ExtractRange::Body,
+        build_support::StructureContainer::IfCallingMethod {
+            method: "take_changes",
+        },
         build_support::ExtractedMethod {
             name: "publish_changed_diagnostics",
             receiver: Some("&mut self"),
@@ -523,12 +523,12 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     )?;
     build_support::allow_dead_code_for_function(&mut source, "_publish_changed_diagnostics")?;
 
-    build_support::extract_method(
+    build_support::extract_for_loop_body(
         &mut source,
         "handle_flycheck_msg",
-        build_support::ExtractSelector::ForLoopBinding("diag"),
-        0,
-        build_support::ExtractRange::Body,
+        build_support::StructureContainer::MatchArm {
+            variant: "FlycheckMessage::AddDiagnostic",
+        },
         build_support::ExtractedMethod {
             name: "record_flycheck_diagnostic",
             receiver: Some("&mut self"),

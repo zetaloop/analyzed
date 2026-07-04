@@ -1146,6 +1146,64 @@ pub fn extract_call_statement(
     apply_extraction(source, function_end, &function_indent, extraction, method)
 }
 
+pub fn extract_for_loop_body(
+    source: &mut String,
+    function: &str,
+    container: StructureContainer<'_>,
+    method: ExtractedMethod<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let function_node = find_function(source, function)?;
+    let function_end = text_offset(function_node.syntax().text_range().end());
+    let function_indent = line_indent(
+        source,
+        text_offset(function_node.syntax().text_range().start()),
+    )
+    .to_owned();
+    let container_list = find_container_block(&function_node, &container)?;
+    let mut loops = container_list
+        .syntax()
+        .descendants()
+        .filter_map(ast::ForExpr::cast);
+    let loop_expr = loops
+        .next()
+        .ok_or_else(|| format!("container in `{function}` has no for loop"))?;
+    if loops.next().is_some() {
+        return Err(format!("container in `{function}` has more than one for loop").into());
+    }
+    let body = loop_expr
+        .loop_body()
+        .ok_or_else(|| format!("container for loop in `{function}` has no body"))?;
+    let stmt_list = body
+        .stmt_list()
+        .ok_or_else(|| format!("container for loop in `{function}` has no statement list"))?;
+    let first_statement = stmt_list
+        .statements()
+        .next()
+        .ok_or_else(|| format!("container for loop in `{function}` has empty body"))?;
+    let opening_brace = stmt_list
+        .l_curly_token()
+        .ok_or_else(|| format!("container for loop in `{function}` has no opening brace"))?;
+    let closing_brace = stmt_list
+        .r_curly_token()
+        .ok_or_else(|| format!("container for loop in `{function}` has no closing brace"))?;
+    let range = text_offset(opening_brace.text_range().end())
+        ..text_offset(closing_brace.text_range().start());
+    let extraction = Extraction {
+        call_indent: line_indent(
+            source,
+            text_offset(first_statement.syntax().text_range().start()),
+        )
+        .to_owned(),
+        close_indent: line_indent(source, text_offset(closing_brace.text_range().start()))
+            .to_owned(),
+        body: source[range.clone()].trim_end().to_owned(),
+        return_ty: None,
+        expression: false,
+        range,
+    };
+    apply_extraction(source, function_end, &function_indent, extraction, method)
+}
+
 struct Extraction {
     range: std::ops::Range<usize>,
     body: String,
