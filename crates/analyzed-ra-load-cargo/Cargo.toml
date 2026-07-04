@@ -23,20 +23,20 @@ analyzed-bridge = { path = "../analyzed-bridge", version = "=0.3.0" }
 [dependencies]
 anyhow = { version = "1.0.98" }
 crossbeam-channel = { version = "0.5.15" }
-hir-expand = { version = "=0.0.338", package = "ra_ap_hir_expand" }
+hir-expand = { version = "=0.0.340", package = "ra_ap_hir_expand" }
 ide-db = { path = "../analyzed-ra-ide-db", package = "analyzed-ra-ide-db", version = "=0.3.0" }
-intern = { version = "=0.0.338", package = "ra_ap_intern" }
+intern = { version = "=0.0.340", package = "ra_ap_intern" }
 itertools = { version = "0.14.0" }
-proc-macro-api = { version = "=0.0.338", package = "ra_ap_proc_macro_api" }
-project-model = { version = "=0.0.338", package = "ra_ap_project_model" }
-span = { version = "=0.0.338", package = "ra_ap_span" }
+proc-macro-api = { version = "=0.0.340", package = "ra_ap_proc_macro_api" }
+project-model = { version = "=0.0.340", package = "ra_ap_project_model" }
+span = { version = "=0.0.340", package = "ra_ap_span" }
 tracing = { version = "0.1.41", features = ["std"], default-features = false }
-tt = { version = "=0.0.338", package = "ra_ap_tt" }
-vfs = { version = "=0.0.338", package = "ra_ap_vfs" }
-vfs-notify = { version = "=0.0.338", package = "ra_ap_vfs-notify" }
+tt = { version = "=0.0.340", package = "ra_ap_tt" }
+vfs = { version = "=0.0.340", package = "ra_ap_vfs" }
+vfs-notify = { version = "=0.0.340", package = "ra_ap_vfs-notify" }
 
 [target.'cfg(any())'.dependencies]
-ra_ap_load-cargo = "=0.0.338"
+ra_ap_load-cargo = "=0.0.340"
 
 [lints.clippy]
 assigning_clones = "allow"

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use ide::{Cancellable, FileId};
 use ide_db::base_db::{AnchoredPathBuf, Crate};
-use lsp_types::Url;
+use lsp_types::Uri;
 use vfs::VfsPath;
 
 use crate::{
@@ -36,11 +36,11 @@ impl GlobalState {
 }
 
 impl GlobalStateSnapshot {
-    pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {
+    pub(crate) fn url_to_file_id(&self, url: &Uri) -> anyhow::Result<Option<FileId>> {
         self.shared.url_to_file_id(url)
     }
 
-    pub(crate) fn file_id_to_url(&self, id: FileId) -> Url {
+    pub(crate) fn file_id_to_url(&self, id: FileId) -> Uri {
         self.shared.file_id_to_url(id).expect("shared analyzer file id must have a url")
     }
 
@@ -67,7 +67,7 @@ impl GlobalStateSnapshot {
         Some(self.mem_docs.get(&path)?.version)
     }
 
-    pub(crate) fn anchored_path(&self, anchored: &AnchoredPathBuf) -> Url {
+    pub(crate) fn anchored_path(&self, anchored: &AnchoredPathBuf) -> Uri {
         let mut anchor = self.file_id_to_file_path(anchored.anchor);
         anchor.pop();
         url_from_abs_path(anchor.join(&anchored.path).unwrap().as_path().unwrap())

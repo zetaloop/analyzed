@@ -22,7 +22,7 @@
 	    ProcMacroLoad, WorkspaceLoad, LoadCargoConfig, ProcMacroServerChoice,
 	    load_workspace_change,
 	};
-	use lsp_types::Url;
+	use lsp_types::Uri;
 	use proc_macro_api::ProcMacroClient;
 	use project_model::{CargoConfig, ManifestPath, ProjectWorkspace};
 	use serde::Serialize;
@@ -1289,12 +1289,12 @@ impl SharedAnalyzerRuntime {
         analysis.with_guard((read_permit, gc_read_permit))
     }
 
-    pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {
+    pub(crate) fn url_to_file_id(&self, url: &Uri) -> anyhow::Result<Option<FileId>> {
         let path = crate::lsp::from_proto::vfs_path(url)?;
         self.vfs_path_to_file_id(&path)
     }
 
-    pub(crate) fn base_url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {
+    pub(crate) fn base_url_to_file_id(&self, url: &Uri) -> anyhow::Result<Option<FileId>> {
         let path = crate::lsp::from_proto::vfs_path(url)?;
         self.base_vfs_path_to_file_id(&path)
     }
@@ -1322,7 +1322,7 @@ impl SharedAnalyzerRuntime {
             .base_file_id(&path))
     }
 
-    pub(crate) fn file_id_to_url(&self, file_id: FileId) -> Option<Url> {
+    pub(crate) fn file_id_to_url(&self, file_id: FileId) -> Option<Uri> {
         let path = self.file_id_to_vfs_path(file_id)?;
         let path = path.as_path()?;
         Some(crate::lsp::to_proto::url_from_abs_path(path))

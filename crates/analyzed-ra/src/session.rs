@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, Sender};
 use ide::FileId;
 use ide_db::{FxHashMap, base_db::SourceRootId};
 use lsp_server::{Connection, Message};
-use lsp_types::Url;
+use lsp_types::{Notification as _, Uri};
 use paths::Utf8PathBuf;
 use triomphe::Arc;
 use vfs::{AbsPathBuf, ChangeKind, VfsPath};
@@ -63,7 +63,6 @@ pub(crate) fn run_shared_lsp_session(
             name: String::from("rust-analyzer"),
             version: Some(crate::RUST_ANALYZER_VERSION.to_owned()),
         }),
-        offset_encoding: None,
     };
 
     connection.initialize_finish(initialize_id, serde_json::to_value(initialize_result)?)?;
@@ -132,8 +131,7 @@ fn run_shared_state(
                 method,
                 ..
             }))
-            if method
-                == <lsp_types::notification::Exit as lsp_types::notification::Notification>::METHOD
+            if method == lsp_types::ExitNotification::METHOD.as_str()
         ) {
             return Ok(());
         }
@@ -471,7 +469,7 @@ impl crate::global_state::GlobalState {
 
     pub(crate) fn base_url_to_file_id(
         &self,
-        url: &Url,
+        url: &Uri,
     ) -> anyhow::Result<Option<FileId>> {
         self.shared.base_url_to_file_id(url)
     }
@@ -653,8 +651,8 @@ fn diagnostic_key(
     diagnostic: &lsp_types::Diagnostic,
 ) -> (lsp_types::Range, Option<String>) {
     let code = diagnostic.code.as_ref().map(|code| match code {
-        lsp_types::NumberOrString::Number(code) => code.to_string(),
-        lsp_types::NumberOrString::String(code) => code.clone(),
+        lsp_types::Code::Int(code) => code.to_string(),
+        lsp_types::Code::String(code) => code.clone(),
     });
 
     (diagnostic.range, code)
@@ -665,9 +663,10 @@ fn config_from_initialize_params(
     initialize_params: &serde_json::Value,
 ) -> anyhow::Result<Config> {
     let lsp_types::InitializeParams {
+        #[expect(deprecated, reason = "compatibility with old clients")]
         root_uri,
         mut capabilities,
-        workspace_folders,
+        workspace_folders_initialize_params,
         initialization_options,
         client_info,
         ..
@@ -680,7 +679,7 @@ fn config_from_initialize_params(
                 value,
             )
     {
-        capabilities.workspace.get_or_insert_default().diagnostic.get_or_insert(diagnostics);
+        capabilities.workspace.get_or_insert_default().diagnostics.get_or_insert(diagnostics);
     }
 
     let root_path = match root_uri
@@ -701,7 +700,14 @@ fn config_from_initialize_params(
         );
     }
 
-    let workspace_roots = workspace_folders
+    let workspace_roots = workspace_folders_initialize_params
+        .workspace_folders
+        .and_then(|workspaces| match workspaces {
+            lsp_types::WorkspaceFolders::WorkspaceFolderList(workspace_folders) => {
+                Some(workspace_folders)
+            }
+            lsp_types::WorkspaceFolders::Null => None,
+        })
         .map(|workspaces| {
             workspaces
                 .into_iter()
@@ -724,9 +730,9 @@ fn config_from_initialize_params(
 
         if !errors.is_empty() {
             let notification = lsp_server::Notification::new(
-                <lsp_types::notification::ShowMessage as lsp_types::notification::Notification>::METHOD.to_owned(),
+                lsp_types::ShowMessageNotification::METHOD.into(),
                 lsp_types::ShowMessageParams {
-                    typ: lsp_types::MessageType::WARNING,
+                    kind: lsp_types::MessageType::Warning,
                     message: errors.to_string(),
                 },
             );
