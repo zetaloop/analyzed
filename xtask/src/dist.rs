@@ -122,7 +122,7 @@ pub(crate) fn run(sh: &Shell, training_dir: Option<PathBuf>) -> anyhow::Result<(
         .then(|| sh.push_env("MACOSX_DEPLOYMENT_TARGET", "14.0"));
 
     build(sh, &target, training_dir)?;
-    package(&target, &dist)
+    package(&target, &dist, env!("CARGO_PKG_VERSION"))
 }
 
 pub(crate) fn matrix() {
@@ -220,17 +220,17 @@ fn with_rustflags<'a>(cmd: Cmd<'a>, rustflags: &str) -> Cmd<'a> {
     }
 }
 
-fn package(target: &Target, dist: &Path) -> anyhow::Result<()> {
+fn package(target: &Target, dist: &Path, version: &str) -> anyhow::Result<()> {
     let triple = target.spec.triple;
     match &target.symbols_path {
         Some(symbols_path) => zip(
             &target.server_path,
             symbols_path,
-            &dist.join(format!("analyzed-{triple}.zip")),
+            &dist.join(format!("analyzed-{triple}-v{version}.zip")),
         ),
         None => tar_gz(
             &target.server_path,
-            &dist.join(format!("analyzed-{triple}.tar.gz")),
+            &dist.join(format!("analyzed-{triple}-v{version}.tar.gz")),
         ),
     }
 }
