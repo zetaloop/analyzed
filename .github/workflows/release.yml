@@ -13,7 +13,6 @@ on:
         options:
           - dryrun
           - draft
-          - release
         default: dryrun
 
 env:
@@ -178,6 +177,6 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Create the release
-        if: steps.tag.outputs.tag != '' && (github.event_name == 'push' || inputs.mode != 'dryrun')
-        run: gh release create "${{ steps.tag.outputs.tag }}" dist/* --verify-tag --title "${{ steps.tag.outputs.tag }}" ${{ github.event_name != 'push' && inputs.mode == 'draft' && '--draft' || '' }}
+      - name: Create the draft release
+        if: steps.tag.outputs.tag != '' && (github.event_name == 'push' || inputs.mode == 'draft')
+        run: gh release create "${{ steps.tag.outputs.tag }}" dist/* --verify-tag --draft --title "${{ steps.tag.outputs.tag }}"
