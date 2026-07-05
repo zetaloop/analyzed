@@ -1,10 +1,14 @@
 use std::{
+    env,
+    ffi::OsString,
     io::{self, Read, Write},
-    process, thread,
+    process::{self, ExitCode},
+    thread,
 };
 
 use analyzed_ipc::RuntimePaths;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use ra_ap_rust_analyzer::{cli::flags, config::Config, driver};
 
 #[derive(Debug, Parser)]
 #[command(about = "Rust analysis daemon")]
@@ -23,9 +27,15 @@ enum Command {
     },
     Status,
     Stop,
+    #[command(external_subcommand)]
+    Upstream(Vec<OsString>),
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<ExitCode> {
+    if env::var("RA_RUSTC_WRAPPER").is_ok() {
+        return driver::main();
+    }
+
     let matches = Cli::command()
         .version(analyzed_daemon::version())
         .get_matches();
@@ -45,10 +55,61 @@ fn main() -> anyhow::Result<()> {
                 serde_json::to_string_pretty(&analyzed_daemon::stop(RuntimePaths::discover()?)?)?
             );
         }
+        Some(Command::Upstream(args)) => return run_upstream_cli(args),
         None => run_stdio()?,
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_upstream_cli(args: Vec<OsString>) -> anyhow::Result<ExitCode> {
+    let flags = match flags::RustAnalyzer::from_vec(args) {
+        Ok(flags) => flags,
+        Err(err) => err.exit(),
+    };
+
+    #[cfg(debug_assertions)]
+    if flags.wait_dbg || env::var("RA_WAIT_DBG").is_ok() {
+        driver::wait_for_debugger();
+    }
+
+    if let Err(e) = driver::setup_logging(flags.log_file.clone()) {
+        eprintln!("Failed to setup logging: {e:#}");
+    }
+
+    let verbosity = flags.verbosity();
+
+    match flags.subcommand {
+        flags::RustAnalyzerCmd::LspServer(cmd) => 'lsp_server: {
+            if cmd.print_config_schema {
+                println!("{:#}", Config::json_schema());
+                break 'lsp_server;
+            }
+            if cmd.version {
+                println!("rust-analyzer {}", ra_ap_rust_analyzer::version());
+                break 'lsp_server;
+            }
+            run_stdio()?;
+        }
+        flags::RustAnalyzerCmd::Parse(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::Symbols(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::Highlight(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::AnalysisStats(cmd) => cmd.run(verbosity)?,
+        flags::RustAnalyzerCmd::Diagnostics(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::UnresolvedReferences(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::Ssr(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::Search(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::Lsif(cmd) => cmd.run(
+            &mut std::io::stdout(),
+            Some(project_model::RustLibSource::Discover),
+        )?,
+        flags::RustAnalyzerCmd::Scip(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::RunTests(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::RustcTests(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::PrimeCaches(cmd) => cmd.run()?,
+    }
+
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_stdio() -> anyhow::Result<()> {

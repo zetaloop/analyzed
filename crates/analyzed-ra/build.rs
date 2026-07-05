@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     patch_reload_source(&generated_src.join("reload.rs"))?;
     patch_flycheck_to_proto_source(&generated_src.join("diagnostics/flycheck_to_proto.rs"))?;
     patch_notification_source(&generated_src.join("handlers/notification.rs"))?;
+    patch_driver_source(&generated_src.join("bin/main.rs"))?;
     patch_test_tool_attributes(&generated_src)?;
     write_root_module(
         &generated_src.join("root.rs"),
@@ -212,6 +213,9 @@ pub(crate) mod shared_reload;
 
 {upstream_root}
 
+#[path = {:?}]
+pub mod driver;
+
 pub use shared_analyzer::{{
     RUST_ANALYZER_COMMIT_HASH, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_RELEASE_VERSION,
     RUST_ANALYZER_VERSION,
@@ -230,7 +234,11 @@ pub use shared_analyzer::{{
         shared_analyzer.to_string_lossy().into_owned(),
         shared_global_state.to_string_lossy().into_owned(),
         shared_main_loop.to_string_lossy().into_owned(),
-        shared_reload.to_string_lossy().into_owned()
+        shared_reload.to_string_lossy().into_owned(),
+        lib_rs
+            .with_file_name("bin/main.rs")
+            .to_string_lossy()
+            .into_owned()
     );
     fs::write(root_rs, source)?;
     println!("cargo:rerun-if-changed={}", shared_analyzer.display());
@@ -758,6 +766,17 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
     )?;
 
     fs::write(notification_rs, source)?;
+    Ok(())
+}
+
+fn patch_driver_source(main_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(main_rs)?;
+
+    build_support::set_visibility::<ast::Fn>(&mut source, "main", "pub")?;
+    build_support::set_visibility::<ast::Fn>(&mut source, "setup_logging", "pub")?;
+    build_support::set_visibility::<ast::Fn>(&mut source, "wait_for_debugger", "pub")?;
+
+    fs::write(main_rs, source)?;
     Ok(())
 }
 
