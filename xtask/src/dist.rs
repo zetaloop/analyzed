@@ -43,12 +43,12 @@ const TARGETS: &[TargetSpec] = &[
     },
     TargetSpec {
         triple: "aarch64-pc-windows-msvc",
-        runner: "windows-latest",
+        runner: "windows-11-arm",
         container: None,
         zig_glibc: None,
         features: &["mimalloc"],
         rustflags: &["-Ctarget-feature=+crt-static"],
-        pgo: false,
+        pgo: true,
     },
     TargetSpec {
         triple: "x86_64-unknown-linux-gnu",
