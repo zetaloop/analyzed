@@ -30,7 +30,7 @@ We keep our modifications to the upstream code minimal. Copying large blocks of 
 - Don't alter upstream execution flow or response timing to avoid duplication. The external behavior must stay identical to upstream.
 - Injected names carry no ownership markers. A replacement keeps the upstream name; a new item takes a name in upstream style, checked for collisions; an owned module whose name clashes with an upstream file takes a `shared_` prefix. The patch declarations in `build.rs` are the authoritative list of injection points.
 
-Patches apply in order; an earlier rename changes what later anchors resolve. Don't edit generated files. Fix the patch source and rebuild. When bumping the upstream pin, update the whole `ra_ap_*` family together and let the build derive and verify the version identity; there is no manual version mapping.
+Patches apply in order; an earlier rename changes what later anchors resolve. Don't edit generated files. Fix the patch source and rebuild. When bumping the upstream pin, update the whole `ra_ap_*` family together and let the build derive and verify the version identity; there is no manual version mapping. The release facts (target matrix, runners, build flags, PGO setup, packaging) live in `xtask`'s target table, and the release workflow derives its job matrix from `cargo xtask matrix`. They mirror the upstream release configuration; nothing syncs them to upstream automatically, so reconcile them in the same bump.
 
 ## Platform & IPC
 
@@ -61,6 +61,8 @@ The workspace has several crates under `crates/`. The ones relevant for most cha
 - `analyzed-bridge`: build-time helper crate: unpacks upstream crates from the local registry, verifies checksums, and provides source-manipulation primitives.
 
 The remaining `analyzed-ra*` crates are the bridge crates that mirror one `ra_ap_*` upstream crate each. Their `build.rs` patches the upstream source and re-exports the result. The crate name tells you which upstream layer it wraps (e.g., `analyzed-ra-ide-db` wraps `ra_ap_ide_db`).
+
+`xtask` at the workspace root is the release tooling: `cargo xtask dist` builds and packages the release artifact for one target, taking `--training-dir` for PGO targets; `cargo xtask matrix` prints the CI job matrix from the same target table.
 
 ## Workflow
 

@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+flate2 = "1.1.9"
+serde_json.workspace = true
+tar = "0.4.46"
+time = { version = "0.3", default-features = false }
+xshell = "0.2.7"
+zip = { version = "4.0", default-features = false, features = ["deflate-flate2", "time"] }

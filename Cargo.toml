@@ -12,6 +12,7 @@ members = [
     "crates/analyzed-ra-ide-diagnostics",
     "crates/analyzed-ra-ide-ssr",
     "crates/analyzed-ra-load-cargo",
+    "xtask",
 ]
 resolver = "3"
 
