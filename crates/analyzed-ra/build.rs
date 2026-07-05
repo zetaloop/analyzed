@@ -59,22 +59,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let slow_tests = generated.join("tests/slow-tests");
     patch_slow_tests(&slow_tests)?;
-    let slow_tests_wrapper = write_slow_tests_wrapper(&slow_tests)?;
+    write_slow_tests_wrapper(&slow_tests)?;
     println!(
         "cargo:rustc-env=ANALYZED_RA_CRATE_VERSION={}",
         package.version
     );
     println!("cargo:rustc-env=ANALYZED_RA_RELEASE_VERSION={}", release);
     println!("cargo:rustc-env=ANALYZED_RA_COMMIT_HASH={revision}");
-    println!(
-        "cargo:rustc-env=ANALYZED_RA_VERSION={} {}",
-        release,
-        &revision[..8]
-    );
-    println!(
-        "cargo:rustc-env=ANALYZED_RA_SLOW_TESTS={}",
-        slow_tests_wrapper.display()
-    );
     println!("cargo:rerun-if-env-changed=GITHUB_TOKEN");
     println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=CARGO_NET_OFFLINE");
@@ -883,7 +874,7 @@ fn patch_slow_tests_imports(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<PathBuf, Box<dyn Error>> {
+fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
     let test_support = owned_source_path("slow_tests.rs");
     let main_rs = slow_tests.join("main.rs");
     let mut body = String::new();
@@ -926,5 +917,5 @@ fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<PathBuf, Box<dyn Error>
         ),
     )?;
     println!("cargo:rerun-if-changed={}", test_support.display());
-    Ok(wrapper_rs)
+    Ok(())
 }

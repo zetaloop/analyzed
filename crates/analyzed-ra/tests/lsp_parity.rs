@@ -2,4 +2,7 @@
 #![allow(unexpected_cfgs)]
 
 #[cfg(not(rust_analyzer))]
-include!(env!("ANALYZED_RA_SLOW_TESTS"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/ra_ap_rust_analyzer_bridge/tests/slow-tests/test-support.rs"
+));

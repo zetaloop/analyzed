@@ -3,7 +3,7 @@
 	    env,
 	    path::{Path, PathBuf},
 	    sync::{
-	        Arc, Condvar, Mutex, OnceLock, Weak,
+	        Arc, Condvar, LazyLock, Mutex, OnceLock, Weak,
 	        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 	    },
 	};
@@ -31,7 +31,12 @@
 pub const RUST_ANALYZER_CRATE_VERSION: &str = env!("ANALYZED_RA_CRATE_VERSION");
 pub const RUST_ANALYZER_RELEASE_VERSION: &str = env!("ANALYZED_RA_RELEASE_VERSION");
 pub const RUST_ANALYZER_COMMIT_HASH: &str = env!("ANALYZED_RA_COMMIT_HASH");
-pub const RUST_ANALYZER_VERSION: &str = env!("ANALYZED_RA_VERSION");
+pub static RUST_ANALYZER_VERSION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{RUST_ANALYZER_RELEASE_VERSION} {}",
+        &RUST_ANALYZER_COMMIT_HASH[..8]
+    )
+});
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RustAnalyzerLspBoundary {
