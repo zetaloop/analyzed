@@ -1,0 +1,183 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to do with the built artifacts"
+        type: choice
+        options:
+          - dryrun
+          - draft
+          - release
+        default: dryrun
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  ZIG_VERSION: 0.13.0
+  ZIGBUILD_VERSION: 0.19.8
+  PGO_TRAINING_REPO: clap-rs/clap
+  PGO_TRAINING_REF: v4.5.36
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup component add rust-src rustfmt clippy
+
+      - name: Format
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup update --no-self-update stable
+
+      - name: Compute the target matrix
+        id: matrix
+        run: echo "matrix=$(cargo xtask matrix)" >> "$GITHUB_OUTPUT"
+
+  dist:
+    name: dist (${{ matrix.target }})
+    needs: ["check", "matrix"]
+    strategy:
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    env:
+      ANALYZED_TARGET: ${{ matrix.target }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Install dependencies (alpine)
+        if: matrix.container == 'rust:alpine'
+        run: apk add --no-cache git clang lld musl-dev
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install rustup (manylinux)
+        if: matrix.container && matrix.container != 'rust:alpine'
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        if: matrix.container != 'rust:alpine'
+        run: |
+          rustup update --no-self-update stable
+          rustup component add rust-src ${{ matrix.pgo && 'llvm-tools' || '' }}
+          rustup target add ${{ matrix.target }}
+
+      - name: Install Zig toolchain
+        if: matrix.zig
+        run: |
+          curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-$(uname -m)-${ZIG_VERSION}.tar.xz" | sudo tar JxC /usr/local
+          sudo ln -s "/usr/local/zig-linux-$(uname -m)-${ZIG_VERSION}/zig" /usr/local/bin/zig
+          curl -L "https://github.com/rust-cross/cargo-zigbuild/releases/download/v${ZIGBUILD_VERSION}/cargo-zigbuild-v${ZIGBUILD_VERSION}.x86_64-unknown-linux-musl.tar.gz" | tar zxC ~/.cargo/bin
+
+      - name: Install cargo-pgo
+        if: matrix.pgo
+        run: cargo install --locked cargo-pgo@0.3.0
+
+      - name: Checkout PGO training crate
+        if: matrix.pgo
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PGO_TRAINING_REPO }}
+          ref: ${{ env.PGO_TRAINING_REF }}
+          path: pgo-training
+
+      - name: Dist
+        run: cargo xtask dist ${{ matrix.pgo && '--training-dir pgo-training' || '' }}
+
+      - name: Smoke test (analysis-stats on the repository)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: target/${{ matrix.target }}/release/analyzed analysis-stats . -q
+
+      - name: Smoke test (analysis-stats on rust std)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          RUSTC_BOOTSTRAP: 1
+        run: target/${{ matrix.target }}/release/analyzed analysis-stats --with-deps --no-sysroot --no-test "$(rustc --print sysroot)/lib/rustlib/src/rust/library/std" -q
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: ./dist
+
+  publish:
+    needs: ["dist"]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-tags: true
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - run: ls -al ./dist
+
+      - name: Determine the release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${{ github.ref_name }}"
+          else
+            tag=$(git tag --points-at HEAD --list 'v*' | head -1)
+            if [ -z "$tag" ]; then
+              echo "::notice::no v* tag points at HEAD; keeping the artifacts without a release"
+            fi
+          fi
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "analyzed") | .version')
+          if [ -n "$tag" ] && [ "$tag" != "v$version" ]; then
+            echo "tag $tag does not match the workspace version $version" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Create the release
+        if: steps.tag.outputs.tag != '' && (github.event_name == 'push' || inputs.mode != 'dryrun')
+        run: gh release create "${{ steps.tag.outputs.tag }}" dist/* --verify-tag --title "${{ steps.tag.outputs.tag }}" ${{ github.event_name != 'push' && inputs.mode == 'draft' && '--draft' || '' }}
