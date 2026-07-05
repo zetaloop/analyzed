@@ -1,7 +1,7 @@
 use std::{
     env,
     error::Error,
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -19,10 +19,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         .git_revision
         .as_deref()
         .ok_or("ra_ap_rust-analyzer does not contain .cargo_vcs_info.json")?;
-    let release = if env::var_os("DOCS_RS").is_some() {
-        "docs.rs".to_owned()
+    let pinned = pinned_upstream_release()?;
+    let release = if offline_build() {
+        pinned
     } else {
-        rust_analyzer_release(revision)?
+        match rust_analyzer_release(revision) {
+            Ok(release) => {
+                if release != pinned {
+                    return Err(format!(
+                        "[package.metadata.upstream] release is {pinned}, but the rust-analyzer \
+                         release for commit {revision} is {release}"
+                    )
+                    .into());
+                }
+                release
+            }
+            Err(error) if error.is::<GithubUnavailable>() => {
+                println!(
+                    "cargo:warning=could not verify the pinned upstream release {pinned}: {error}"
+                );
+                pinned
+            }
+            Err(error) => return Err(error),
+        }
     };
     let generated_src = generated.join("src");
     patch_config_source(&generated_src.join("config.rs"))?;
@@ -58,9 +77,40 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!("cargo:rerun-if-env-changed=GITHUB_TOKEN");
     println!("cargo:rerun-if-env-changed=DOCS_RS");
+    println!("cargo:rerun-if-env-changed=CARGO_NET_OFFLINE");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())
 }
+
+fn pinned_upstream_release() -> Result<String, Box<dyn Error>> {
+    let manifest_path = Path::new(&env::var("CARGO_MANIFEST_DIR")?).join("Cargo.toml");
+    let manifest: toml::Table = toml::from_str(&fs::read_to_string(manifest_path)?)?;
+    manifest
+        .get("package")
+        .and_then(|value| value.get("metadata"))
+        .and_then(|value| value.get("upstream"))
+        .and_then(|value| value.get("release"))
+        .and_then(toml::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "Cargo.toml lacks a [package.metadata.upstream] release".into())
+}
+
+fn offline_build() -> bool {
+    env::var_os("DOCS_RS").is_some()
+        || env::var("CARGO_NET_OFFLINE").is_ok_and(|value| value == "true")
+}
+
+#[derive(Debug)]
+struct GithubUnavailable(String);
+
+impl fmt::Display for GithubUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for GithubUnavailable {}
 
 fn rust_analyzer_release(revision: &str) -> Result<String, Box<dyn Error>> {
     let agent = ureq::Agent::config_builder()
@@ -141,13 +191,18 @@ fn github_get(agent: &ureq::Agent, path: &str) -> Result<serde_json::Value, Box<
     let mut response = match request.call() {
         Ok(response) => response,
         Err(ureq::Error::StatusCode(403 | 429)) if env::var_os("GITHUB_TOKEN").is_none() => {
-            return Err(format!(
+            return Err(GithubUnavailable(format!(
                 "GitHub API request to {path} was rate limited (60 requests/hour unauthenticated); \
                  set GITHUB_TOKEN to raise the limit"
-            )
+            ))
             .into());
         }
-        Err(error) => return Err(error.into()),
+        Err(error @ ureq::Error::StatusCode(_)) => return Err(error.into()),
+        Err(error) => {
+            return Err(
+                GithubUnavailable(format!("GitHub API request to {path} failed: {error}")).into(),
+            );
+        }
     };
     Ok(serde_json::from_str(
         &response.body_mut().read_to_string()?,

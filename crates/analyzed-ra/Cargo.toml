@@ -8,6 +8,9 @@ repository.workspace = true
 description = "Patched rust-analyzer bridge crate for analyzed"
 build = "build.rs"
 
+[package.metadata.upstream]
+release = "v0.3.2955"
+
 [lib]
 name = "ra_ap_rust_analyzer"
 path = "src/lib.rs"
@@ -23,6 +26,7 @@ jemalloc = ["jemallocator", "profile/jemalloc"]
 [build-dependencies]
 analyzed-bridge = { path = "../analyzed-bridge", version = "=0.4.0" }
 serde_json = "1.0.150"
+toml = "1.1.2"
 ureq = "3.3.0"
 
 [dependencies]
