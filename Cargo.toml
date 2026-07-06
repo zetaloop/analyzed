@@ -17,16 +17,16 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zetaloop/analyzed"
 
 [workspace.dependencies]
-analyzed-daemon = { path = "crates/analyzed-daemon", version = "=0.4.1" }
-analyzed-ipc = { path = "crates/analyzed-ipc", version = "=0.4.1" }
-ra_ap_rust-analyzer = { path = "crates/analyzed-ra", package = "analyzed-ra", version = "=0.4.1" }
+analyzed-daemon = { path = "crates/analyzed-daemon", version = "=0.4.2" }
+analyzed-ipc = { path = "crates/analyzed-ipc", version = "=0.4.2" }
+ra_ap_rust-analyzer = { path = "crates/analyzed-ra", package = "analyzed-ra", version = "=0.4.2" }
 
 anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive", "string"] }

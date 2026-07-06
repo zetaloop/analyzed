@@ -19,12 +19,12 @@ default = []
 in-rust-tree = []
 
 [build-dependencies]
-analyzed-bridge = { path = "../analyzed-bridge", version = "=0.4.1" }
+analyzed-bridge = { path = "../analyzed-bridge", version = "=0.4.2" }
 
 [dependencies]
 cov-mark = { version = "2.0.0" }
 hir = { version = "=0.0.341", package = "ra_ap_hir" }
-ide-db = { path = "../analyzed-ra-ide-db", package = "analyzed-ra-ide-db", version = "=0.4.1" }
+ide-db = { path = "../analyzed-ra-ide-db", package = "analyzed-ra-ide-db", version = "=0.4.2" }
 itertools = { version = "0.15.0" }
 parser = { version = "=0.0.341", package = "ra_ap_parser" }
 syntax = { version = "=0.0.341", package = "ra_ap_syntax" }

@@ -18,13 +18,13 @@ test = false
 in-rust-tree = ["hir-expand/in-rust-tree", "proc-macro-api/in-rust-tree"]
 
 [build-dependencies]
-analyzed-bridge = { path = "../analyzed-bridge", version = "=0.4.1" }
+analyzed-bridge = { path = "../analyzed-bridge", version = "=0.4.2" }
 
 [dependencies]
 anyhow = { version = "1.0.98" }
 crossbeam-channel = { version = "0.5.15" }
 hir-expand = { version = "=0.0.341", package = "ra_ap_hir_expand" }
-ide-db = { path = "../analyzed-ra-ide-db", package = "analyzed-ra-ide-db", version = "=0.4.1" }
+ide-db = { path = "../analyzed-ra-ide-db", package = "analyzed-ra-ide-db", version = "=0.4.2" }
 intern = { version = "=0.0.341", package = "ra_ap_intern" }
 itertools = { version = "0.15.0" }
 proc-macro-api = { version = "=0.0.341", package = "ra_ap_proc_macro_api" }

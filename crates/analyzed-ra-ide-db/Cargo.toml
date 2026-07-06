@@ -19,7 +19,7 @@ default = []
 in-rust-tree = []
 
 [build-dependencies]
-analyzed-bridge = { path = "../analyzed-bridge", version = "=0.4.1" }
+analyzed-bridge = { path = "../analyzed-bridge", version = "=0.4.2" }
 
 [dependencies]
 arrayvec = { version = "0.7.6" }
