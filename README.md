@@ -1,4 +1,4 @@
-# <img height="80" alt="analyzed logo" src="./analyzed.svg" />
+# <img height="80" alt="analyzed logo" src="https://raw.githubusercontent.com/zetaloop/analyzed/HEAD/analyzed.svg" />
 
 `analyzed` is a drop-in replacement for [rust-analyzer](https://github.com/rust-lang/rust-analyzer) that runs analysis through a shared daemon.
 
