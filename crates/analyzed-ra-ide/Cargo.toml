@@ -18,7 +18,7 @@ test = false
 in-rust-tree = []
 
 [build-dependencies]
-analyzed-bridge = { path = "../analyzed-bridge", version = "=0.4.0" }
+analyzed-bridge = { path = "../analyzed-bridge", version = "=0.4.1" }
 
 [dependencies]
 arrayvec = { version = "0.7.6" }
@@ -27,11 +27,11 @@ cov-mark = { version = "2.0.0" }
 dot = { version = "0.1.4" }
 either = { version = "1.15.0" }
 hir = { version = "=0.0.340", package = "ra_ap_hir" }
-ide-assists = { path = "../analyzed-ra-ide-assists", package = "analyzed-ra-ide-assists", version = "=0.4.0" }
-ide-completion = { path = "../analyzed-ra-ide-completion", package = "analyzed-ra-ide-completion", version = "=0.4.0" }
-ide-db = { path = "../analyzed-ra-ide-db", package = "analyzed-ra-ide-db", version = "=0.4.0" }
-ide-diagnostics = { path = "../analyzed-ra-ide-diagnostics", package = "analyzed-ra-ide-diagnostics", version = "=0.4.0" }
-ide-ssr = { path = "../analyzed-ra-ide-ssr", package = "analyzed-ra-ide-ssr", version = "=0.4.0" }
+ide-assists = { path = "../analyzed-ra-ide-assists", package = "analyzed-ra-ide-assists", version = "=0.4.1" }
+ide-completion = { path = "../analyzed-ra-ide-completion", package = "analyzed-ra-ide-completion", version = "=0.4.1" }
+ide-db = { path = "../analyzed-ra-ide-db", package = "analyzed-ra-ide-db", version = "=0.4.1" }
+ide-diagnostics = { path = "../analyzed-ra-ide-diagnostics", package = "analyzed-ra-ide-diagnostics", version = "=0.4.1" }
+ide-ssr = { path = "../analyzed-ra-ide-ssr", package = "analyzed-ra-ide-ssr", version = "=0.4.1" }
 itertools = { version = "0.14.0" }
 macros = { version = "=0.0.340", package = "ra_ap_macros" }
 nohash-hasher = { version = "0.2.0" }
