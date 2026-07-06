@@ -30,7 +30,7 @@ We keep our modifications to the upstream code minimal. Copying large blocks of 
 - Don't alter upstream execution flow or response timing to avoid duplication. The external behavior must stay identical to upstream.
 - Injected names carry no ownership markers. A replacement keeps the upstream name; a new item takes a name in upstream style, checked for collisions; an owned module whose name clashes with an upstream file takes a `shared_` prefix. The patch declarations in `build.rs` are the authoritative list of injection points.
 
-Patches apply in order; an earlier rename changes what later anchors resolve. Don't edit generated files. Fix the patch source and rebuild. When bumping the upstream pin, update the whole `ra_ap_*` family together and let the build derive and verify the version identity; there is no manual version mapping. The release facts (target matrix, runners, build flags, PGO setup, packaging) live in `xtask`'s target table, and the release workflow derives its job matrix from `cargo xtask matrix`. They mirror the upstream release configuration; nothing syncs them to upstream automatically, so reconcile them in the same bump.
+Patches apply in order; an earlier rename changes what later anchors resolve. Don't edit generated files. Fix the patch source and rebuild. When bumping the upstream pin, update the whole `ra_ap_*` family together with the `[package.metadata.upstream]` release and tag pins, and mirror upstream workspace dependency changes in the bridge manifests; the build derives and verifies the version identity, there is no manual version mapping. The release facts (target matrix, runners, build flags, PGO setup, packaging) live in `xtask`'s target table, and the release workflow derives its job matrix from `cargo xtask matrix`. They mirror the upstream release configuration; nothing syncs them to upstream automatically, so reconcile them in the same bump.
 
 ## Platform & IPC
 
@@ -63,6 +63,10 @@ The workspace has several crates under `crates/`. The ones relevant for most cha
 The remaining `analyzed-ra*` crates are the bridge crates that mirror one `ra_ap_*` upstream crate each. Their `build.rs` patches the upstream source and re-exports the result. The crate name tells you which upstream layer it wraps (e.g., `analyzed-ra-ide-db` wraps `ra_ap_ide_db`).
 
 `xtask` at the workspace root is the release tooling: `cargo xtask dist` builds and packages the release artifact for one target, taking `--training-dir` for PGO targets; `cargo xtask matrix` prints the CI job matrix from the same target table.
+
+## Release
+
+Ship a version by bumping every crate to the same number (including the internal `=x.y.z` cross-dependency pins) and pushing the `vX.Y.Z` tag. CI builds the targets and creates a draft release; publishing the draft triggers `publish.yml`, which uploads all crates to crates.io through Trusted Publishing. The publish job is idempotent — it skips versions that are already live — so re-running it (or dispatching it with the tag as input) resumes an interrupted upload.
 
 ## Workflow
 
