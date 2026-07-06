@@ -118,22 +118,38 @@ fn rust_analyzer_release(revision: &str) -> Result<(String, String), Box<dyn Err
         .new_agent();
 
     let tag = rust_analyzer_release_tag(&agent, revision)?;
-    let release = github_get(
+    let runs = github_get(
         &agent,
-        &format!("/repos/{RA_REPOSITORY}/releases/tags/{tag}"),
+        &format!(
+            "/repos/{RA_REPOSITORY}/actions/workflows/release.yaml/runs\
+             ?head_sha={revision}&branch=release&status=success"
+        ),
     )?;
-    let body = release
-        .get("body")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("rust-analyzer release has no body")?;
-    if release_commit(body) != Some(revision) {
-        return Err(
-            format!("rust-analyzer release {tag} does not describe commit {revision}").into(),
-        );
-    }
-    let version = release_version(body).ok_or("rust-analyzer release has no extension version")?;
+    let numbers = runs
+        .get("workflow_runs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("GitHub workflow runs response has no workflow_runs array")?
+        .iter()
+        .filter_map(|run| run.get("run_number")?.as_u64())
+        .collect::<Vec<_>>();
 
-    Ok((version.to_owned(), tag))
+    match numbers.as_slice() {
+        [number] => Ok((format!("v0.3.{number}"), tag)),
+        [] => Err(GithubUnavailable(format!(
+            "no release workflow run records commit {revision}; GitHub retains run history \
+             for about 400 days"
+        ))
+        .into()),
+        numbers => Err(format!(
+            "multiple release workflow runs record commit {revision}: {}",
+            numbers
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .into()),
+    }
 }
 
 fn rust_analyzer_release_tag(
@@ -206,30 +222,6 @@ fn github_get(agent: &ureq::Agent, path: &str) -> Result<serde_json::Value, Box<
     Ok(serde_json::from_str(
         &response.body_mut().read_to_string()?,
     )?)
-}
-
-fn release_commit(body: &str) -> Option<&str> {
-    body.lines()
-        .find(|line| line.starts_with("Commit: "))
-        .and_then(|line| line.split_once("/commit/"))
-        .and_then(|(_, revision)| revision.split(')').next())
-}
-
-fn release_version(body: &str) -> Option<&str> {
-    let line = body.lines().find(|line| line.starts_with("Release: "))?;
-    let (_, version) = line.rsplit_once(" (`")?;
-    let (version, _) = version.split_once("`)")?;
-    let mut parts = version.strip_prefix('v')?.split('.');
-    let parts = (parts.next()?, parts.next()?, parts.next()?, parts.next());
-    if parts.3.is_none()
-        && [parts.0, parts.1, parts.2]
-            .into_iter()
-            .all(|part| part.parse::<u64>().is_ok())
-    {
-        Some(version)
-    } else {
-        None
-    }
 }
 
 fn write_root_module(root_rs: &Path, lib_rs: &Path) -> Result<(), Box<dyn Error>> {
