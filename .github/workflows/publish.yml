@@ -3,6 +3,11 @@ name: publish
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish
+        required: true
 
 jobs:
   crates:
@@ -15,9 +20,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Install Rust toolchain
         run: rustup update --no-self-update stable
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
 
       - name: Authenticate with crates.io
         id: auth
