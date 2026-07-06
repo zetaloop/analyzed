@@ -194,4 +194,6 @@ jobs:
 
       - name: Create the draft release
         if: steps.tag.outputs.tag != '' && (github.event_name == 'push' || inputs.mode == 'draft')
-        run: gh release create "${{ steps.tag.outputs.tag }}" dist/* --verify-tag --draft --title "${{ steps.tag.outputs.tag }}" --notes "${{ steps.notes.outputs.notes }}"
+        env:
+          NOTES: ${{ steps.notes.outputs.notes }}
+        run: gh release create "${{ steps.tag.outputs.tag }}" dist/* --verify-tag --draft --title "${{ steps.tag.outputs.tag }}" --notes "$NOTES"
