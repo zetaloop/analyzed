@@ -22,20 +22,20 @@ in-rust-tree = []
 analyzed-bridge = { path = "../analyzed-bridge", version = "=0.4.1" }
 
 [dependencies]
-cfg = { version = "=0.0.340", package = "ra_ap_cfg", features = ["tt", "syntax"] }
+cfg = { version = "=0.0.341", package = "ra_ap_cfg", features = ["tt", "syntax"] }
 cov-mark = { version = "2.0.0" }
 either = { version = "1.15.0" }
-hir = { version = "=0.0.340", package = "ra_ap_hir" }
+hir = { version = "=0.0.341", package = "ra_ap_hir" }
 ide-db = { path = "../analyzed-ra-ide-db", package = "analyzed-ra-ide-db", version = "=0.4.1" }
-itertools = { version = "0.14.0" }
-paths = { version = "=0.0.340", package = "ra_ap_paths" }
+itertools = { version = "0.15.0" }
+paths = { version = "=0.0.341", package = "ra_ap_paths" }
 serde_json = { version = "1.0.140" }
-stdx = { version = "=0.0.340", package = "ra_ap_stdx" }
-syntax = { version = "=0.0.340", package = "ra_ap_syntax" }
+stdx = { version = "=0.0.341", package = "ra_ap_stdx" }
+syntax = { version = "=0.0.341", package = "ra_ap_syntax" }
 tracing = { version = "0.1.41", features = ["std"], default-features = false }
 
 [target.'cfg(any())'.dependencies]
-ra_ap_ide_diagnostics = "=0.0.340"
+ra_ap_ide_diagnostics = "=0.0.341"
 
 [lints.clippy]
 assigning_clones = "allow"

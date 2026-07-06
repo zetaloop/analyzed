@@ -23,14 +23,14 @@ analyzed-bridge = { path = "../analyzed-bridge", version = "=0.4.1" }
 
 [dependencies]
 cov-mark = { version = "2.0.0" }
-hir = { version = "=0.0.340", package = "ra_ap_hir" }
+hir = { version = "=0.0.341", package = "ra_ap_hir" }
 ide-db = { path = "../analyzed-ra-ide-db", package = "analyzed-ra-ide-db", version = "=0.4.1" }
-itertools = { version = "0.14.0" }
-parser = { version = "=0.0.340", package = "ra_ap_parser" }
-syntax = { version = "=0.0.340", package = "ra_ap_syntax" }
+itertools = { version = "0.15.0" }
+parser = { version = "=0.0.341", package = "ra_ap_parser" }
+syntax = { version = "=0.0.341", package = "ra_ap_syntax" }
 
 [target.'cfg(any())'.dependencies]
-ra_ap_ide_ssr = "=0.0.340"
+ra_ap_ide_ssr = "=0.0.341"
 
 [lints.clippy]
 assigning_clones = "allow"

@@ -15,7 +15,7 @@ anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 ra_ap_rust-analyzer.workspace = true
-project_model = { version = "=0.0.340", package = "ra_ap_project_model" }
+project_model = { version = "=0.0.341", package = "ra_ap_project_model" }
 
 [features]
 mimalloc = ["ra_ap_rust-analyzer/mimalloc"]

@@ -22,43 +22,43 @@ analyzed-bridge = { path = "../analyzed-bridge", version = "=0.4.1" }
 
 [dependencies]
 arrayvec = { version = "0.7.6" }
-cfg = { version = "=0.0.340", package = "ra_ap_cfg", features = ["tt", "syntax"] }
+cfg = { version = "=0.0.341", package = "ra_ap_cfg", features = ["tt", "syntax"] }
 cov-mark = { version = "2.0.0" }
 dot = { version = "0.1.4" }
 either = { version = "1.15.0" }
-hir = { version = "=0.0.340", package = "ra_ap_hir" }
+hir = { version = "=0.0.341", package = "ra_ap_hir" }
 ide-assists = { path = "../analyzed-ra-ide-assists", package = "analyzed-ra-ide-assists", version = "=0.4.1" }
 ide-completion = { path = "../analyzed-ra-ide-completion", package = "analyzed-ra-ide-completion", version = "=0.4.1" }
 ide-db = { path = "../analyzed-ra-ide-db", package = "analyzed-ra-ide-db", version = "=0.4.1" }
 ide-diagnostics = { path = "../analyzed-ra-ide-diagnostics", package = "analyzed-ra-ide-diagnostics", version = "=0.4.1" }
 ide-ssr = { path = "../analyzed-ra-ide-ssr", package = "analyzed-ra-ide-ssr", version = "=0.4.1" }
-itertools = { version = "0.14.0" }
-macros = { version = "=0.0.340", package = "ra_ap_macros" }
+itertools = { version = "0.15.0" }
+macros = { version = "=0.0.341", package = "ra_ap_macros" }
 nohash-hasher = { version = "0.2.0" }
 oorandom = { version = "11.1.5" }
-profile = { version = "=0.0.340", package = "ra_ap_profile" }
+profile = { version = "=0.0.341", package = "ra_ap_profile" }
 pulldown-cmark = { version = "0.9.6", default-features = false }
 pulldown-cmark-to-cmark = { version = "10.0.4" }
 rustc-hash = { version = "2.1.1" }
 rustc_apfloat = { version = "0.2.3" }
 smallvec = { version = "1.15.1", features = ["const_new", "union", "const_generics"] }
-span = { version = "=0.0.340", package = "ra_ap_span" }
-stdx = { version = "=0.0.340", package = "ra_ap_stdx" }
-syntax = { version = "=0.0.340", package = "ra_ap_syntax" }
+span = { version = "=0.0.341", package = "ra_ap_span" }
+stdx = { version = "=0.0.341", package = "ra_ap_stdx" }
+syntax = { version = "=0.0.341", package = "ra_ap_syntax" }
 tracing = { version = "0.1.41", features = ["std"], default-features = false }
 triomphe = { version = "0.1.14", features = ["std"], default-features = false }
 url = { version = "2.5.4" }
 
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "emscripten")))'.dependencies]
-toolchain = { version = "=0.0.340", package = "ra_ap_toolchain" }
+toolchain = { version = "=0.0.341", package = "ra_ap_toolchain" }
 
 [dev-dependencies]
 expect-test = "1.5.1"
-test-fixture = { version = "=0.0.340", package = "ra_ap_test_fixture" }
-test-utils = { version = "=0.0.340", package = "ra_ap_test_utils" }
+test-fixture = { version = "=0.0.341", package = "ra_ap_test_fixture" }
+test-utils = { version = "=0.0.341", package = "ra_ap_test_utils" }
 
 [target.'cfg(any())'.dependencies]
-ra_ap_ide = "=0.0.340"
+ra_ap_ide = "=0.0.341"
 
 [lints.clippy]
 assigning_clones = "allow"

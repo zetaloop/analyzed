@@ -8,7 +8,7 @@ description = "Build-time patching support for analyzed rust-analyzer bridge cra
 
 [dependencies]
 flate2 = "1.1.9"
-ra_ap_syntax = "=0.0.340"
+ra_ap_syntax = "=0.0.341"
 serde_json.workspace = true
 sha2 = "0.11.0"
 tar = "0.4.46"
