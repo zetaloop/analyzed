@@ -19,16 +19,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         .git_revision
         .as_deref()
         .ok_or("ra_ap_rust-analyzer does not contain .cargo_vcs_info.json")?;
-    let pinned = pinned_upstream_release()?;
+    let pinned = pinned_upstream("release")?;
+    let pinned_tag = pinned_upstream("tag")?;
     let release = if offline_build() {
         pinned
     } else {
         match rust_analyzer_release(revision) {
-            Ok(release) => {
+            Ok((release, tag)) => {
                 if release != pinned {
                     return Err(format!(
                         "[package.metadata.upstream] release is {pinned}, but the rust-analyzer \
                          release for commit {revision} is {release}"
+                    )
+                    .into());
+                }
+                if tag != pinned_tag {
+                    return Err(format!(
+                        "[package.metadata.upstream] tag is {pinned_tag}, but the rust-analyzer \
+                         release tag for commit {revision} is {tag}"
                     )
                     .into());
                 }
@@ -74,17 +82,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn pinned_upstream_release() -> Result<String, Box<dyn Error>> {
+fn pinned_upstream(key: &str) -> Result<String, Box<dyn Error>> {
     let manifest_path = Path::new(&env::var("CARGO_MANIFEST_DIR")?).join("Cargo.toml");
     let manifest: toml::Table = toml::from_str(&fs::read_to_string(manifest_path)?)?;
     manifest
         .get("package")
         .and_then(|value| value.get("metadata"))
         .and_then(|value| value.get("upstream"))
-        .and_then(|value| value.get("release"))
+        .and_then(|value| value.get(key))
         .and_then(toml::Value::as_str)
         .map(ToOwned::to_owned)
-        .ok_or_else(|| "Cargo.toml lacks a [package.metadata.upstream] release".into())
+        .ok_or_else(|| format!("Cargo.toml lacks a [package.metadata.upstream] {key}").into())
 }
 
 fn offline_build() -> bool {
@@ -103,7 +111,7 @@ impl fmt::Display for GithubUnavailable {
 
 impl Error for GithubUnavailable {}
 
-fn rust_analyzer_release(revision: &str) -> Result<String, Box<dyn Error>> {
+fn rust_analyzer_release(revision: &str) -> Result<(String, String), Box<dyn Error>> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(30)))
         .build()
@@ -125,7 +133,7 @@ fn rust_analyzer_release(revision: &str) -> Result<String, Box<dyn Error>> {
     }
     let version = release_version(body).ok_or("rust-analyzer release has no extension version")?;
 
-    Ok(version.to_owned())
+    Ok((version.to_owned(), tag))
 }
 
 fn rust_analyzer_release_tag(

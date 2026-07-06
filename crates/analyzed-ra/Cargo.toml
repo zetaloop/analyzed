@@ -10,6 +10,7 @@ build = "build.rs"
 
 [package.metadata.upstream]
 release = "v0.3.2955"
+tag = "2026-06-29"
 
 [lib]
 name = "ra_ap_rust_analyzer"

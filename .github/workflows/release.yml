@@ -177,6 +177,21 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
+      - name: Compose the release notes
+        id: notes
+        run: |
+          release=$(sed -n 's/^release = "\(.*\)"/\1/p' crates/analyzed-ra/Cargo.toml)
+          tag=$(sed -n 's/^tag = "\(.*\)"/\1/p' crates/analyzed-ra/Cargo.toml)
+          tar -xzf dist/analyzed-x86_64-unknown-linux-gnu-*.tar.gz -C "$RUNNER_TEMP"
+          reported=$("$RUNNER_TEMP/analyzed" --version)
+          case "$reported" in
+            *"rust-analyzer $release "*) ;;
+            *) echo "the artifact reports '$reported' but the manifest pins $release" >&2; exit 1 ;;
+          esac
+          commit=${reported##* }
+          commit=${commit%)}
+          echo "notes=- Built on [rust-analyzer $release (\`$commit\`)](https://github.com/rust-lang/rust-analyzer/releases/$tag)" >> "$GITHUB_OUTPUT"
+
       - name: Create the draft release
         if: steps.tag.outputs.tag != '' && (github.event_name == 'push' || inputs.mode == 'draft')
-        run: gh release create "${{ steps.tag.outputs.tag }}" dist/* --verify-tag --draft --title "${{ steps.tag.outputs.tag }}"
+        run: gh release create "${{ steps.tag.outputs.tag }}" dist/* --verify-tag --draft --title "${{ steps.tag.outputs.tag }}" --notes "${{ steps.notes.outputs.notes }}"
