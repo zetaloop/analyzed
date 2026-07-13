@@ -210,7 +210,7 @@ pub fn set_visibility<N: VisibilityHost>(
             Position::before(item.visibility_slot()?),
             vec![
                 visibility_node(visibility)?.syntax().clone().into(),
-                make::tokens::single_space().into(),
+                make::tokens::whitespace(" ").into(),
             ],
         );
     }
@@ -288,7 +288,7 @@ impl ListHost for ast::Struct {
                 .clone()
                 .into(),
                 make::token(SyntaxKind::COMMA).into(),
-                make::tokens::single_newline().into(),
+                make::tokens::whitespace("\n").into(),
             ]);
         }
         editor.insert_all(Position::before(close), elements);
@@ -339,7 +339,7 @@ impl ListHost for ast::Fn {
         for item in items {
             elements.extend([
                 make::token(SyntaxKind::COMMA).into(),
-                make::tokens::single_space().into(),
+                make::tokens::whitespace(" ").into(),
                 make::param(
                     make::ident_pat(false, false, make::name(item.name)).into(),
                     make::ty(item.ty),
@@ -472,7 +472,7 @@ pub fn add_rest_pattern(
             Position::after(last.syntax()),
             vec![
                 make::token(SyntaxKind::COMMA).into(),
-                make::tokens::single_space().into(),
+                make::tokens::whitespace(" ").into(),
                 make::rest_pat().syntax().clone().into(),
             ],
         );
@@ -543,7 +543,7 @@ pub fn add_use(
         Position::before(&anchor),
         vec![
             item.syntax().clone().into(),
-            make::tokens::single_newline().into(),
+            make::tokens::whitespace("\n").into(),
         ],
     );
     commit(source, editor)
