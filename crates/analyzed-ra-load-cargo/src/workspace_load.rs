@@ -18,6 +18,7 @@ pub fn load_workspace_change(
     ws: ProjectWorkspace,
     extra_env: &FxHashMap<String, Option<String>>,
     load_config: &LoadCargoConfig,
+    proc_macro_server: Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
     mut allocate_file_id: impl FnMut(FileId) -> FileId,
 ) -> anyhow::Result<WorkspaceLoad> {
     let (sender, receiver) = unbounded();
@@ -29,7 +30,6 @@ pub fn load_workspace_change(
     let mut file_id_map = FxHashMap::default();
 
     tracing::debug!(?load_config, "LoadCargoConfig");
-    let proc_macro_server = spawn_proc_macro_server(&ws, extra_env, load_config);
     log_proc_macro_server(&ws, &proc_macro_server);
 
     let (crate_graph, proc_macros) = ws.to_crate_graph(
@@ -134,44 +134,6 @@ pub(crate) fn load_crate_graph_into_db(
     );
     db.enable_proc_attr_macros();
     db.apply_change(analysis_change);
-}
-
-fn spawn_proc_macro_server(
-    workspace: &ProjectWorkspace,
-    extra_env: &FxHashMap<String, Option<String>>,
-    load_config: &LoadCargoConfig,
-) -> Option<Result<ProcMacroClient, ProcMacroLoadingError>> {
-    match &load_config.with_proc_macro_server {
-        ProcMacroServerChoice::Sysroot => workspace
-            .find_sysroot_proc_macro_srv()
-            .map(|result| {
-                result
-                    .and_then(|path| {
-                        ProcMacroClient::spawn(
-                            &path,
-                            extra_env,
-                            workspace.toolchain.as_ref(),
-                            load_config.proc_macro_processes,
-                        )
-                        .map_err(Into::into)
-                    })
-                    .map_err(proc_macro_loading_error)
-            }),
-        ProcMacroServerChoice::Explicit(path) => Some(
-            ProcMacroClient::spawn(
-                path,
-                extra_env,
-                workspace.toolchain.as_ref(),
-                load_config.proc_macro_processes,
-            )
-            .map_err(proc_macro_loading_error),
-        ),
-        ProcMacroServerChoice::None => Some(Err(ProcMacroLoadingError::Disabled)),
-    }
-}
-
-fn proc_macro_loading_error(error: impl ToString) -> ProcMacroLoadingError {
-    ProcMacroLoadingError::ProcMacroSrvError(error.to_string().into_boxed_str())
 }
 
 fn log_proc_macro_server(

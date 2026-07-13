@@ -14,7 +14,8 @@
 	    FxHashMap,
 	    base_db::{
 	        CrateGraphBuilder, DependencyBuilder, FileSet, LibraryRoots, LocalRoots,
-	        ProcMacroPaths, SourceDatabase, SourceRoot, SourceRootId, all_crates,
+	        ProcMacroLoadingError, ProcMacroPaths, SourceDatabase, SourceRoot, SourceRootId,
+	        all_crates,
 	        salsa::{Durability, Setter as _},
 	    },
 	};
@@ -475,7 +476,15 @@ impl SharedAnalyzerRegistry {
         };
 
         if leader {
-            let result = SharedWorld::prepare_workspace_load(source, config)
+            let result = world
+                .lock()
+                .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))
+                .map(|world| {
+                    world.proc_macro_clients(reload.then_some(registry_load_key.project.as_str()))
+                })
+                .and_then(|proc_macro_clients| {
+                    SharedWorld::prepare_workspace_load(source, config, &proc_macro_clients)
+                })
                 .and_then(|loaded| {
                     let access = world
                         .lock()
@@ -1927,6 +1936,8 @@ impl LoadedWorkspaceFiles {
     }
 }
 
+type ProcMacroSpawnKey = (AbsPathBuf, Option<semver::Version>, FxHashMap<String, Option<String>>);
+
 struct LoadedWorkspace {
     summary: WorkspaceSummary,
     workspace: ProjectWorkspace,
@@ -1934,7 +1945,7 @@ struct LoadedWorkspace {
     _vfs: Arc<LoadedWorkspaceFiles>,
     line_endings: Arc<BTreeMap<FileId, crate::line_index::LineEndings>>,
     source_root_parent_map: FxHashMap<SourceRootId, SourceRootId>,
-    _proc_macro_client: Option<ProcMacroClient>,
+    proc_macro_client: Option<(ProcMacroSpawnKey, ProcMacroClient)>,
 }
 
 impl LoadedWorkspace {
@@ -1949,6 +1960,42 @@ struct PreparedWorkspaceLoad {
     workspace: ProjectWorkspace,
     loaded: WorkspaceLoad,
     line_endings: BTreeMap<FileId, crate::line_index::LineEndings>,
+    proc_macro_spawn: Option<ProcMacroSpawnKey>,
+}
+
+// Workspaces referring to the same proc-macro server executable (i.e. the same
+// sysroot) with an identical spawn environment share a single client, and thereby
+// a single set of server processes.
+fn spawn_proc_macro_server(
+    workspace: &ProjectWorkspace,
+    extra_env: &FxHashMap<String, Option<String>>,
+    load_config: &LoadCargoConfig,
+    clients: &[(ProcMacroSpawnKey, ProcMacroClient)],
+) -> Option<Result<(ProcMacroSpawnKey, ProcMacroClient), ProcMacroLoadingError>> {
+    let path = match &load_config.with_proc_macro_server {
+        ProcMacroServerChoice::Sysroot => match workspace.find_sysroot_proc_macro_srv()? {
+            Ok(path) => path,
+            Err(error) => return Some(Err(proc_macro_loading_error(error))),
+        },
+        ProcMacroServerChoice::Explicit(path) => path.clone(),
+        ProcMacroServerChoice::None => return Some(Err(ProcMacroLoadingError::Disabled)),
+    };
+
+    let key = (path, workspace.toolchain.clone(), extra_env.clone());
+    if let Some((_, client)) = clients.iter().find(|(k, _)| *k == key) {
+        return Some(Ok((key, client.clone())));
+    }
+
+    let (path, toolchain, env) = &key;
+    Some(
+        ProcMacroClient::spawn(path, env, toolchain.as_ref(), load_config.proc_macro_processes)
+            .map(|client| (key.clone(), client))
+            .map_err(proc_macro_loading_error),
+    )
+}
+
+fn proc_macro_loading_error(error: impl ToString) -> ProcMacroLoadingError {
+    ProcMacroLoadingError::ProcMacroSrvError(error.to_string().into_boxed_str())
 }
 
 pub struct SharedWorld {
@@ -1992,6 +2039,19 @@ impl SharedWorld {
         self.workspace_indexes.get(load_key).copied()
     }
 
+    fn proc_macro_clients(
+        &self,
+        excluded_load_key: Option<&str>,
+    ) -> Vec<(ProcMacroSpawnKey, ProcMacroClient)> {
+        let excluded = excluded_load_key.and_then(|load_key| self.workspace_index(load_key));
+        self.loaded_workspaces
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != excluded)
+            .filter_map(|(_, workspace)| workspace.proc_macro_client.clone())
+            .collect()
+    }
+
     fn access(&self) -> Arc<SharedWorldAccess> {
         Arc::clone(&self.access)
     }
@@ -1999,6 +2059,7 @@ impl SharedWorld {
     fn prepare_workspace_load(
         source: SharedAnalyzerWorkspaceLoadSource,
         config: &SharedAnalyzerConfig,
+        proc_macro_clients: &[(ProcMacroSpawnKey, ProcMacroClient)],
     ) -> anyhow::Result<PreparedWorkspaceLoad> {
         match source {
             SharedAnalyzerWorkspaceLoadSource::Project(project) => {
@@ -2011,7 +2072,7 @@ impl SharedWorld {
                         ProjectWorkspace::load_inline(project, &config.cargo_config, &|_| {})
                     }
                 };
-                Self::prepare_loaded_workspace(load_key, workspace, config)
+                Self::prepare_loaded_workspace(load_key, workspace, config, proc_macro_clients)
             }
             SharedAnalyzerWorkspaceLoadSource::DetachedFile(file) => {
                 let load_key = shared_detached_file_key(&file);
@@ -2022,7 +2083,7 @@ impl SharedWorld {
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow::format_err!("detached file did not produce a workspace"))??;
-                Self::prepare_loaded_workspace(load_key, workspace, config)
+                Self::prepare_loaded_workspace(load_key, workspace, config, proc_macro_clients)
             }
         }
     }
@@ -2031,6 +2092,7 @@ impl SharedWorld {
         load_key: String,
         mut workspace: ProjectWorkspace,
         config: &SharedAnalyzerConfig,
+        proc_macro_clients: &[(ProcMacroSpawnKey, ProcMacroClient)],
     ) -> anyhow::Result<PreparedWorkspaceLoad> {
         let manifest_path = workspace
             .manifest()
@@ -2042,11 +2104,23 @@ impl SharedWorld {
             let build_scripts = workspace.run_build_scripts(&config.cargo_config, &|_| {})?;
             workspace.set_build_scripts(build_scripts);
         }
+        let load_config = config.load.to_load_cargo_config();
+        let (proc_macro_spawn, proc_macro_server) = match spawn_proc_macro_server(
+            &workspace,
+            &config.cargo_config.extra_env,
+            &load_config,
+            proc_macro_clients,
+        ) {
+            Some(Ok((key, client))) => (Some(key), Some(Ok(client))),
+            Some(Err(error)) => (None, Some(Err(error))),
+            None => (None, None),
+        };
         let workspace_for_session = workspace.clone();
         let loaded = load_workspace_change(
             workspace,
             &config.cargo_config.extra_env,
-            &config.load.to_load_cargo_config(),
+            &load_config,
+            proc_macro_server,
             |_| allocate_shared_file_id(),
         )?;
         let files = loaded.vfs.iter().count();
@@ -2073,6 +2147,7 @@ impl SharedWorld {
             workspace: workspace_for_session,
             loaded,
             line_endings,
+            proc_macro_spawn,
         })
     }
 
@@ -2157,7 +2232,9 @@ impl SharedWorld {
                 _vfs: Arc::new(files),
                 line_endings,
                 source_root_parent_map,
-                _proc_macro_client: loaded.loaded.proc_macro_server,
+                proc_macro_client: loaded
+                    .proc_macro_spawn
+                    .zip(loaded.loaded.proc_macro_server),
             },
             file_texts,
         )
