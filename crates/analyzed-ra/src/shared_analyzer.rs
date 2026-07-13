@@ -25,7 +25,7 @@
 	};
 	use lsp_types::Uri;
 	use proc_macro_api::ProcMacroClient;
-	use project_model::{CargoConfig, ManifestPath, ProjectWorkspace};
+	use project_model::{CargoConfig, ManifestPath, ProjectWorkspace, ProjectWorkspaceKind};
 	use serde::Serialize;
 	use vfs::{AbsPathBuf, Vfs, VfsPath};
 
@@ -1981,7 +1981,29 @@ fn spawn_proc_macro_server(
         ProcMacroServerChoice::None => return Some(Err(ProcMacroLoadingError::Disabled)),
     };
 
-    let key = (path, workspace.toolchain.clone(), extra_env.clone());
+    let env: FxHashMap<_, _> = match &workspace.kind {
+        ProjectWorkspaceKind::Cargo { cargo, .. }
+        | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, ..)), .. } => cargo
+            .env()
+            .into_iter()
+            .map(|(k, v)| (k.clone(), Some(v.clone())))
+            .chain(extra_env.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .chain(
+                workspace
+                    .sysroot
+                    .root()
+                    .filter(|_| {
+                        !extra_env.contains_key("RUSTUP_TOOLCHAIN")
+                            && env::var_os("RUSTUP_TOOLCHAIN").is_none()
+                    })
+                    .map(|it| ("RUSTUP_TOOLCHAIN".to_owned(), Some(it.to_string()))),
+            )
+            .collect(),
+
+        _ => Default::default(),
+    };
+
+    let key = (path, workspace.toolchain.clone(), env);
     if let Some((_, client)) = clients.iter().find(|(k, _)| *k == key) {
         return Some(Ok((key, client.clone())));
     }
