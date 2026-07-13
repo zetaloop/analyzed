@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::Context;
 use flate2::{Compression, write::GzEncoder};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, PrimitiveDateTime};
 use xshell::{Cmd, Shell, cmd};
 use zip::{DateTime, ZipWriter, write::SimpleFileOptions};
 
@@ -249,10 +249,10 @@ fn tar_gz(server_path: &Path, dest_path: &Path) -> anyhow::Result<()> {
 fn zip(server_path: &Path, symbols_path: &Path, dest_path: &Path) -> anyhow::Result<()> {
     let mut writer = ZipWriter::new(BufWriter::new(File::create(dest_path)?));
     for (path, executable) in [(server_path, true), (symbols_path, false)] {
+        let modified = OffsetDateTime::from(fs::metadata(path)?.modified()?);
+        let modified = PrimitiveDateTime::new(modified.date(), modified.time());
         let mut options = SimpleFileOptions::default()
-            .last_modified_time(DateTime::try_from(OffsetDateTime::from(
-                fs::metadata(path)?.modified()?,
-            ))?)
+            .last_modified_time(DateTime::try_from(modified)?)
             .compression_method(zip::CompressionMethod::Deflated)
             .compression_level(Some(9));
         if executable {
