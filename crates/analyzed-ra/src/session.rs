@@ -220,7 +220,8 @@ impl crate::global_state::GlobalState {
                 }
 
                 if !file_is_created_or_deleted
-                    && !self.mem_docs.contains(&vfs_path)
+                    && (!self.mem_docs.contains(&vfs_path)
+                        || self.source_root_config.path_is_library(&vfs_path))
                     && let Some(text) = text
                     && let Some(&line_endings) = line_endings_map.get(&file.file_id)
                 {
@@ -242,6 +243,7 @@ impl crate::global_state::GlobalState {
             let open_files = self
                 .mem_docs
                 .iter()
+                .filter(|path| !self.source_root_config.path_is_library(path))
                 .filter_map(|path| {
                     let doc = self.mem_docs.get(path)?;
                     let text = std::str::from_utf8(&doc.data).ok()?.to_owned();

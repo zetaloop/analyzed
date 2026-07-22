@@ -20,19 +20,25 @@ pub(crate) fn handle_did_save_text_document(
     params: DidSaveTextDocumentParams,
 ) -> anyhow::Result<()> {
     if let Ok(vfs_path) = from_proto::vfs_path(&params.text_document.uri) {
-        let saved = state
-            .mem_docs
-            .get(&vfs_path)
-            .and_then(|document| std::str::from_utf8(&document.data).ok())
-            .map(|text| LineEndings::normalize(text.to_owned()));
-        if let Some((text, line_endings)) = saved {
-            state
-                .shared
-                .apply_base_file_changes(vec![SharedBaseFileChange {
-                    path: vfs_path.clone(),
-                    text,
-                    line_endings,
-                }])?;
+        if state.source_root_config.path_is_library(&vfs_path) {
+            if let Some(path) = vfs_path.as_path() {
+                state.loader.handle.invalidate(path.to_path_buf());
+            }
+        } else {
+            let saved = state
+                .mem_docs
+                .get(&vfs_path)
+                .and_then(|document| std::str::from_utf8(&document.data).ok())
+                .map(|text| LineEndings::normalize(text.to_owned()));
+            if let Some((text, line_endings)) = saved {
+                state
+                    .shared
+                    .apply_base_file_changes(vec![SharedBaseFileChange {
+                        path: vfs_path.clone(),
+                        text,
+                        line_endings,
+                    }])?;
+            }
         }
 
         let snap = state.snapshot();
@@ -114,12 +120,10 @@ pub(crate) fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
                     // have this problem. Remove the line below when triomphe::Arc has an UnwindSafe impl
                     // like std::sync::Arc's.
                     let world = world;
-                    stdx::always!(
-                        world.flycheck.len() == 1,
-                        "should have exactly one flycheck handle when invocation strategy is once"
-                    );
                     let saved_file = vfs_path.as_path().map(ToOwned::to_owned);
-                    world.flycheck[0].restart_workspace(saved_file);
+                    if let Some(flycheck) = world.flycheck.first() {
+                        flycheck.restart_workspace(saved_file);
+                    }
                     Ok(())
                 }),
                 InvocationStrategy::PerWorkspace => Box::new(move || {
