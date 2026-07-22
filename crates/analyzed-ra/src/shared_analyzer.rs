@@ -1420,6 +1420,28 @@ impl SharedAnalyzerRuntime {
             .source_root_for_path(self.workspace_indexes(), path)
     }
 
+    pub(crate) fn apply_base_file_changes(
+        &self,
+        files: Vec<SharedBaseFileChange>,
+    ) -> anyhow::Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let _write = self.session.access.write(Some(self.session_id()));
+        let mut world = self
+            .world
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
+        let changed = world.apply_base_file_changes(self.workspace_indexes(), files);
+        if changed
+            && let Some(gc) = &self.session.gc {
+                gc.changed();
+            }
+        self.refresh_session_cache(&world);
+        Ok(())
+    }
+
     pub(crate) fn sync_open_files(
         &self,
         files: Vec<(
@@ -1817,6 +1839,12 @@ impl SessionOverlayCrate {
 pub(crate) struct SharedOverlaySync {
     pub(crate) changed: bool,
     pub(crate) removed_files: Vec<FileId>,
+}
+
+pub(crate) struct SharedBaseFileChange {
+    pub(crate) path: VfsPath,
+    pub(crate) text: String,
+    pub(crate) line_endings: crate::line_index::LineEndings,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2293,6 +2321,44 @@ impl SharedWorld {
         }
 
         (source_roots, change)
+    }
+
+    fn apply_base_file_changes(
+        &mut self,
+        workspaces: &[usize],
+        files: Vec<SharedBaseFileChange>,
+    ) -> bool {
+        let revision = self.host.raw_database().nonce_and_revision().1;
+        let mut change = ChangeWithProcMacros::default();
+        let mut applied = false;
+        let mut line_endings_changed = false;
+
+        for file in files {
+            let Some(file_id) = self
+                .base_file_for_vfs_path_in(workspaces, &normalize_vfs_path(&file.path))
+            else {
+                continue;
+            };
+            for workspace in &mut self.loaded_workspaces {
+                if workspace._vfs.contains_file(file_id) {
+                    line_endings_changed |= Arc::make_mut(&mut workspace.line_endings)
+                        .insert(file_id, file.line_endings)
+                        != Some(file.line_endings);
+                }
+            }
+            change.change_file(file_id, Some(file.text));
+            applied = true;
+        }
+
+        if applied {
+            self.host.apply_change(change);
+        }
+        let changed = line_endings_changed
+            || self.host.raw_database().nonce_and_revision().1 != revision;
+        if changed {
+            self.input_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        changed
     }
 
     fn apply_source_roots(&mut self, roots: Vec<SourceRoot>) {

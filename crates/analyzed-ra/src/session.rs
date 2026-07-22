@@ -15,7 +15,9 @@ use triomphe::Arc;
 use vfs::{AbsPathBuf, ChangeKind, VfsPath};
 
 use crate::{
-    shared_analyzer::{SharedAnalyzerProvider, SharedAnalyzerRuntime, patch_path_prefix},
+    shared_analyzer::{
+        SharedAnalyzerProvider, SharedAnalyzerRuntime, SharedBaseFileChange, patch_path_prefix,
+    },
     config::{Config, ConfigChange, ConfigErrors},
     from_json, server_capabilities,
     global_state::FetchWorkspaceRequest,
@@ -152,6 +154,7 @@ impl crate::global_state::GlobalState {
         let generation_changed = shared.config_generation_changed();
         let mut modified_ratoml_files = Vec::new();
         let mut workspace_structure_change = None;
+        let mut base_file_changes = Vec::new();
         let mut changed = false;
         let mut cancellation_time = None;
 
@@ -215,7 +218,24 @@ impl crate::global_state::GlobalState {
                 {
                     self.diagnostics.clear_native_for(file_id);
                 }
+
+                if !file_is_created_or_deleted
+                    && !self.mem_docs.contains(&vfs_path)
+                    && let Some(text) = text
+                    && let Some(&line_endings) = line_endings_map.get(&file.file_id)
+                {
+                    base_file_changes.push(SharedBaseFileChange {
+                        path: vfs_path,
+                        text,
+                        line_endings,
+                    });
+                }
             }
+        }
+
+        if let Err(error) = shared.apply_base_file_changes(base_file_changes) {
+            tracing::error!("failed to apply shared analyzer base file changes: {error}");
+            return (false, None);
         }
 
         if changed || generation_changed {

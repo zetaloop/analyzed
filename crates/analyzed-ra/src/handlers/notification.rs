@@ -7,8 +7,10 @@ use vfs::{ChangeKind, VfsPath};
 use crate::{
     flycheck::{InvocationStrategy, PackageSpecifier, Target},
     global_state::{FetchWorkspaceRequest, GlobalState},
+    line_index::LineEndings,
     lsp::from_proto,
     reload,
+    shared_analyzer::SharedBaseFileChange,
     target_spec::TargetSpec,
     try_default,
 };
@@ -18,6 +20,21 @@ pub(crate) fn handle_did_save_text_document(
     params: DidSaveTextDocumentParams,
 ) -> anyhow::Result<()> {
     if let Ok(vfs_path) = from_proto::vfs_path(&params.text_document.uri) {
+        let saved = state
+            .mem_docs
+            .get(&vfs_path)
+            .and_then(|document| std::str::from_utf8(&document.data).ok())
+            .map(|text| LineEndings::normalize(text.to_owned()));
+        if let Some((text, line_endings)) = saved {
+            state
+                .shared
+                .apply_base_file_changes(vec![SharedBaseFileChange {
+                    path: vfs_path.clone(),
+                    text,
+                    line_endings,
+                }])?;
+        }
+
         let snap = state.snapshot();
         let file_id = try_default!(snap.vfs_path_to_file_id(&vfs_path)?);
         let sr = snap.analysis.source_root_id(file_id)?;
