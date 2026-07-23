@@ -62,10 +62,7 @@ fn patch_search_source(search_rs: &Path) -> Result<(), Box<dyn Error>> {
 
     build_support::retarget_use(&mut source, "all_crates", "crate::visibility::all_crates")?;
     let search_scope = owned_source_path("search_scope.rs");
-    source.push_str(&format!(
-        "\n#[path = {:?}]\nmod search_scope;\n",
-        search_scope.to_string_lossy().into_owned()
-    ));
+    build_support::mount_module(&mut source, None, "search_scope", &search_scope)?;
     println!("cargo:rerun-if-changed={}", search_scope.display());
     build_support::rename::<ast::Fn>(&mut source, "reverse_dependencies", "_reverse_dependencies")?;
     build_support::add_attr::<ast::Fn>(
@@ -82,10 +79,12 @@ fn patch_symbol_index_source(symbol_index_rs: &Path) -> Result<(), Box<dyn Error
     let mut source = fs::read_to_string(symbol_index_rs)?;
 
     let world_symbols = owned_source_path("symbol_index.rs");
-    source.push_str(&format!(
-        "\n#[path = {:?}]\nmod world_symbols;\npub use world_symbols::world_symbols;\n",
-        world_symbols.to_string_lossy().into_owned()
-    ));
+    build_support::mount_module(&mut source, None, "world_symbols", &world_symbols)?;
+    build_support::add_use(
+        &mut source,
+        Some("pub"),
+        "self::world_symbols::world_symbols",
+    )?;
     println!("cargo:rerun-if-changed={}", world_symbols.display());
     build_support::rename::<ast::Fn>(&mut source, "world_symbols", "_world_symbols")?;
     build_support::add_attr::<ast::Fn>(&mut source, "_world_symbols", "#[allow(dead_code)]")?;

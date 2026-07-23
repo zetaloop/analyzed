@@ -230,19 +230,7 @@ fn write_root_module(root_rs: &Path, lib_rs: &Path) -> Result<(), Box<dyn Error>
     let shared_main_loop = owned_source_path("main_loop.rs");
     let shared_reload = owned_source_path("reload.rs");
     let shared_notification = owned_source_path("handlers/notification.rs");
-    let mut upstream_root = fs::read_to_string(lib_rs)?;
-    let handlers_start = "mod handlers {\n";
-    let insert_at = upstream_root
-        .find(handlers_start)
-        .map(|index| index + handlers_start.len())
-        .ok_or("could not find handlers module")?;
-    upstream_root.insert_str(
-        insert_at,
-        &format!(
-            "    #[path = {:?}]\n    pub(crate) mod shared_notification;\n",
-            shared_notification.to_string_lossy().into_owned()
-        ),
-    );
+    let upstream_root = fs::read_to_string(lib_rs)?;
     let source = format!(
         r#"
 #[path = {:?}]
@@ -256,6 +244,9 @@ pub(crate) mod shared_main_loop;
 
 #[path = {:?}]
 pub(crate) mod shared_reload;
+
+#[path = {:?}]
+pub(crate) mod shared_notification;
 
 {upstream_root}
 
@@ -281,6 +272,7 @@ pub use shared_analyzer::{{
         shared_global_state.to_string_lossy().into_owned(),
         shared_main_loop.to_string_lossy().into_owned(),
         shared_reload.to_string_lossy().into_owned(),
+        shared_notification.to_string_lossy().into_owned(),
         lib_rs
             .with_file_name("bin/main.rs")
             .to_string_lossy()
@@ -731,10 +723,7 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::add_use(&mut source, None, "self::session::UpstreamTask")?;
 
     let session = owned_source_path("session.rs");
-    source.push_str(&format!(
-        "\n#[path = {:?}]\npub(crate) mod session;\n",
-        session.to_string_lossy().into_owned()
-    ));
+    build_support::mount_module(&mut source, Some("pub(crate)"), "session", &session)?;
 
     fs::write(main_loop_rs, source)?;
     Ok(())
@@ -776,10 +765,7 @@ fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box
     build_support::add_attr::<ast::Fn>(&mut source, "_location", "#[allow(dead_code)]")?;
     build_support::add_use(&mut source, None, "self::flycheck_location::location")?;
     let flycheck_location = owned_source_path("diagnostics/flycheck_location.rs");
-    source.push_str(&format!(
-        "\n#[path = {:?}]\nmod flycheck_location;\n",
-        flycheck_location.to_string_lossy().into_owned()
-    ));
+    build_support::mount_module(&mut source, None, "flycheck_location", &flycheck_location)?;
     println!("cargo:rerun-if-changed={}", flycheck_location.display());
     fs::write(flycheck_to_proto_rs, source)?;
     Ok(())
@@ -793,7 +779,7 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
     build_support::add_use(
         &mut source,
         Some("pub(crate)"),
-        "crate::handlers::shared_notification::run_flycheck",
+        "crate::shared_notification::run_flycheck",
     )?;
     build_support::rename::<ast::Fn>(
         &mut source,
@@ -808,7 +794,7 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
     build_support::add_use(
         &mut source,
         Some("pub(crate)"),
-        "crate::handlers::shared_notification::handle_did_save_text_document",
+        "crate::shared_notification::handle_did_save_text_document",
     )?;
 
     fs::write(notification_rs, source)?;

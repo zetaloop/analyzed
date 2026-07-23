@@ -26,13 +26,15 @@ fn patch_load_cargo_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::add_use(&mut source, None, "vfs::file_set::FileSet")?;
 
     let workspace_load = owned_source_path("workspace_load.rs");
-    source.insert_str(
-        0,
-        &format!(
-            "#[path = {:?}]\nmod workspace_load;\npub use workspace_load::{{\n    ProcMacroLoad, WorkspaceLoad, load_workspace_change,\n}};\nuse workspace_load::load_crate_graph_into_db;\n\n",
-            workspace_load.to_string_lossy().into_owned()
-        ),
-    );
+    build_support::mount_module(&mut source, None, "workspace_load", &workspace_load)?;
+    for name in ["ProcMacroLoad", "WorkspaceLoad", "load_workspace_change"] {
+        build_support::add_use(&mut source, Some("pub"), &format!("workspace_load::{name}"))?;
+    }
+    build_support::add_use(
+        &mut source,
+        None,
+        "workspace_load::load_crate_graph_into_db",
+    )?;
     println!("cargo:rerun-if-changed={}", workspace_load.display());
 
     build_support::rename::<ast::Fn>(
