@@ -24,7 +24,7 @@ fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(lib_rs)?;
 
     let visibility = owned_source_path("visibility.rs");
-    build_support::mount_module(&mut source, None, "visibility", &visibility);
+    build_support::mount_module(&mut source, None, "visibility", &visibility)?;
     println!("cargo:rerun-if-changed={}", visibility.display());
     build_support::append::<ast::Struct>(
         &mut source,

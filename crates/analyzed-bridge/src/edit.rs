@@ -542,11 +542,6 @@ pub fn add_use(
         visibility.map(visibility_node).transpose()?,
         make::use_tree(make::path_from_text(path), None, None, false),
     );
-    let statement = item.to_string();
-    if source.contains(&statement) {
-        return Err(format!("source already contains `{statement}`").into());
-    }
-
     let (editor, root) = open(source)?;
     let anchor = root
         .children()
@@ -645,15 +640,34 @@ fn use_tree_removal(tree: &ast::UseTree) -> Vec<SyntaxElement> {
     elements
 }
 
-pub fn mount_module(source: &mut String, visibility: Option<&str>, name: &str, path: &Path) {
+pub fn mount_module(
+    source: &mut String,
+    visibility: Option<&str>,
+    name: &str,
+    path: &Path,
+) -> Result<(), Box<dyn Error>> {
     let visibility = visibility.map_or(String::new(), |visibility| format!("{visibility} "));
-    source.insert_str(
-        0,
-        &format!(
-            "#[path = {:?}]\n{visibility}mod {name};\n\n",
-            path.to_string_lossy().into_owned()
-        ),
+    let file = parse_file(&format!(
+        "#[path = {:?}]\n{visibility}mod {name};",
+        path.to_string_lossy()
+    ))?;
+    let module = one(
+        file.syntax().children().filter_map(ast::Module::cast),
+        "module in wrapper",
+    )?;
+    let (editor, root) = open(source)?;
+    let anchor = root
+        .children()
+        .find(|node| ast::Item::can_cast(node.kind()))
+        .ok_or("source has no items")?;
+    editor.insert_all(
+        Position::before(&anchor),
+        vec![
+            module.syntax().clone().into(),
+            make::tokens::whitespace("\n\n").into(),
+        ],
     );
+    commit(source, editor)
 }
 
 pub struct Param<'a> {
