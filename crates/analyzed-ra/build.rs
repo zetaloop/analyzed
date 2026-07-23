@@ -299,7 +299,6 @@ fn owned_source_path(file_name: &str) -> PathBuf {
 
 fn patch_config_source(config_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(config_rs)?;
-    source = source.replace("ra_ap_rust_analyzer", "rust_analyzer");
 
     for guard in [
         "fn generate_package_json_config() {",
@@ -815,94 +814,72 @@ fn patch_driver_source(main_rs: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn patch_test_tool_attributes(src_dir: &Path) -> Result<(), Box<dyn Error>> {
-    for relative_path in ["cli/scip.rs", "lsp/to_proto.rs"] {
-        let path = src_dir.join(relative_path);
-        let source = fs::read_to_string(&path)?;
-        let source = source
-            .replace("#[ra_ap_rust_analyzer::rust_fixture] ", "")
-            .replace("#[ra_ap_rust_analyzer::rust_fixture]", "")
-            .replace("#[rust_analyzer::rust_fixture] ", "")
-            .replace("#[rust_analyzer::rust_fixture]", "");
+fn patch_slow_tests(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
+    for name in ["main.rs", "ratoml.rs", "cli.rs", "flycheck.rs"] {
+        let path = slow_tests.join(name);
+        let mut source = fs::read_to_string(&path)?;
+        build_support::retarget_use(
+            &mut source,
+            "skip_slow_tests",
+            "crate::test_support::skip_slow_tests",
+        )?;
         fs::write(path, source)?;
     }
+
+    let support = slow_tests.join("support.rs");
+    let mut source = fs::read_to_string(&support)?;
+    build_support::rename::<ast::Fn>(&mut source, "lines_match", "_original_lines_match")?;
+    build_support::set_visibility::<ast::Fn>(&mut source, "_original_lines_match", "pub(crate)")?;
+    build_support::add_use(&mut source, None, "crate::test_support::lines_match")?;
+    fs::write(support, source)?;
+
+    let ratoml = slow_tests.join("ratoml.rs");
+    let mut source = fs::read_to_string(&ratoml)?;
+    build_support::rename::<ast::Fn>(&mut source, "fixture_path", "_original_fixture_path")?;
+    build_support::mount_module(
+        &mut source,
+        None,
+        "fixture_uri",
+        &owned_source_path("slow_tests_uri.rs"),
+    )?;
+    build_support::add_use(&mut source, None, "self::fixture_uri::FixturePath")?;
+    fs::write(ratoml, source)?;
     Ok(())
 }
 
-fn patch_slow_tests(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
-    for name in [
-        "main.rs",
-        "ratoml.rs",
-        "support.rs",
-        "cli.rs",
-        "flycheck.rs",
+fn patch_test_tool_attributes(src_dir: &Path) -> Result<(), Box<dyn Error>> {
+    for (relative_path, functions) in [
+        ("cli/scip.rs", &["position", "check_symbol"][..]),
+        (
+            "lsp/to_proto.rs",
+            &["check_rendered_snippets_in_source"][..],
+        ),
     ] {
-        patch_slow_tests_imports(&slow_tests.join(name))?;
+        let path = src_dir.join(relative_path);
+        let mut source = fs::read_to_string(&path)?;
+        for function in functions {
+            build_support::rename_path_root(
+                &mut source,
+                function,
+                "ra_ap_rust_analyzer",
+                "rust_analyzer",
+            )?;
+        }
+        fs::write(path, source)?;
     }
-    Ok(())
-}
-
-fn patch_slow_tests_imports(path: &Path) -> Result<(), Box<dyn Error>> {
-    let source = fs::read_to_string(path)?;
-    let mut source = source
-        .replace("use rust_analyzer::", "use ra_ap_rust_analyzer::")
-        .replace(" rust_analyzer::", " ra_ap_rust_analyzer::")
-        .replace("<rust_analyzer::", "<ra_ap_rust_analyzer::")
-        .replace(
-            "use test_utils::skip_slow_tests;\n",
-            "use crate::test_support::skip_slow_tests;\n",
-        )
-        .replace(
-            r#".replace("C:\\", "/c:/").replace('\\', "/")"#,
-            ".uri_path()",
-        );
-    if source.contains(".uri_path()") {
-        build_support::add_use(&mut source, None, "crate::test_support::UriPath")?;
-    }
-    fs::write(path, source)?;
     Ok(())
 }
 
 fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
     let test_support = owned_source_path("slow_tests.rs");
     let main_rs = slow_tests.join("main.rs");
-    let mut body = String::new();
-    for line in fs::read_to_string(&main_rs)?.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("//!")
-            || matches!(
-                trimmed,
-                "#![allow(clippy::disallowed_types)]"
-                    | "#![cfg_attr(feature = \"in-rust-tree\", feature(rustc_private))]"
-            )
-            || matches!(
-                trimmed,
-                "mod cli;" | "mod flycheck;" | "mod ratoml;" | "mod support;" | "mod testdir;"
-            )
-        {
-            continue;
-        }
-        body.push_str(line);
-        body.push('\n');
-    }
-
-    let body_rs = slow_tests.join("test-support-main.rs");
-    fs::write(&body_rs, body)?;
     let wrapper_rs = slow_tests.join("test-support.rs");
     fs::write(
         &wrapper_rs,
         format!(
-            "#[path = {:?}]\nmod test_support;\n#[path = {:?}]\nmod cli;\n#[path = {:?}]\nmod flycheck;\n#[path = {:?}]\nmod ratoml;\n#[path = {:?}]\nmod support;\n#[path = {:?}]\nmod testdir;\ninclude!({:?});\n",
+            "#[path = {:?}]\nmod test_support;\ninclude!({:?});\n",
             test_support.to_string_lossy().into_owned(),
-            slow_tests.join("cli.rs").to_string_lossy().into_owned(),
-            slow_tests
-                .join("flycheck.rs")
-                .to_string_lossy()
-                .into_owned(),
-            slow_tests.join("ratoml.rs").to_string_lossy().into_owned(),
-            slow_tests.join("support.rs").to_string_lossy().into_owned(),
-            slow_tests.join("testdir.rs").to_string_lossy().into_owned(),
-            body_rs.to_string_lossy().into_owned(),
+            main_rs.to_string_lossy().into_owned(),
         ),
     )?;
     println!("cargo:rerun-if-changed={}", test_support.display());
