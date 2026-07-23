@@ -89,17 +89,28 @@ pub fn calls(scope: &impl AstNode, name: &str) -> impl Iterator<Item = ast::Meth
         .into_iter()
 }
 
-pub fn arms(scope: &impl AstNode, variant: &str) -> impl Iterator<Item = ast::MatchArm> {
+pub fn arms(
+    scope: &impl AstNode,
+    type_name: &str,
+    variant_name: &str,
+) -> impl Iterator<Item = ast::MatchArm> {
     scope
         .syntax()
         .descendants()
         .filter_map(ast::MatchArm::cast)
-        .filter(|arm| {
+        .filter(move |arm| {
             arm.pat().is_some_and(|pat| {
                 pat.syntax()
                     .descendants()
                     .filter_map(ast::Path::cast)
-                    .any(|path| path.syntax().text() == variant)
+                    .any(|path| {
+                        let mut segments = path.segments().filter_map(|segment| segment.name_ref());
+                        segments.next().is_some_and(|name| name.text() == type_name)
+                            && segments
+                                .next()
+                                .is_some_and(|name| name.text() == variant_name)
+                            && segments.next().is_none()
+                    })
             })
         })
         .collect::<Vec<_>>()
@@ -365,15 +376,17 @@ pub fn append<N: ListHost>(
     commit(source, editor)
 }
 
-fn record_exprs_in(function: &ast::Fn, path_tail: &str) -> Vec<ast::RecordExpr> {
+fn record_exprs_in(function: &ast::Fn, record_name: &str) -> Vec<ast::RecordExpr> {
     function
         .syntax()
         .descendants()
         .filter_map(ast::RecordExpr::cast)
         .filter(|record| {
-            record
-                .path()
-                .is_some_and(|path| path.syntax().text().to_string().ends_with(path_tail))
+            record.path().is_some_and(|path| {
+                path.segment()
+                    .and_then(|segment| segment.name_ref())
+                    .is_some_and(|name| name.text() == record_name)
+            })
         })
         .collect()
 }
@@ -386,12 +399,12 @@ pub struct FieldInit<'a> {
 pub fn append_record_fields(
     source: &mut String,
     function: &str,
-    path_tail: &str,
+    record_name: &str,
     fields: &[FieldInit<'_>],
 ) -> Result<(), Box<dyn Error>> {
     let (editor, root) = open(source)?;
     let function: ast::Fn = named(&root, function)?;
-    for record in record_exprs_in(&function, path_tail) {
+    for record in record_exprs_in(&function, record_name) {
         let Some(field_list) = record.record_expr_field_list() else {
             continue;
         };
@@ -407,19 +420,19 @@ pub fn append_record_fields(
         field_list.add_fields(&editor, fields);
         return commit(source, editor);
     }
-    Err(format!("function has no `{path_tail}` record expression").into())
+    Err(format!("function has no `{record_name}` record expression").into())
 }
 
 pub fn set_record_field(
     source: &mut String,
     function: &str,
-    path_tail: &str,
+    record_name: &str,
     field: &str,
     value: &str,
 ) -> Result<(), Box<dyn Error>> {
     let (editor, root) = open(source)?;
     let function: ast::Fn = named(&root, function)?;
-    for record in record_exprs_in(&function, path_tail) {
+    for record in record_exprs_in(&function, record_name) {
         let Some(field_list) = record.record_expr_field_list() else {
             continue;
         };
@@ -437,13 +450,13 @@ pub fn set_record_field(
             return commit(source, editor);
         }
     }
-    Err(format!("function has no `{path_tail}.{field}` field").into())
+    Err(format!("function has no `{record_name}.{field}` field").into())
 }
 
 pub fn add_rest_pattern(
     source: &mut String,
     function: &str,
-    path_tail: &str,
+    record_name: &str,
 ) -> Result<(), Box<dyn Error>> {
     let (editor, root) = open(source)?;
     let function: ast::Fn = named(&root, function)?;
@@ -455,7 +468,11 @@ pub fn add_rest_pattern(
         let Some(path) = record.path() else {
             continue;
         };
-        if !path.syntax().text().to_string().ends_with(path_tail) {
+        if path
+            .segment()
+            .and_then(|segment| segment.name_ref())
+            .is_none_or(|name| name.text() != record_name)
+        {
             continue;
         }
         let Some(fields) = record.record_pat_field_list() else {
@@ -478,7 +495,7 @@ pub fn add_rest_pattern(
         );
         return commit(source, editor);
     }
-    Err(format!("function has no `{path_tail}` record pattern").into())
+    Err(format!("function has no `{record_name}` record pattern").into())
 }
 
 pub fn rename_path_root(

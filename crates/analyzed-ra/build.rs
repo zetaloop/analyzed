@@ -587,7 +587,7 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
         "_handle_event",
         |function| {
             let arm = build_support::one(
-                build_support::arms(function, "PrimeCachesProgress::End"),
+                build_support::arms(function, "PrimeCachesProgress", "End"),
                 "`PrimeCachesProgress::End` arm",
             )?;
             let call = build_support::one(
@@ -675,7 +675,7 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
         "handle_flycheck_msg",
         |function| {
             let arm = build_support::one(
-                build_support::arms(function, "FlycheckMessage::AddDiagnostic"),
+                build_support::arms(function, "FlycheckMessage", "AddDiagnostic"),
                 "`FlycheckMessage::AddDiagnostic` arm",
             )?;
             let diagnostics_loop =
