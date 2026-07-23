@@ -7,6 +7,7 @@ use std::{
 };
 
 use flate2::read::GzDecoder;
+use ra_ap_syntax::{AstNode, AstToken, Edition, SourceFile, syntax_editor::SyntaxEditor};
 use sha2::{Digest, Sha256};
 use toml::{Table, Value, map::Map};
 
@@ -25,6 +26,7 @@ pub struct LockedPackage {
 pub fn prepare_bridge_package(
     package_name: &str,
     generated_dir: &str,
+    included_roots: &[&str],
 ) -> Result<(PathBuf, LockedPackage), Box<dyn Error>> {
     let manifest = bridge_manifest_path();
     let (mut package, lock) = locked_package(package_name, &manifest)?;
@@ -36,7 +38,10 @@ pub fn prepare_bridge_package(
     unpack_crate_archive(package_name, &archive, &generated, &package)?;
     verify_manifest_matches_bridge(package_name, &generated.join("Cargo.toml"), &manifest)?;
     package.git_revision = crate_git_revision(&generated)?;
-    rewrite_lib_header(&generated.join("src/lib.rs"))?;
+    rewrite_included_header(&generated.join("src/lib.rs"))?;
+    for path in included_roots {
+        rewrite_included_header(&generated.join(path))?;
+    }
 
     println!("cargo:rerun-if-changed={}", archive.display());
     println!("cargo:rerun-if-changed={}", manifest.display());
@@ -320,20 +325,30 @@ fn unpack_crate_archive(
     Ok(())
 }
 
-fn rewrite_lib_header(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let source = fs::read_to_string(lib_rs)?;
-    let mut rewritten = String::new();
-
-    for line in source.lines() {
-        if line.starts_with("//!") || line.starts_with("#![") {
-            continue;
-        }
-
-        rewritten.push_str(line);
-        rewritten.push('\n');
+fn rewrite_included_header(path: &Path) -> Result<(), Box<dyn Error>> {
+    let source = fs::read_to_string(path)?;
+    let parsed = SourceFile::parse(&source, Edition::CURRENT);
+    if !parsed.errors().is_empty() {
+        return Err(format!("could not parse {}: {:?}", path.display(), parsed.errors()).into());
     }
-
-    fs::write(lib_rs, rewritten)?;
+    let tree = parsed.tree();
+    let (editor, root) = SyntaxEditor::new(tree.syntax().clone());
+    for attr in root
+        .children()
+        .filter_map(ast::Attr::cast)
+        .filter(|attr| attr.kind() == ast::AttrKind::Inner)
+    {
+        editor.delete(attr.syntax().clone());
+    }
+    for comment in root
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter_map(ast::Comment::cast)
+        .filter(ast::Comment::is_inner)
+    {
+        editor.delete(comment.syntax().clone());
+    }
+    fs::write(path, editor.finish().new_root().to_string())?;
     Ok(())
 }
 

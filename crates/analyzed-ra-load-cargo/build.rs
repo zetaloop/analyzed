@@ -12,7 +12,7 @@ const PACKAGE: &str = "ra_ap_load-cargo";
 const GENERATED_DIR: &str = "ra_ap_load_cargo_bridge";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (generated, _) = build_support::prepare_bridge_package(PACKAGE, GENERATED_DIR)?;
+    let (generated, _) = build_support::prepare_bridge_package(PACKAGE, GENERATED_DIR, &[])?;
     patch_load_cargo_source(&generated.join("src/lib.rs"))?;
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())

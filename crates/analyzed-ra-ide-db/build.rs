@@ -12,7 +12,7 @@ const PACKAGE: &str = "ra_ap_ide_db";
 const GENERATED_DIR: &str = "ra_ap_ide_db_bridge";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (generated, _) = build_support::prepare_bridge_package(PACKAGE, GENERATED_DIR)?;
+    let (generated, _) = build_support::prepare_bridge_package(PACKAGE, GENERATED_DIR, &[])?;
     patch_ide_db_source(&generated.join("src/lib.rs"))?;
     patch_search_source(&generated.join("src/search.rs"))?;
     patch_symbol_index_source(&generated.join("src/symbol_index.rs"))?;

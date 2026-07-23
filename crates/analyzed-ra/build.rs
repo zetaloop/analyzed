@@ -13,8 +13,11 @@ const RA_PACKAGE: &str = "ra_ap_rust-analyzer";
 const RA_REPOSITORY: &str = "rust-lang/rust-analyzer";
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let (generated, package) =
-        build_support::prepare_bridge_package(RA_PACKAGE, "ra_ap_rust_analyzer_bridge")?;
+    let (generated, package) = build_support::prepare_bridge_package(
+        RA_PACKAGE,
+        "ra_ap_rust_analyzer_bridge",
+        &["tests/slow-tests/main.rs"],
+    )?;
     let revision = package
         .git_revision
         .as_deref()
