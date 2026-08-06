@@ -563,7 +563,7 @@ impl crate::global_state::GlobalState {
         crate::shared_analyzer::shared_analyzer_registry().request_gc();
     }
 
-    pub(crate) fn mark_gc_when_idle(&mut self) {}
+    pub(crate) fn mark_idle_gc(&mut self) {}
 
     pub(crate) fn handle_event(&mut self, event: super::Event) {
         self._handle_event(event)

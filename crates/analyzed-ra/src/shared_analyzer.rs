@@ -1254,9 +1254,9 @@ impl SharedAnalyzerRuntime {
 
     fn refresh_session_cache(&self, world: &SharedWorld) {
         let line_endings =
-            world.line_endings_for_session(self.session_id(), self.workspace_indexes());
+            world.session_line_endings(self.session_id(), self.workspace_indexes());
         let file_mappings =
-            world.file_mappings_for_session(self.session_id(), self.workspace_indexes());
+            world.session_file_mappings(self.session_id(), self.workspace_indexes());
         *self
             .session
             .line_endings
@@ -1287,7 +1287,7 @@ impl SharedAnalyzerRuntime {
             .lock()
             .expect("shared analyzer analysis cache mutex poisoned");
         if cache.generation != Some(generation) {
-            cache.visible_files = Arc::new(world.visible_crate_roots_for_session(
+            cache.visible_files = Arc::new(world.session_visible_crate_roots(
                 self.session_id(),
                 self.workspace_indexes(),
                 &self.session.excluded_paths,
@@ -1490,7 +1490,7 @@ impl SharedAnalyzerRuntime {
         let db = world.host.raw_database();
         for (path, text, _) in files {
             let Some(base_file) = world
-                .base_file_for_vfs_path_in(self.workspace_indexes(), &normalize_vfs_path(path))
+                .base_file(self.workspace_indexes(), &normalize_vfs_path(path))
             else {
                 continue;
             };
@@ -2165,7 +2165,7 @@ impl SharedWorld {
             Some(Err(error)) => (None, Some(Err(error))),
             None => (None, None),
         };
-        let workspace_for_session = workspace.clone();
+        let session_workspace = workspace.clone();
         let loaded = load_workspace_change(
             workspace,
             &config.cargo_config.extra_env,
@@ -2194,7 +2194,7 @@ impl SharedWorld {
                 files,
                 proc_macro_server,
             },
-            workspace: workspace_for_session,
+            workspace: session_workspace,
             loaded,
             line_endings,
             proc_macro_spawn,
@@ -2335,7 +2335,7 @@ impl SharedWorld {
 
         for file in files {
             let Some(file_id) = self
-                .base_file_for_vfs_path_in(workspaces, &normalize_vfs_path(&file.path))
+                .base_file(workspaces, &normalize_vfs_path(&file.path))
             else {
                 continue;
             };
@@ -2490,7 +2490,7 @@ impl SharedWorld {
         anyhow::bail!("workspace file is not loaded: {path}")
     }
 
-    fn line_endings_for_session(
+    fn session_line_endings(
         &self,
         session_id: u64,
         workspaces: &[usize],
@@ -2513,7 +2513,7 @@ impl SharedWorld {
         }
     }
 
-    fn file_mappings_for_session(
+    fn session_file_mappings(
         &self,
         session_id: u64,
         workspaces: &[usize],
@@ -2564,7 +2564,7 @@ impl SharedWorld {
         path: &VfsPath,
     ) -> Option<(SourceRootId, bool)> {
         let path = normalize_vfs_path(path);
-        if let Some(file_id) = self.base_file_for_vfs_path_in(workspaces, &path) {
+        if let Some(file_id) = self.base_file(workspaces, &path) {
             let db = self.host.raw_database();
             let source_root_id = db.file_source_root(file_id).source_root_id(db);
             let source_root = db.source_root(source_root_id).source_root(db);
@@ -2611,7 +2611,7 @@ impl SharedWorld {
             .into_iter()
             .filter_map(|(path, display_path, text, line_endings)| {
                 let key = path_key(&path);
-                self.base_file_for_vfs_path_in(workspaces, &normalize_vfs_path(&path))
+                self.base_file(workspaces, &normalize_vfs_path(&path))
                     .and_then(|base_file| {
                         let db = self.host.raw_database();
                         let base_text = db.file_text(base_file).text(db);
@@ -2750,7 +2750,7 @@ impl SharedWorld {
 
         for (path, _, _) in open_files.values() {
             let source_path = normalize_vfs_path(path);
-            let Some(base_file) = self.base_file_for_vfs_path_in(workspaces, &source_path) else {
+            let Some(base_file) = self.base_file(workspaces, &source_path) else {
                 continue;
             };
 
@@ -2775,7 +2775,7 @@ impl SharedWorld {
                 continue;
             }
 
-            let Some(base_file) = self.base_file_for_vfs_path_in(workspaces, &path) else {
+            let Some(base_file) = self.base_file(workspaces, &path) else {
                 continue;
             };
             let text = db.file_text(base_file).text(db).to_string();
@@ -2862,7 +2862,7 @@ impl SharedWorld {
             };
 
             for (key, file) in &old_overlay.files_by_path {
-                let base_file = self.base_file_for_vfs_path_in(
+                let base_file = self.base_file(
                     &old_overlay.workspaces,
                     &normalize_vfs_path(&file.path),
                 );
@@ -3068,7 +3068,7 @@ impl SharedWorld {
         }
     }
 
-    fn visible_crate_roots_for_session(
+    fn session_visible_crate_roots(
         &self,
         session_id: u64,
         workspaces: &[usize],
@@ -3121,7 +3121,7 @@ impl SharedWorld {
             .any(|excluded| path.starts_with(excluded))
     }
 
-    fn base_file_for_vfs_path_in(&self, workspaces: &[usize], path: &VfsPath) -> Option<FileId> {
+    fn base_file(&self, workspaces: &[usize], path: &VfsPath) -> Option<FileId> {
         self.loaded_workspaces_in(workspaces)
             .find_map(|workspace| workspace._vfs.file_id(path).map(|(file_id, _)| file_id))
     }

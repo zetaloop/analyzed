@@ -620,15 +620,15 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
             build_support::stmt(&call)
         },
         build_support::Method {
-            name: "mark_gc_when_idle",
+            name: "mark_idle_gc",
             receiver: Some("&mut self"),
             params: &[],
             args: &[],
             return_ty: None,
         },
     )?;
-    build_support::rename::<ast::Fn>(&mut source, "mark_gc_when_idle", "_mark_gc_when_idle")?;
-    build_support::add_attr::<ast::Fn>(&mut source, "_mark_gc_when_idle", "#[allow(dead_code)]")?;
+    build_support::rename::<ast::Fn>(&mut source, "mark_idle_gc", "_mark_idle_gc")?;
+    build_support::add_attr::<ast::Fn>(&mut source, "_mark_idle_gc", "#[allow(dead_code)]")?;
 
     build_support::extract(
         &mut source,
