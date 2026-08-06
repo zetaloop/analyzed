@@ -50,6 +50,23 @@ pub fn prepare_bridge_package(
     Ok((generated, package))
 }
 
+// rust-analyzer's crates.io workflow rewrites its crate name in every Rust source file.
+pub fn restore_rust_analyzer_source(source_dir: &Path) -> Result<(), Box<dyn Error>> {
+    for entry in fs::read_dir(source_dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            restore_rust_analyzer_source(&path)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            let source = fs::read_to_string(&path)?;
+            let restored = source.replace("ra_ap_rust_analyzer", "rust_analyzer");
+            if restored != source {
+                fs::write(path, restored)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn registry_archive(
     package_name: &str,
     package: &LockedPackage,

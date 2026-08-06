@@ -542,6 +542,25 @@ pub fn add_use(
         visibility.map(visibility_node).transpose()?,
         make::use_tree(make::path_from_text(path), None, None, false),
     );
+    insert_use(source, item)
+}
+
+pub fn add_use_alias(
+    source: &mut String,
+    visibility: Option<&str>,
+    path: &str,
+    alias: &str,
+) -> Result<(), Box<dyn Error>> {
+    let visibility = visibility.map_or(String::new(), |visibility| format!("{visibility} "));
+    let file = parse_file(&format!("{visibility}use {path} as {alias};"))?;
+    let item = one(
+        file.syntax().children().filter_map(ast::Use::cast),
+        "use item",
+    )?;
+    insert_use(source, item)
+}
+
+fn insert_use(source: &mut String, item: ast::Use) -> Result<(), Box<dyn Error>> {
     let (editor, root) = open(source)?;
     let anchor = root
         .children()
@@ -1082,6 +1101,18 @@ mod tests {
         assert_eq!(
             source,
             "#![allow(clippy::all)]\n\nuse crate::patched::run_flycheck;\nuse std::path::Path;\n"
+        );
+    }
+
+    #[test]
+    fn injects_aliased_use_before_existing_imports() {
+        let mut source = String::from("#![allow(clippy::all)]\n\nuse std::path::Path;\n");
+
+        add_use_alias(&mut source, None, "crate", "rust_analyzer").unwrap();
+
+        assert_eq!(
+            source,
+            "#![allow(clippy::all)]\n\nuse crate as rust_analyzer;\nuse std::path::Path;\n"
         );
     }
 }

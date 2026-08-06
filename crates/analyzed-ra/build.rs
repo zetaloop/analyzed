@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "ra_ap_rust_analyzer_bridge",
         &["tests/slow-tests/main.rs"],
     )?;
+    build_support::restore_rust_analyzer_source(&generated)?;
     let revision = package
         .git_revision
         .as_deref()
@@ -63,7 +64,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     patch_flycheck_to_proto_source(&generated_src.join("diagnostics/flycheck_to_proto.rs"))?;
     patch_notification_source(&generated_src.join("handlers/notification.rs"))?;
     patch_driver_source(&generated_src.join("bin/main.rs"))?;
-    patch_test_tool_attributes(&generated_src)?;
     write_root_module(
         &generated_src.join("root.rs"),
         &generated_src.join("lib.rs"),
@@ -809,6 +809,7 @@ fn patch_driver_source(main_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::set_visibility::<ast::Fn>(&mut source, "main", "pub")?;
     build_support::set_visibility::<ast::Fn>(&mut source, "setup_logging", "pub")?;
     build_support::set_visibility::<ast::Fn>(&mut source, "wait_for_debugger", "pub")?;
+    build_support::add_use_alias(&mut source, None, "crate", "rust_analyzer")?;
 
     fs::write(main_rs, source)?;
     Ok(())
@@ -847,29 +848,6 @@ fn patch_slow_tests(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn patch_test_tool_attributes(src_dir: &Path) -> Result<(), Box<dyn Error>> {
-    for (relative_path, functions) in [
-        ("cli/scip.rs", &["position", "check_symbol"][..]),
-        (
-            "lsp/to_proto.rs",
-            &["check_rendered_snippets_in_source"][..],
-        ),
-    ] {
-        let path = src_dir.join(relative_path);
-        let mut source = fs::read_to_string(&path)?;
-        for function in functions {
-            build_support::rename_path_root(
-                &mut source,
-                function,
-                "ra_ap_rust_analyzer",
-                "rust_analyzer",
-            )?;
-        }
-        fs::write(path, source)?;
-    }
-    Ok(())
-}
-
 fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
     let test_support = owned_source_path("slow_tests.rs");
     let main_rs = slow_tests.join("main.rs");
@@ -877,7 +855,7 @@ fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
     fs::write(
         &wrapper_rs,
         format!(
-            "#[path = {:?}]\nmod test_support;\ninclude!({:?});\n",
+            "extern crate ra_ap_rust_analyzer as rust_analyzer;\n#[path = {:?}]\nmod test_support;\ninclude!({:?});\n",
             test_support.to_string_lossy().into_owned(),
             main_rs.to_string_lossy().into_owned(),
         ),
