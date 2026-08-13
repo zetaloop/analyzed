@@ -751,7 +751,7 @@ fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::add_rest_pattern(&mut source, "switch_workspaces", "FetchWorkspaceResponse")?;
     build_support::redirect_call(
         &mut source,
-        "switch_workspaces",
+        build_support::Scope::Function("switch_workspaces"),
         "recreate_crate_graph",
         "recreate_crate_graph_from_shared",
     )?;

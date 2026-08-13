@@ -3,7 +3,7 @@ use std::{error::Error, path::Path};
 use ra_ap_syntax::{
     AstNode, Edition, SourceFile, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
     ast::{
-        self, HasLoopBody, HasName, HasVisibility,
+        self, HasArgList, HasLoopBody, HasName, HasVisibility,
         edit::{AstNodeEdit, IndentLevel},
         make,
     },
@@ -80,8 +80,11 @@ pub fn one<T>(
 }
 
 pub fn calls(scope: &impl AstNode, name: &str) -> impl Iterator<Item = ast::MethodCallExpr> {
+    calls_in(scope.syntax(), name)
+}
+
+fn calls_in(scope: &SyntaxNode, name: &str) -> impl Iterator<Item = ast::MethodCallExpr> {
     scope
-        .syntax()
         .descendants()
         .filter_map(ast::MethodCallExpr::cast)
         .filter(|call| call.name_ref().is_some_and(|it| it.text() == name))
@@ -103,14 +106,7 @@ pub fn arms(
                 pat.syntax()
                     .descendants()
                     .filter_map(ast::Path::cast)
-                    .any(|path| {
-                        let mut segments = path.segments().filter_map(|segment| segment.name_ref());
-                        segments.next().is_some_and(|name| name.text() == type_name)
-                            && segments
-                                .next()
-                                .is_some_and(|name| name.text() == variant_name)
-                            && segments.next().is_none()
-                    })
+                    .any(|path| path_ends_with(&path, &[type_name, variant_name]))
             })
         })
         .collect::<Vec<_>>()
@@ -702,6 +698,13 @@ pub struct Method<'a> {
     pub return_ty: Option<&'a str>,
 }
 
+pub struct Function<'a> {
+    pub name: &'a str,
+    pub params: &'a [Param<'a>],
+    pub args: &'a [&'a str],
+    pub return_ty: Option<&'a str>,
+}
+
 pub struct Selection {
     kind: SelectionKind,
 }
@@ -754,6 +757,94 @@ pub fn params_tail() -> Selection {
     Selection {
         kind: SelectionKind::ParamsTail,
     }
+}
+
+pub fn extract_match_arm(
+    source: &mut String,
+    scope: Scope<'_>,
+    function: Function<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let Scope::MatchArm {
+        function: parent_name,
+        type_name,
+        variant_name,
+    } = scope
+    else {
+        return Err("match-arm extraction requires a match-arm scope".into());
+    };
+    let (editor, root) = open(source)?;
+    let parent: ast::Fn = named(&root, parent_name)?;
+    let arm = one(
+        arms(&parent, type_name, variant_name),
+        &format!("`{type_name}::{variant_name}` arm in `{parent_name}`"),
+    )?;
+    let expression = arm.expr().ok_or_else(|| {
+        format!("`{type_name}::{variant_name}` arm in `{parent_name}` has no expression")
+    })?;
+    let body = expression.clone().syntax().clone();
+    let call = make::expr_call(
+        path_expr(function.name)?,
+        make::arg_list(
+            function
+                .args
+                .iter()
+                .map(|arg| expr_node(arg))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    );
+    let call: ast::Expr = make::block_expr(std::iter::empty(), Some(call.into())).into();
+    editor.replace(expression.syntax(), call.syntax().clone());
+
+    let params = make::param_list(
+        None,
+        function.params.iter().map(|param| {
+            make::param(
+                make::ident_pat(false, false, make::name(param.name)).into(),
+                make::ty(param.ty),
+            )
+        }),
+    );
+    let function_node = make::fn_(
+        std::iter::empty(),
+        None,
+        make::name(function.name),
+        None,
+        None,
+        params,
+        make::block_expr(std::iter::empty(), None),
+        function.return_ty.map(|ty| make::ret_type(make::ty(ty))),
+        false,
+        false,
+        false,
+        false,
+    );
+    let (function_editor, function_node) = SyntaxEditor::with_ast_node(&function_node);
+    let list = function_node
+        .body()
+        .and_then(|body| body.stmt_list())
+        .ok_or("extracted function has no statement list")?;
+    function_editor.insert_all(
+        Position::after(
+            list.l_curly_token()
+                .ok_or("extracted function has no opening brace")?,
+        ),
+        vec![
+            make::tokens::whitespace("\n    ").into(),
+            body.into(),
+            make::tokens::whitespace("\n").into(),
+        ],
+    );
+    let function_node = ast::Fn::cast(function_editor.finish().new_root().clone())
+        .ok_or("extracted function is not a function")?;
+    let level = IndentLevel::from_node(parent.syntax());
+    editor.insert_all(
+        Position::after(parent.syntax()),
+        vec![
+            make::tokens::whitespace(&format!("\n\n{level}")).into(),
+            function_node.syntax().clone().into(),
+        ],
+    );
+    commit(source, editor)
 }
 
 pub fn extract(
@@ -965,35 +1056,455 @@ pub fn extract(
     commit(source, editor)
 }
 
+#[derive(Clone, Copy)]
+pub enum Scope<'a> {
+    Function(&'a str),
+    ForLoop {
+        function: &'a str,
+    },
+    MethodArgument {
+        function: &'a str,
+        method: &'a str,
+    },
+    IfLet {
+        function: &'a str,
+        type_name: &'a str,
+        variant_name: &'a str,
+    },
+    MatchArm {
+        function: &'a str,
+        type_name: &'a str,
+        variant_name: &'a str,
+    },
+}
+
+struct ResolvedScope {
+    syntax: SyntaxNode,
+    statements: ast::StmtList,
+    description: String,
+}
+
+impl Scope<'_> {
+    fn resolve(self, root: &SyntaxNode) -> Result<ResolvedScope, Box<dyn Error>> {
+        let function_name = match self {
+            Scope::Function(function)
+            | Scope::ForLoop { function }
+            | Scope::MethodArgument { function, .. }
+            | Scope::IfLet { function, .. }
+            | Scope::MatchArm { function, .. } => function,
+        };
+        let function: ast::Fn = named(root, function_name)?;
+        let (syntax, statements, description) = match self {
+            Scope::Function(_) => {
+                let body = function
+                    .body()
+                    .ok_or_else(|| format!("function `{function_name}` has no body"))?;
+                let statements = body
+                    .stmt_list()
+                    .ok_or_else(|| format!("function `{function_name}` has no statement list"))?;
+                (
+                    function.syntax().clone(),
+                    statements,
+                    format!("`{function_name}`"),
+                )
+            }
+            Scope::ForLoop { .. } => {
+                let loop_expr = one(
+                    function
+                        .syntax()
+                        .descendants()
+                        .filter_map(ast::ForExpr::cast),
+                    &format!("for loop in `{function_name}`"),
+                )?;
+                let statements = loop_expr
+                    .loop_body()
+                    .and_then(|body| body.stmt_list())
+                    .ok_or_else(|| {
+                        format!("for loop in `{function_name}` has no statement list")
+                    })?;
+                (
+                    loop_expr.syntax().clone(),
+                    statements,
+                    format!("for loop in `{function_name}`"),
+                )
+            }
+            Scope::MethodArgument { method, .. } => {
+                let call = one(
+                    calls_in(function.syntax(), method),
+                    &format!("`{method}` call in `{function_name}`"),
+                )?;
+                let block = one(
+                    call.arg_list()
+                        .into_iter()
+                        .flat_map(|arguments| arguments.args())
+                        .filter_map(|argument| match argument {
+                            ast::Expr::BlockExpr(block) => Some(block),
+                            _ => None,
+                        }),
+                    &format!("block argument to `{method}` in `{function_name}`"),
+                )?;
+                let statements = block.stmt_list().ok_or_else(|| {
+                    format!(
+                        "block argument to `{method}` in `{function_name}` has no statement list"
+                    )
+                })?;
+                (
+                    block.syntax().clone(),
+                    statements,
+                    format!("block argument to `{method}` in `{function_name}`"),
+                )
+            }
+            Scope::IfLet {
+                type_name,
+                variant_name,
+                ..
+            } => {
+                let branch = one(
+                    function
+                        .syntax()
+                        .descendants()
+                        .filter_map(ast::IfExpr::cast)
+                        .filter(|branch| {
+                            branch.condition().is_some_and(|condition| {
+                                condition
+                                    .syntax()
+                                    .descendants()
+                                    .filter_map(ast::LetExpr::cast)
+                                    .filter_map(|let_expr| let_expr.pat())
+                                    .any(|pattern| {
+                                        pattern
+                                            .syntax()
+                                            .descendants()
+                                            .filter_map(ast::Path::cast)
+                                            .any(|path| {
+                                                path_ends_with(&path, &[type_name, variant_name])
+                                            })
+                                    })
+                            })
+                        }),
+                    &format!("`if let {type_name}::{variant_name}` branch in `{function_name}`"),
+                )?;
+                let block = branch.then_branch().ok_or_else(|| {
+                    format!(
+                        "`if let {type_name}::{variant_name}` branch in `{function_name}` has no body"
+                    )
+                })?;
+                let statements = block.stmt_list().ok_or_else(|| {
+                    format!(
+                        "`if let {type_name}::{variant_name}` branch in `{function_name}` has no statement list"
+                    )
+                })?;
+                (
+                    block.syntax().clone(),
+                    statements,
+                    format!("`if let {type_name}::{variant_name}` branch in `{function_name}`"),
+                )
+            }
+            Scope::MatchArm {
+                type_name,
+                variant_name,
+                ..
+            } => {
+                let arm = one(
+                    arms(&function, type_name, variant_name),
+                    &format!("`{type_name}::{variant_name}` arm in `{function_name}`"),
+                )?;
+                let statements = match arm.expr() {
+                    Some(ast::Expr::BlockExpr(block)) => block.stmt_list().ok_or_else(|| {
+                        format!(
+                            "`{type_name}::{variant_name}` arm in `{function_name}` has no statement list"
+                        )
+                    })?,
+                    _ => {
+                        return Err(format!(
+                            "`{type_name}::{variant_name}` arm in `{function_name}` is not a block"
+                        )
+                        .into());
+                    }
+                };
+                (
+                    arm.syntax().clone(),
+                    statements,
+                    format!("`{type_name}::{variant_name}` arm in `{function_name}`"),
+                )
+            }
+        };
+        Ok(ResolvedScope {
+            syntax,
+            statements,
+            description,
+        })
+    }
+}
+
+fn method_call_is_in_scope(call: &SyntaxNode, scope: &ResolvedScope) -> bool {
+    match scope.syntax.kind() {
+        SyntaxKind::CLOSURE_EXPR => call.ancestors().any(|ancestor| ancestor == scope.syntax),
+        _ => call
+            .ancestors()
+            .filter_map(ast::StmtList::cast)
+            .next()
+            .is_some_and(|list| list == scope.statements),
+    }
+}
+
 pub fn redirect_call(
     source: &mut String,
-    function: &str,
+    scope: Scope<'_>,
     from: &str,
     to: &str,
 ) -> Result<(), Box<dyn Error>> {
     let (editor, root) = open(source)?;
-    let function_node: ast::Fn = named(&root, function)?;
-    let body_stmt_list = function_node
-        .body()
-        .and_then(|body| body.stmt_list())
-        .ok_or_else(|| format!("function `{function}` has no statement list"))?
-        .syntax()
-        .clone();
-    let call = one(
-        calls(&function_node, from).filter(|call| {
-            call.syntax()
-                .ancestors()
-                .filter_map(ast::StmtList::cast)
-                .next()
-                .is_some_and(|list| *list.syntax() == body_stmt_list)
-        }),
-        &format!("top-level `{from}` call in `{function}`"),
+    let scope = scope.resolve(&root)?;
+    let expected =
+        path_names(&named_path(from)?).ok_or_else(|| format!("`{from}` is not a named path"))?;
+    let methods = calls_in(&scope.syntax, from)
+        .filter(|call| method_call_is_in_scope(call.syntax(), &scope))
+        .filter_map(|call| call.name_ref().map(|name| (name.syntax().clone(), true)));
+    let functions = scope
+        .syntax
+        .descendants()
+        .filter_map(ast::CallExpr::cast)
+        .filter_map(|call| match call.expr() {
+            Some(ast::Expr::PathExpr(path)) => path.path(),
+            _ => None,
+        })
+        .filter(|path| path_names(path).as_ref() == Some(&expected))
+        .map(|path| (path.syntax().clone(), false));
+    let (callee, method) = one(
+        methods.chain(functions),
+        &format!("`{from}` call in {}", scope.description),
     )?;
-    let name = call
-        .name_ref()
-        .ok_or_else(|| format!("`{from}` call has no method name"))?;
-    editor.replace(name.syntax(), make::name_ref(to).syntax().clone());
+
+    let replacement = named_path(to)?;
+    if method {
+        let replacement = path_names(&replacement)
+            .filter(|segments| segments.len() == 1)
+            .ok_or_else(|| format!("method replacement `{to}` is not a name"))?;
+        editor.replace(callee, make::name_ref(&replacement[0]).syntax().clone());
+    } else {
+        editor.replace(callee, replacement.syntax().clone());
+    }
     commit(source, editor)
+}
+
+pub fn set_parameter_type(
+    source: &mut String,
+    function: &str,
+    parameter_name: &str,
+    ty: &str,
+) -> Result<(), Box<dyn Error>> {
+    let (editor, root) = open(source)?;
+    let function_node: ast::Fn = named(&root, function)?;
+    let params = function_node
+        .param_list()
+        .ok_or_else(|| format!("function `{function}` has no parameter list"))?;
+    let parameter = one(
+        params.params().filter(|param| {
+            matches!(param.pat(), Some(ast::Pat::IdentPat(pattern)) if pattern.name().is_some_and(|name| name.text() == parameter_name))
+        }),
+        &format!("parameter `{parameter_name}` in `{function}`"),
+    )?;
+    let old_type = parameter
+        .ty()
+        .ok_or_else(|| format!("parameter `{parameter_name}` has no type"))?;
+    editor.replace(old_type.syntax(), make::ty(ty).syntax().clone());
+    commit(source, editor)
+}
+
+pub enum ClosureContext<'a> {
+    Move(&'a str),
+    Clone(&'a str),
+}
+
+pub enum Call<'a> {
+    Function(&'a str),
+    Method(&'a str),
+}
+
+pub struct ClosureDelegate<'a> {
+    pub scope: Scope<'a>,
+    pub call: Call<'a>,
+    pub helper: &'a str,
+    pub context: &'a [ClosureContext<'a>],
+    pub params: &'a [Param<'a>],
+}
+
+pub fn delegate_closure(
+    source: &mut String,
+    delegate: ClosureDelegate<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let ClosureDelegate {
+        scope,
+        call,
+        helper,
+        context,
+        params,
+    } = delegate;
+    let (editor, root) = open(source)?;
+    let scope = scope.resolve(&root)?;
+    let (arguments, call_name) = match call {
+        Call::Function(function) => {
+            let expected = path_expr(function)?;
+            let ast::Expr::PathExpr(expected) = expected else {
+                unreachable!();
+            };
+            let expected = expected
+                .path()
+                .and_then(|path| path_names(&path))
+                .ok_or_else(|| format!("`{function}` is not a named path"))?;
+            let call = one(
+                scope
+                    .syntax
+                    .descendants()
+                    .filter_map(ast::CallExpr::cast)
+                    .filter(|call| {
+                        matches!(
+                            call.expr(),
+                            Some(ast::Expr::PathExpr(path))
+                                if path.path().and_then(|path| path_names(&path)).as_ref()
+                                    == Some(&expected)
+                        )
+                    }),
+                &format!("`{function}` call in {}", scope.description),
+            )?;
+            (
+                call.arg_list().ok_or_else(|| {
+                    format!(
+                        "`{function}` call in {} has no argument list",
+                        scope.description
+                    )
+                })?,
+                function,
+            )
+        }
+        Call::Method(method) => {
+            let call = one(
+                calls_in(&scope.syntax, method),
+                &format!("`{method}` call in {}", scope.description),
+            )?;
+            (
+                call.arg_list().ok_or_else(|| {
+                    format!(
+                        "`{method}` call in {} has no argument list",
+                        scope.description
+                    )
+                })?,
+                method,
+            )
+        }
+    };
+    let closure = one(
+        arguments.args().filter_map(|argument| match argument {
+            ast::Expr::ClosureExpr(closure) => Some(closure),
+            ast::Expr::BlockExpr(block) => match block.tail_expr() {
+                Some(ast::Expr::ClosureExpr(closure)) => Some(closure),
+                _ => None,
+            },
+            _ => None,
+        }),
+        &format!(
+            "closure-valued argument to `{call_name}` in {}",
+            scope.description
+        ),
+    )?;
+
+    let mut helper_arguments = Vec::with_capacity(context.len() + 1);
+    for item in context {
+        helper_arguments.push(match item {
+            ClosureContext::Move(identifier) => identifier_expr(identifier)?,
+            ClosureContext::Clone(identifier) => make::expr_method_call(
+                identifier_expr(identifier)?,
+                make::name_ref("clone"),
+                make::arg_list(std::iter::empty()),
+            )
+            .into(),
+        });
+    }
+    let original_closure = closure.clone();
+    let closure = replace_closure_params(closure, params, call_name, &scope.description)?;
+    helper_arguments.push(closure.into());
+    let helper = path_expr(helper)?;
+    let delegate = make::expr_call(helper, make::arg_list(helper_arguments));
+    editor.replace(original_closure.syntax(), delegate.syntax().clone());
+    commit(source, editor)
+}
+
+fn replace_closure_params(
+    closure: ast::ClosureExpr,
+    params: &[Param<'_>],
+    call_name: &str,
+    scope: &str,
+) -> Result<ast::ClosureExpr, Box<dyn Error>> {
+    let (editor, root) = SyntaxEditor::new(closure.syntax().clone());
+    let old_params = ast::ClosureExpr::cast(root)
+        .expect("closure editor root must be a closure")
+        .param_list()
+        .ok_or_else(|| format!("closure argument to `{call_name}` in {scope} has no parameters"))?;
+    let new_params = make::expr_closure(
+        params.iter().map(|param| {
+            make::param(
+                make::ident_pat(false, false, make::name(param.name)).into(),
+                make::ty(param.ty),
+            )
+        }),
+        make::ext::expr_unit(),
+    )
+    .param_list()
+    .expect("generated closure must have parameters");
+    editor.replace(old_params.syntax(), new_params.syntax().clone());
+    ast::ClosureExpr::cast(editor.finish().new_root().clone())
+        .ok_or_else(|| "edited closure is not a closure".into())
+}
+
+fn path_names(path: &ast::Path) -> Option<Vec<String>> {
+    path.segments()
+        .map(|segment| segment.name_ref().map(|name| name.text().to_string()))
+        .collect()
+}
+
+fn path_ends_with(path: &ast::Path, names: &[&str]) -> bool {
+    path_names(path).is_some_and(|segments| {
+        segments.len() >= names.len()
+            && segments[segments.len() - names.len()..]
+                .iter()
+                .map(String::as_str)
+                .eq(names.iter().copied())
+    })
+}
+
+fn identifier_expr(identifier: &str) -> Result<ast::Expr, Box<dyn Error>> {
+    let expression = path_expr(identifier)?;
+    let ast::Expr::PathExpr(path) = &expression else {
+        unreachable!();
+    };
+    let path = path.path().ok_or("identifier has no path")?;
+    let name = path
+        .segment()
+        .and_then(|segment| segment.name_ref())
+        .ok_or_else(|| format!("`{identifier}` is not an identifier"))?;
+    if path.qualifier().is_some() || name.text() != identifier {
+        return Err(format!("`{identifier}` is not an identifier").into());
+    }
+    Ok(expression)
+}
+
+fn path_expr(path: &str) -> Result<ast::Expr, Box<dyn Error>> {
+    let expression = expr_node(path)?;
+    if matches!(expression, ast::Expr::PathExpr(_)) {
+        Ok(expression)
+    } else {
+        Err(format!("`{path}` is not a path").into())
+    }
+}
+
+fn named_path(path: &str) -> Result<ast::Path, Box<dyn Error>> {
+    let ast::Expr::PathExpr(expression) = path_expr(path)? else {
+        unreachable!();
+    };
+    expression
+        .path()
+        .ok_or_else(|| format!("`{path}` has no path").into())
 }
 
 fn visibility_node(visibility: &str) -> Result<ast::Visibility, Box<dyn Error>> {
@@ -1086,33 +1597,4 @@ fn indent_before(element: &SyntaxElement) -> String {
     };
     let text = whitespace.to_string();
     text.rsplit('\n').next().unwrap_or_default().to_owned()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn injects_use_before_existing_imports() {
-        let mut source = String::from("#![allow(clippy::all)]\n\nuse std::path::Path;\n");
-
-        add_use(&mut source, None, "crate::patched::run_flycheck").unwrap();
-
-        assert_eq!(
-            source,
-            "#![allow(clippy::all)]\n\nuse crate::patched::run_flycheck;\nuse std::path::Path;\n"
-        );
-    }
-
-    #[test]
-    fn injects_aliased_use_before_existing_imports() {
-        let mut source = String::from("#![allow(clippy::all)]\n\nuse std::path::Path;\n");
-
-        add_use_alias(&mut source, None, "crate", "rust_analyzer").unwrap();
-
-        assert_eq!(
-            source,
-            "#![allow(clippy::all)]\n\nuse crate as rust_analyzer;\nuse std::path::Path;\n"
-        );
-    }
 }
