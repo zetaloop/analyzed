@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc as StdArc, time::Duration};
 
 use ide::{Cancellable, FileId};
 use ide_db::base_db::{AnchoredPathBuf, Crate};
@@ -11,6 +11,49 @@ use crate::{
     lsp::to_proto::url_from_abs_path,
     target_spec::TargetSpec,
 };
+
+pub(crate) struct PendingGlobalStateSnapshot {
+    pub(crate) analysis: crate::shared_analyzer::SharedAnalyzerPendingAnalysis,
+    snapshot: std::panic::AssertUnwindSafe<
+        StdArc<dyn Fn(ide::Analysis) -> GlobalStateSnapshot + Send + Sync>,
+    >,
+}
+
+impl Clone for PendingGlobalStateSnapshot {
+    fn clone(&self) -> Self {
+        Self {
+            analysis: self.analysis.clone(),
+            snapshot: std::panic::AssertUnwindSafe(StdArc::clone(&self.snapshot.0)),
+        }
+    }
+}
+
+impl PendingGlobalStateSnapshot {
+    pub(crate) fn activate(&self) -> GlobalStateSnapshot {
+        (self.snapshot.0)(self.analysis.activate())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SnapshotReplay {
+    snapshot: StdArc<dyn Fn() -> GlobalStateSnapshot + Send + Sync>,
+    token: crate::shared_analyzer::SharedAnalyzerSnapshotToken,
+}
+
+impl SnapshotReplay {
+    pub(crate) fn replayable(&self) -> bool {
+        self.token.replayable()
+    }
+
+    pub(crate) fn next(&self) -> Option<GlobalStateSnapshot> {
+        if !self.token.active() || !self.token.replayable() {
+            return None;
+        }
+        let snapshot = (self.snapshot)();
+        let token = snapshot.shared.snapshot_token(&snapshot.analysis);
+        self.token.can_replay(&token).then_some(snapshot)
+    }
+}
 
 impl GlobalState {
     pub(crate) fn new(
@@ -33,9 +76,78 @@ impl GlobalState {
         let _p = tracing::span!(tracing::Level::INFO, "GlobalState::process_changes").entered();
         self.process_shared_changes()
     }
+
+    pub(crate) fn pending_snapshot(&self) -> PendingGlobalStateSnapshot {
+        let analysis = self.shared.pending_analysis();
+        let config = self.config.clone();
+        let check_fixes = self.diagnostics.check_fixes.clone();
+        let mem_docs = self.mem_docs.clone();
+        let semantic_tokens_cache = self.semantic_tokens_cache.clone();
+        let vfs = self.vfs.clone();
+        let workspaces = self.workspaces.clone();
+        let proc_macros_loaded = !self.config.expand_proc_macros()
+            || self
+                .fetch_proc_macros_queue
+                .last_op_result()
+                .copied()
+                .unwrap_or(false);
+        let flycheck = self.flycheck.clone();
+        let minicore = self.minicore.clone();
+        let shared = self.shared.clone();
+        let snapshot = std::panic::AssertUnwindSafe(StdArc::new(move |analysis| GlobalStateSnapshot {
+            config: config.clone(),
+            check_fixes: check_fixes.clone(),
+            analysis,
+            mem_docs: mem_docs.clone(),
+            semantic_tokens_cache: semantic_tokens_cache.clone(),
+            vfs: vfs.clone(),
+            workspaces: workspaces.clone(),
+            proc_macros_loaded,
+            flycheck: flycheck.clone(),
+            minicore: minicore.clone(),
+            shared: shared.clone(),
+        }) as StdArc<dyn Fn(ide::Analysis) -> GlobalStateSnapshot + Send + Sync>);
+        PendingGlobalStateSnapshot { analysis, snapshot }
+    }
 }
 
 impl GlobalStateSnapshot {
+    pub(crate) fn flycheck_handles(&self) -> triomphe::Arc<[crate::flycheck::FlycheckHandle]> {
+        self.flycheck.clone()
+    }
+
+    pub(crate) fn replay(&self) -> SnapshotReplay {
+        let token = self.shared.snapshot_token(&self.analysis);
+        let config = self.config.clone();
+        let check_fixes = self.check_fixes.clone();
+        let mem_docs = self.mem_docs.clone();
+        let semantic_tokens_cache = self.semantic_tokens_cache.clone();
+        let vfs = self.vfs.clone();
+        let workspaces = self.workspaces.clone();
+        let proc_macros_loaded = self.proc_macros_loaded;
+        let flycheck = self.flycheck.clone();
+        let minicore = self.minicore.clone();
+        let shared = self.shared.clone();
+        let snapshot = StdArc::new(move || {
+            let shared = shared.clone();
+            let analysis = shared.analysis();
+            GlobalStateSnapshot {
+                config: config.clone(),
+                check_fixes: check_fixes.clone(),
+                analysis,
+                mem_docs: mem_docs.clone(),
+                semantic_tokens_cache: semantic_tokens_cache.clone(),
+                vfs: vfs.clone(),
+                workspaces: workspaces.clone(),
+                proc_macros_loaded,
+                flycheck: flycheck.clone(),
+                minicore: minicore.clone(),
+                shared,
+            }
+        });
+        SnapshotReplay { snapshot, token }
+    }
+
     pub(crate) fn url_to_file_id(&self, url: &Uri) -> anyhow::Result<Option<FileId>> {
         self.shared.url_to_file_id(url)
     }

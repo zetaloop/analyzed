@@ -1,17 +1,24 @@
-use std::{ops::Deref, panic::UnwindSafe};
+use std::{
+    cell::RefCell,
+    ops::Deref,
+    panic::{AssertUnwindSafe, UnwindSafe},
+    rc::Rc,
+};
 
-use itertools::Itertools;
 use lsp_types::DidSaveTextDocumentParams;
+use paths::AbsPathBuf;
+use rustc_hash::FxHashSet;
+use triomphe::Arc;
 use vfs::{ChangeKind, VfsPath};
 
 use crate::{
-    flycheck::{InvocationStrategy, PackageSpecifier, Target},
-    global_state::{FetchWorkspaceRequest, GlobalState},
+    flycheck::{FlycheckHandle, InvocationStrategy, PackageSpecifier, Target},
+    global_state::{FetchWorkspaceRequest, GlobalState, GlobalStateSnapshot},
     line_index::LineEndings,
     lsp::from_proto,
     reload,
     shared_analyzer::SharedBaseFileChange,
-    target_spec::TargetSpec,
+    shared_global_state::PendingGlobalStateSnapshot,
     try_default,
 };
 
@@ -106,199 +113,189 @@ pub(crate) fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
     let base_file_id = state.shared.base_vfs_path_to_file_id(&vfs_path);
     let file_id = state.shared.vfs_path_to_file_id(&vfs_path);
     if let (Ok(Some(_)), Ok(Some(file_id))) = (base_file_id, file_id) {
-        let world = state.snapshot();
+        let world = state.pending_snapshot();
         let invocation_strategy = state.config.flycheck(None).invocation_strategy();
         let may_flycheck_workspace = state.config.flycheck_workspace(None);
-
         let task: Box<dyn FnOnce() -> ide::Cancellable<()> + Send + UnwindSafe> =
             match invocation_strategy {
-                InvocationStrategy::Once => Box::new(move || {
-                    // FIXME: Because triomphe::Arc's auto UnwindSafe impl requires that the inner type
-                    // be UnwindSafe, and FlycheckHandle is not UnwindSafe, `word.flycheck` cannot
-                    // be captured directly. std::sync::Arc has an UnwindSafe impl that only requires
-                    // that the inner type be RefUnwindSafe, so if we were using that one we wouldn't
-                    // have this problem. Remove the line below when triomphe::Arc has an UnwindSafe impl
-                    // like std::sync::Arc's.
-                    let world = world;
-                    let saved_file = vfs_path.as_path().map(ToOwned::to_owned);
-                    if let Some(flycheck) = world.flycheck.first() {
-                        flycheck.restart_workspace(saved_file);
-                    }
-                    Ok(())
-                }),
-                InvocationStrategy::PerWorkspace => Box::new(move || {
-                    let saved_file = vfs_path.as_path().map(ToOwned::to_owned);
-                    let target = TargetSpec::for_file(&world, file_id)?.map(|it| {
-                        let tgt_kind = it.target_kind();
-                        let (tgt_name, root, package) = match it {
-                            TargetSpec::Cargo(c) => (
-                                Some(c.target),
-                                c.workspace_root,
-                                PackageSpecifier::Cargo { package_id: c.package_id },
-                            ),
-                            TargetSpec::ProjectJson(p) => (
-                                None,
-                                p.project_root,
-                                PackageSpecifier::BuildInfo { label: p.label.clone() },
-                            ),
-                        };
-
-                        let tgt = tgt_name.and_then(|tgt_name| {
-                            Some(match tgt_kind {
-                                project_model::TargetKind::Bin => Target::Bin(tgt_name),
-                                project_model::TargetKind::Example => Target::Example(tgt_name),
-                                project_model::TargetKind::Test => Target::Test(tgt_name),
-                                project_model::TargetKind::Bench => Target::Benchmark(tgt_name),
-                                _ => return None,
-                            })
-                        });
-
-                        (tgt, root, package)
-                    });
-                    tracing::debug!(?target, "flycheck target");
-                    // we have a specific non-library target, attempt to only check that target, nothing
-                    // else will be affected
-                    let mut package_workspace_idx = None;
-                    if let Some((target, root, package)) = target {
-                        // trigger a package check if we have a non-library target as that can't affect
-                        // anything else in the workspace OR if we're not allowed to check the workspace as
-                        // the user opted into package checks then OR if this is not cargo.
-                        let package_check_allowed = target.is_some()
-                            || !may_flycheck_workspace
-                            || matches!(package, PackageSpecifier::BuildInfo { .. });
-                        if package_check_allowed {
-                            package_workspace_idx =
-                                world.workspaces.iter().position(|ws| match &ws.kind {
-                                    project_model::ProjectWorkspaceKind::Cargo {
-                                        cargo,
-                                        ..
-                                    }
-                                    | project_model::ProjectWorkspaceKind::DetachedFile {
-                                        cargo: Some((cargo, _, _)),
-                                        ..
-                                    } => *cargo.workspace_root() == root,
-                                    project_model::ProjectWorkspaceKind::Json(p) => {
-                                        *p.project_root() == root
-                                    }
-                                    project_model::ProjectWorkspaceKind::DetachedFile {
-                                        cargo: None,
-                                        ..
-                                    } => false,
-                                });
-                            if let Some(idx) = package_workspace_idx {
-                                // flycheck handles are indexed by their ID (which is the workspace index),
-                                // but not all workspaces have flycheck enabled (e.g., JSON projects without
-                                // a flycheck template). Find the flycheck handle by its ID.
-                                if let Some(flycheck) =
-                                    world.flycheck.iter().find(|fc| fc.id() == idx)
-                                {
-                                    let workspace_deps =
-                                        world.all_workspace_dependencies_for_package(&package);
-                                    flycheck.restart_for_package(
-                                        package,
-                                        target,
-                                        workspace_deps,
-                                        saved_file.clone(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    if !may_flycheck_workspace {
-                        return Ok(());
-                    }
-
-                    // Trigger flychecks for all workspaces that depend on the saved file
-                    // Crates containing or depending on the saved file
-                    let crate_ids: Vec<_> = world
-                        .analysis
-                        .crates_for(file_id)?
-                        .into_iter()
-                        .flat_map(|id| world.analysis.transitive_rev_deps(id))
-                        .flatten()
-                        .unique()
-                        .collect();
-                    tracing::debug!(?crate_ids, "flycheck crate ids");
-                    let crate_root_paths: Vec<_> = crate_ids
-                        .iter()
-                        .filter_map(|&crate_id| {
-                            world
-                                .analysis
-                                .crate_root(crate_id)
-                                .map(|file_id| {
-                                    world
-                                        .file_id_to_file_path(file_id)
-                                        .as_path()
-                                        .map(ToOwned::to_owned)
-                                })
-                                .transpose()
-                        })
-                        .collect::<ide::Cancellable<_>>()?;
-                    let crate_root_paths: Vec<_> =
-                        crate_root_paths.iter().map(Deref::deref).collect();
-                    tracing::debug!(?crate_root_paths, "flycheck crate roots");
-
-                    // Find all workspaces that have at least one target containing the saved file
-                    let workspace_ids = world.workspaces.iter().enumerate().filter(|&(idx, ws)| {
-                        let ws_contains_file = match &ws.kind {
-                            project_model::ProjectWorkspaceKind::Cargo {
-                                cargo, ..
-                            }
-                            | project_model::ProjectWorkspaceKind::DetachedFile {
-                                cargo: Some((cargo, _, _)),
-                                ..
-                            } => cargo.packages().any(|pkg| {
-                                cargo[pkg]
-                                    .targets
-                                    .iter()
-                                    .any(|&it| crate_root_paths.contains(&cargo[it].root.as_path()))
-                            }),
-                            project_model::ProjectWorkspaceKind::Json(project) => {
-                                project.crates().any(|(_, krate)| {
-                                    crate_root_paths.contains(&krate.root_module.as_path())
-                                })
-                            }
-                            project_model::ProjectWorkspaceKind::DetachedFile {
-                                ..
-                            } => false,
-                        };
-                        let is_pkg_ws = match package_workspace_idx {
-                            Some(pkg_idx) => pkg_idx == idx,
-                            None => false,
-                        };
-                        ws_contains_file && !is_pkg_ws
-                    });
-
-                    let mut workspace_check_triggered = false;
-                    // Find and trigger corresponding flychecks
-                    'flychecks: for flycheck in world.flycheck.iter() {
-                        for (id, _) in workspace_ids.clone() {
-                            if id == flycheck.id() {
-                                workspace_check_triggered = true;
-                                flycheck.restart_workspace(saved_file.clone());
-                                continue 'flychecks;
-                            }
-                        }
-                    }
-
-                    // No specific flycheck was triggered, so let's trigger all of them.
-                    if !workspace_check_triggered && package_workspace_idx.is_none() {
-                        for flycheck in world.flycheck.iter() {
-                            flycheck.restart_workspace(saved_file.clone());
-                        }
-                    }
-                    Ok(())
-                }),
+                InvocationStrategy::Once => {
+                    crate::handlers::notification::run_flycheck_once(world, vfs_path.clone())
+                }
+                InvocationStrategy::PerWorkspace => {
+                    crate::handlers::notification::run_flycheck_per_workspace(
+                        world,
+                        file_id,
+                        vfs_path.clone(),
+                        may_flycheck_workspace,
+                    )
+                }
             };
 
-        state.task_pool.handle.spawn_with_sender(stdx::thread::ThreadIntent::Worker, move |_| {
-            if let Err(e) = std::panic::catch_unwind(task) {
-                tracing::error!("flycheck task panicked: {e:?}")
-            }
-        });
+        state
+            .task_pool
+            .handle
+            .spawn_with_sender(stdx::thread::ThreadIntent::Worker, move |_| {
+                if let Err(e) = std::panic::catch_unwind(task) {
+                    tracing::error!("flycheck task panicked: {e:?}")
+                }
+            });
         true
     } else {
         false
+    }
+}
+
+enum FlycheckRestart {
+    Workspace {
+        handle: usize,
+        saved_file: Option<AbsPathBuf>,
+    },
+    Package {
+        handle: usize,
+        package: PackageSpecifier,
+        target: Option<Target>,
+        workspace_deps: Option<FxHashSet<PackageSpecifier>>,
+        saved_file: Option<AbsPathBuf>,
+    },
+}
+
+struct FlycheckSelection {
+    flycheck: Arc<[FlycheckHandle]>,
+    restarts: Rc<RefCell<Vec<FlycheckRestart>>>,
+}
+
+pub(crate) struct FlycheckSelectionHandle {
+    handle: usize,
+    id: usize,
+    restarts: Rc<RefCell<Vec<FlycheckRestart>>>,
+}
+
+pub(crate) struct FlycheckSelectionWorld {
+    snapshot: GlobalStateSnapshot,
+    pub(crate) flycheck: Vec<FlycheckSelectionHandle>,
+}
+
+pub(crate) fn activate_flycheck<F>(
+    world: PendingGlobalStateSnapshot,
+    f: F,
+) -> impl FnOnce() -> ide::Cancellable<()> + Send + UnwindSafe + 'static
+where
+    F: FnOnce(GlobalStateSnapshot) -> ide::Cancellable<()> + Send + 'static,
+{
+    AssertUnwindSafe(move || f(world.activate()))
+}
+
+pub(crate) fn select_flycheck_per_workspace<F>(
+    world: PendingGlobalStateSnapshot,
+    f: F,
+) -> impl FnOnce() -> ide::Cancellable<()> + Send + UnwindSafe + 'static
+where
+    F: Fn(FlycheckSelectionWorld) -> ide::Cancellable<()> + Send + 'static,
+{
+    AssertUnwindSafe(move || {
+        let mut snapshot = world.activate();
+        loop {
+            let replay = AssertUnwindSafe(snapshot.replay());
+            let (world, selection) = FlycheckSelectionWorld::new(snapshot);
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| f(world)));
+            if replay.replayable()
+                && let Some(next) = replay.next()
+            {
+                snapshot = next;
+                continue;
+            }
+            match result {
+                Ok(result) => result?,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+            selection.execute();
+            return Ok(());
+        }
+    })
+}
+
+impl FlycheckSelectionWorld {
+    fn new(snapshot: GlobalStateSnapshot) -> (Self, FlycheckSelection) {
+        let flycheck = snapshot.flycheck_handles();
+        let restarts = Rc::new(RefCell::new(Vec::new()));
+        let handles = flycheck
+            .iter()
+            .enumerate()
+            .map(|(handle, flycheck)| FlycheckSelectionHandle {
+                handle,
+                id: flycheck.id(),
+                restarts: Rc::clone(&restarts),
+            })
+            .collect();
+        (
+            Self {
+                snapshot,
+                flycheck: handles,
+            },
+            FlycheckSelection { flycheck, restarts },
+        )
+    }
+}
+
+impl Deref for FlycheckSelectionWorld {
+    type Target = GlobalStateSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+impl FlycheckSelectionHandle {
+    pub(crate) fn id(&self) -> usize {
+        self.id
+    }
+
+    pub(crate) fn restart_workspace(&self, saved_file: Option<AbsPathBuf>) {
+        self.restarts.borrow_mut().push(FlycheckRestart::Workspace {
+            handle: self.handle,
+            saved_file,
+        });
+    }
+
+    pub(crate) fn restart_for_package(
+        &self,
+        package: PackageSpecifier,
+        target: Option<Target>,
+        workspace_deps: Option<FxHashSet<PackageSpecifier>>,
+        saved_file: Option<AbsPathBuf>,
+    ) {
+        self.restarts.borrow_mut().push(FlycheckRestart::Package {
+            handle: self.handle,
+            package,
+            target,
+            workspace_deps,
+            saved_file,
+        });
+    }
+}
+
+impl FlycheckSelection {
+    fn execute(self) {
+        for restart in self.restarts.take() {
+            match restart {
+                FlycheckRestart::Workspace { handle, saved_file } => {
+                    self.flycheck[handle].restart_workspace(saved_file);
+                }
+                FlycheckRestart::Package {
+                    handle,
+                    package,
+                    target,
+                    workspace_deps,
+                    saved_file,
+                } => {
+                    self.flycheck[handle].restart_for_package(
+                        package,
+                        target,
+                        workspace_deps,
+                        saved_file,
+                    );
+                }
+            }
+        }
     }
 }

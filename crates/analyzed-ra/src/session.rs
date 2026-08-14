@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     env, fs,
+    panic::AssertUnwindSafe,
     sync::Once,
     time::{Duration, Instant},
 };
@@ -26,6 +27,14 @@ use crate::{
 
 pub(crate) struct Session {
     state: crate::global_state::GlobalState,
+}
+
+struct ActiveSession(SharedAnalyzerRuntime);
+
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        self.0.retire();
+    }
 }
 
 impl Session {
@@ -99,6 +108,7 @@ fn run_shared_state(
     mut state: crate::global_state::GlobalState,
     inbox: Receiver<Message>,
 ) -> anyhow::Result<()> {
+    let _active = ActiveSession(state.shared.clone());
     if state.config.did_save_text_document_dynamic_registration() {
         let additional_patterns = state
             .config
@@ -591,6 +601,14 @@ impl crate::global_state::GlobalState {
                 );
                 None
             }
+            super::Task::RetryDeferred(task) => {
+                self.deferred_task_queue.sender.send(task).unwrap();
+                None
+            }
+            super::Task::RetryDiscoverTests(subscriptions) => {
+                self.spawn_discover_tests(subscriptions);
+                None
+            }
             _ => {
                 let upstream = UpstreamTask::try_from(task)
                     .unwrap_or_else(|_| unreachable!("analyzed task variants handled above"));
@@ -623,15 +641,169 @@ impl crate::global_state::GlobalState {
             .iter()
             .filter_map(|path| shared.vfs_path_to_file_id(path).ok().flatten())
             .collect::<Vec<_>>();
-        let snap = self.snapshot();
-        file_ids
-            .into_iter()
-            .filter(|&file_id| {
-                snap.analysis
-                    .is_library_file(file_id)
-                    .is_ok_and(|is_library| !is_library)
-            })
-            .collect()
+        let mut snapshot = self.snapshot();
+        loop {
+            let replay = snapshot.replay();
+            let result = file_ids
+                .iter()
+                .copied()
+                .filter(|&file_id| {
+                    snapshot
+                        .analysis
+                        .is_library_file(file_id)
+                        .is_ok_and(|it| !it)
+                })
+                .collect();
+            if replay.replayable() {
+                drop(snapshot);
+                if let Some(next) = replay.next() {
+                    snapshot = next;
+                    continue;
+                }
+            }
+            return result;
+        }
+    }
+}
+
+pub(crate) fn prime_caches(
+    analysis: AssertUnwindSafe<crate::shared_analyzer::SharedAnalyzerPendingAnalysis>,
+    f: impl FnOnce(AssertUnwindSafe<ide::Analysis>, Sender<super::Task>)
+    + Send
+    + std::panic::UnwindSafe
+    + 'static,
+) -> impl FnOnce(Sender<super::Task>) + Send + std::panic::UnwindSafe + 'static {
+    move |sender| {
+        let (analysis, snapshot) = analysis.0.activate_snapshot();
+        let (pending, tasks) = crossbeam_channel::unbounded();
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            f(AssertUnwindSafe(analysis), pending)
+        }));
+        if snapshot.replayable() {
+            sender
+                .send(super::Task::PrimeCaches(super::PrimeCachesProgress::End {
+                    cancelled: true,
+                }))
+                .unwrap();
+        } else if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        } else {
+            for task in tasks {
+                sender.send(task).unwrap();
+            }
+        }
+    }
+}
+
+pub(crate) fn discover_tests(
+    snapshot: crate::shared_global_state::PendingGlobalStateSnapshot,
+    subscriptions: Vec<FileId>,
+    f: impl FnOnce(crate::global_state::GlobalStateSnapshot) -> super::Task
+    + Send
+    + std::panic::UnwindSafe
+    + 'static,
+) -> impl FnOnce() -> super::Task + Send + std::panic::UnwindSafe + 'static {
+    move || {
+        let snapshot = snapshot.activate();
+        let replay = snapshot.replay();
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| f(snapshot)));
+        if replay.replayable() {
+            return super::Task::RetryDiscoverTests(subscriptions);
+        }
+        match result {
+            Ok(task) => task,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+}
+
+pub(crate) fn check_if_indexed(
+    snapshot: crate::shared_global_state::PendingGlobalStateSnapshot,
+    uri: Uri,
+    f: impl FnOnce(crate::global_state::GlobalStateSnapshot, Sender<super::Task>)
+    + Send
+    + std::panic::UnwindSafe
+    + 'static,
+) -> impl FnOnce(Sender<super::Task>) + Send + std::panic::UnwindSafe + 'static {
+    move |sender| {
+        let snapshot = snapshot.activate();
+        let replay = snapshot.replay();
+        let (pending, tasks) = crossbeam_channel::unbounded();
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| f(snapshot, pending)));
+        if replay.replayable() {
+            sender
+                .send(super::Task::RetryDeferred(
+                    super::DeferredTask::CheckIfIndexed(uri),
+                ))
+                .unwrap();
+        } else if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        } else {
+            for task in tasks {
+                sender.send(task).unwrap();
+            }
+        }
+    }
+}
+
+pub(crate) fn check_proc_macro_sources(
+    analysis: AssertUnwindSafe<crate::shared_analyzer::SharedAnalyzerPendingAnalysis>,
+    modified_rust_files: Vec<FileId>,
+    f: impl FnOnce(AssertUnwindSafe<ide::Analysis>, Sender<super::Task>)
+    + Send
+    + std::panic::UnwindSafe
+    + 'static,
+) -> impl FnOnce(Sender<super::Task>) + Send + std::panic::UnwindSafe + 'static {
+    move |sender| {
+        let (analysis, snapshot) = analysis.0.activate_snapshot();
+        let (pending, tasks) = crossbeam_channel::unbounded();
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            f(AssertUnwindSafe(analysis), pending)
+        }));
+        if snapshot.replayable() {
+            sender
+                .send(super::Task::RetryDeferred(
+                    super::DeferredTask::CheckProcMacroSources(modified_rust_files),
+                ))
+                .unwrap();
+        } else if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        } else {
+            for task in tasks {
+                sender.send(task).unwrap();
+            }
+        }
+    }
+}
+
+pub(crate) fn fetch_native_diagnostics(
+    pending: &AssertUnwindSafe<&crate::shared_global_state::PendingGlobalStateSnapshot>,
+    subscriptions: std::sync::Arc<[FileId]>,
+    slice: std::ops::Range<usize>,
+    kind: super::NativeDiagnosticsFetchKind,
+) -> Vec<(FileId, Vec<lsp_types::Diagnostic>)> {
+    let semantic = matches!(kind, super::NativeDiagnosticsFetchKind::Semantic);
+    let mut snapshot = pending.0.activate();
+    loop {
+        let replay = snapshot.replay();
+        let diagnostics = crate::diagnostics::_fetch_native_diagnostics(
+            &snapshot,
+            subscriptions.clone(),
+            slice.clone(),
+            if semantic {
+                super::NativeDiagnosticsFetchKind::Semantic
+            } else {
+                super::NativeDiagnosticsFetchKind::Syntax
+            },
+        );
+        if !replay.replayable() {
+            return diagnostics;
+        }
+        drop(snapshot);
+        let Some(next) = replay.next() else {
+            return diagnostics;
+        };
+        snapshot = next;
     }
 }
 

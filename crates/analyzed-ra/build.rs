@@ -57,11 +57,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let generated_src = generated.join("src");
     patch_config_source(&generated_src.join("config.rs"))?;
+    patch_diagnostics_source(&generated_src.join("diagnostics.rs"))?;
     patch_discover_source(&generated_src.join("discover.rs"))?;
     patch_global_state_source(&generated_src.join("global_state.rs"))?;
     patch_main_loop_source(&generated_src.join("main_loop.rs"))?;
     patch_reload_source(&generated_src.join("reload.rs"))?;
     patch_flycheck_to_proto_source(&generated_src.join("diagnostics/flycheck_to_proto.rs"))?;
+    patch_dispatch_source(&generated_src.join("handlers/dispatch.rs"))?;
     patch_notification_source(&generated_src.join("handlers/notification.rs"))?;
     patch_driver_source(&generated_src.join("bin/main.rs"))?;
     write_root_module(
@@ -330,6 +332,22 @@ fn patch_discover_source(discover_rs: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn patch_diagnostics_source(diagnostics_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(diagnostics_rs)?;
+    build_support::rename::<ast::Fn>(
+        &mut source,
+        "fetch_native_diagnostics",
+        "_fetch_native_diagnostics",
+    )?;
+    build_support::add_use(
+        &mut source,
+        Some("pub(crate)"),
+        "crate::main_loop::session::fetch_native_diagnostics",
+    )?;
+    fs::write(diagnostics_rs, source)?;
+    Ok(())
+}
+
 fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(global_state_rs)?;
 
@@ -372,11 +390,13 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
             ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
         }],
     )?;
-    build_support::set_visibility::<ast::RecordField>(
-        &mut source,
-        "GlobalStateSnapshot::mem_docs",
-        "pub(crate)",
-    )?;
+    for field in ["mem_docs", "vfs", "minicore"] {
+        build_support::set_visibility::<ast::RecordField>(
+            &mut source,
+            &format!("GlobalStateSnapshot::{field}"),
+            "pub(crate)",
+        )?;
+    }
     build_support::add_attr::<ast::RecordField>(
         &mut source,
         "GlobalState::last_gc_revision",
@@ -516,10 +536,20 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::append::<ast::Enum>(
         &mut source,
         "Task",
-        &[build_support::Variant {
-            name: "FetchedWorkspace",
-            tuple_fields: &["FetchWorkspaceResponse"],
-        }],
+        &[
+            build_support::Variant {
+                name: "FetchedWorkspace",
+                tuple_fields: &["FetchWorkspaceResponse"],
+            },
+            build_support::Variant {
+                name: "RetryDeferred",
+                tuple_fields: &["DeferredTask"],
+            },
+            build_support::Variant {
+                name: "RetryDiscoverTests",
+                tuple_fields: &["Vec<FileId>"],
+            },
+        ],
     )?;
     build_support::add_attr::<ast::Variant>(
         &mut source,
@@ -575,6 +605,130 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
         },
     )?;
     build_support::add_attr::<ast::Fn>(&mut source, "_update_tests", "#[allow(dead_code)]")?;
+    build_support::redirect_call(
+        &mut source,
+        build_support::Scope::ForLoop {
+            function: "spawn_native_diagnostics",
+        },
+        "snapshot",
+        "pending_snapshot",
+    )?;
+
+    build_support::redirect_call(
+        &mut source,
+        build_support::Scope::MethodArgument {
+            function: "spawn_discover_tests",
+            method: "spawn",
+        },
+        "snapshot",
+        "pending_snapshot",
+    )?;
+    build_support::delegate_closure(
+        &mut source,
+        build_support::ClosureDelegate {
+            scope: build_support::Scope::Function("spawn_discover_tests"),
+            call: build_support::Call::Method("spawn"),
+            helper: "crate::main_loop::session::discover_tests",
+            context: &[
+                build_support::ClosureContext::Move("snapshot"),
+                build_support::ClosureContext::Clone("subscriptions"),
+            ],
+            params: &[build_support::Param {
+                name: "snapshot",
+                ty: "_",
+            }],
+        },
+    )?;
+
+    build_support::redirect_call(
+        &mut source,
+        build_support::Scope::MethodArgument {
+            function: "prime_caches",
+            method: "spawn_with_sender",
+        },
+        "snapshot",
+        "pending_snapshot",
+    )?;
+    build_support::delegate_closure(
+        &mut source,
+        build_support::ClosureDelegate {
+            scope: build_support::Scope::Function("prime_caches"),
+            call: build_support::Call::Method("spawn_with_sender"),
+            helper: "crate::main_loop::session::prime_caches",
+            context: &[build_support::ClosureContext::Move("analysis")],
+            params: &[
+                build_support::Param {
+                    name: "analysis",
+                    ty: "_",
+                },
+                build_support::Param {
+                    name: "sender",
+                    ty: "_",
+                },
+            ],
+        },
+    )?;
+
+    for (scope, method, helper, context, params) in [
+        (
+            build_support::Scope::MatchArm {
+                function: "handle_deferred_task",
+                type_name: "DeferredTask",
+                variant_name: "CheckIfIndexed",
+            },
+            "spawn_with_sender",
+            "crate::main_loop::session::check_if_indexed",
+            &[
+                build_support::ClosureContext::Move("snap"),
+                build_support::ClosureContext::Clone("uri"),
+            ][..],
+            &[
+                build_support::Param {
+                    name: "snap",
+                    ty: "_",
+                },
+                build_support::Param {
+                    name: "sender",
+                    ty: "_",
+                },
+            ][..],
+        ),
+        (
+            build_support::Scope::MatchArm {
+                function: "handle_deferred_task",
+                type_name: "DeferredTask",
+                variant_name: "CheckProcMacroSources",
+            },
+            "spawn_with_sender",
+            "crate::main_loop::session::check_proc_macro_sources",
+            &[
+                build_support::ClosureContext::Move("analysis"),
+                build_support::ClosureContext::Clone("modified_rust_files"),
+            ][..],
+            &[
+                build_support::Param {
+                    name: "analysis",
+                    ty: "_",
+                },
+                build_support::Param {
+                    name: "sender",
+                    ty: "_",
+                },
+            ][..],
+        ),
+    ] {
+        build_support::redirect_call(&mut source, scope, "snapshot", "pending_snapshot")?;
+        build_support::delegate_closure(
+            &mut source,
+            build_support::ClosureDelegate {
+                scope,
+                call: build_support::Call::Method(method),
+                helper,
+                context,
+                params,
+            },
+        )?;
+    }
 
     build_support::extract(
         &mut source,
@@ -760,6 +914,39 @@ fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn patch_dispatch_source(dispatch_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(dispatch_rs)?;
+
+    let shared_dispatch = owned_source_path("shared_dispatch.rs");
+    build_support::mount_module(&mut source, None, "shared_dispatch", &shared_dispatch)?;
+    println!("cargo:rerun-if-changed={}", shared_dispatch.display());
+    build_support::redirect_call(
+        &mut source,
+        build_support::Scope::Function("on_with_thread_intent"),
+        "snapshot",
+        "pending_snapshot",
+    )?;
+    build_support::delegate_closure(
+        &mut source,
+        build_support::ClosureDelegate {
+            scope: build_support::Scope::Function("on_with_thread_intent"),
+            call: build_support::Call::Method("spawn"),
+            helper: "crate::handlers::dispatch::shared_dispatch::on_with_thread_intent",
+            context: &[
+                build_support::ClosureContext::Move("world"),
+                build_support::ClosureContext::Clone("req"),
+            ],
+            params: &[build_support::Param {
+                name: "world",
+                ty: "_",
+            }],
+        },
+    )?;
+
+    fs::write(dispatch_rs, source)?;
+    Ok(())
+}
+
 fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(flycheck_to_proto_rs)?;
 
@@ -776,6 +963,110 @@ fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box
 fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(notification_rs)?;
 
+    build_support::redirect_call(
+        &mut source,
+        build_support::Scope::IfLet {
+            function: "run_flycheck",
+            type_name: "FileExcluded",
+            variant_name: "No",
+        },
+        "snapshot",
+        "pending_snapshot",
+    )?;
+    let once = build_support::Scope::MatchArm {
+        function: "run_flycheck",
+        type_name: "InvocationStrategy",
+        variant_name: "Once",
+    };
+    build_support::extract_match_arm(
+        &mut source,
+        once,
+        build_support::Function {
+            name: "run_flycheck_once",
+            params: &[
+                build_support::Param {
+                    name: "world",
+                    ty: "crate::shared_global_state::PendingGlobalStateSnapshot",
+                },
+                build_support::Param {
+                    name: "vfs_path",
+                    ty: "vfs::VfsPath",
+                },
+            ],
+            args: &["world", "vfs_path.clone()"],
+            return_ty: Some("Box<dyn FnOnce() -> ide::Cancellable<()> + Send + UnwindSafe>"),
+        },
+    )?;
+    build_support::delegate_closure(
+        &mut source,
+        build_support::ClosureDelegate {
+            scope: build_support::Scope::Function("run_flycheck_once"),
+            call: build_support::Call::Function("Box::new"),
+            helper: "crate::shared_notification::activate_flycheck",
+            context: &[build_support::ClosureContext::Move("world")],
+            params: &[build_support::Param {
+                name: "world",
+                ty: "_",
+            }],
+        },
+    )?;
+    let per_workspace = build_support::Scope::MatchArm {
+        function: "run_flycheck",
+        type_name: "InvocationStrategy",
+        variant_name: "PerWorkspace",
+    };
+    build_support::extract_match_arm(
+        &mut source,
+        per_workspace,
+        build_support::Function {
+            name: "run_flycheck_per_workspace",
+            params: &[
+                build_support::Param {
+                    name: "world",
+                    ty: "crate::shared_global_state::PendingGlobalStateSnapshot",
+                },
+                build_support::Param {
+                    name: "file_id",
+                    ty: "ide::FileId",
+                },
+                build_support::Param {
+                    name: "vfs_path",
+                    ty: "vfs::VfsPath",
+                },
+                build_support::Param {
+                    name: "may_flycheck_workspace",
+                    ty: "bool",
+                },
+            ],
+            args: &[
+                "world",
+                "file_id",
+                "vfs_path.clone()",
+                "may_flycheck_workspace",
+            ],
+            return_ty: Some("Box<dyn FnOnce() -> ide::Cancellable<()> + Send + UnwindSafe>"),
+        },
+    )?;
+    build_support::delegate_closure(
+        &mut source,
+        build_support::ClosureDelegate {
+            scope: build_support::Scope::Function("run_flycheck_per_workspace"),
+            call: build_support::Call::Function("Box::new"),
+            helper: "crate::shared_notification::select_flycheck_per_workspace",
+            context: &[build_support::ClosureContext::Move("world")],
+            params: &[build_support::Param {
+                name: "world",
+                ty: "_",
+            }],
+        },
+    )?;
+    for name in [
+        "run_flycheck",
+        "run_flycheck_once",
+        "run_flycheck_per_workspace",
+    ] {
+        build_support::set_visibility::<ast::Fn>(&mut source, name, "pub(crate)")?;
+    }
     build_support::rename::<ast::Fn>(&mut source, "run_flycheck", "_run_flycheck")?;
     build_support::add_attr::<ast::Fn>(&mut source, "_run_flycheck", "#[allow(dead_code)]")?;
     build_support::add_use(

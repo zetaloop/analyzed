@@ -222,11 +222,13 @@ struct SharedWorldAccess {
 struct SharedWorldAccessState {
     readers: BTreeMap<u64, usize>,
     pending_writers: BTreeMap<Option<u64>, usize>,
+    foreign_epochs: BTreeMap<u64, u64>,
 }
 
 pub(crate) struct SharedAnalyzerReadPermit {
     access: Arc<SharedWorldAccess>,
     session_id: u64,
+    foreign_epoch: u64,
 }
 
 struct SharedAnalyzerWritePermit {
@@ -236,7 +238,10 @@ struct SharedAnalyzerWritePermit {
 
 impl SharedWorldAccess {
     fn read(self: &Arc<Self>, session_id: u64) -> SharedAnalyzerReadPermit {
-        let mut state = self.state.lock().expect("shared world access mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("shared world access mutex poisoned");
         while state.read_is_blocked(session_id) {
             state = self
                 .ready
@@ -244,11 +249,19 @@ impl SharedWorldAccess {
                 .expect("shared world access mutex poisoned");
         }
         *state.readers.entry(session_id).or_default() += 1;
-        SharedAnalyzerReadPermit { access: Arc::clone(self), session_id }
+        let foreign_epoch = *state.foreign_epochs.entry(session_id).or_default();
+        SharedAnalyzerReadPermit {
+            access: Arc::clone(self),
+            session_id,
+            foreign_epoch,
+        }
     }
 
     fn write(self: &Arc<Self>, owner: Option<u64>) -> SharedAnalyzerWritePermit {
-        let mut state = self.state.lock().expect("shared world access mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("shared world access mutex poisoned");
         *state.pending_writers.entry(owner).or_default() += 1;
         while state.write_is_blocked(owner) {
             state = self
@@ -256,7 +269,59 @@ impl SharedWorldAccess {
                 .wait(state)
                 .expect("shared world access mutex poisoned");
         }
-        SharedAnalyzerWritePermit { access: Arc::clone(self), owner }
+        SharedAnalyzerWritePermit {
+            access: Arc::clone(self),
+            owner,
+        }
+    }
+
+    fn write_overlay(
+        self: &Arc<Self>,
+        session_id: u64,
+        cancel: impl FnOnce(),
+    ) -> SharedAnalyzerWritePermit {
+        let owner = Some(session_id);
+        let mut state = self
+            .state
+            .lock()
+            .expect("shared world access mutex poisoned");
+        *state.pending_writers.entry(owner).or_default() += 1;
+        let permit = SharedAnalyzerWritePermit {
+            access: Arc::clone(self),
+            owner,
+        };
+        let has_foreign_readers = state
+            .readers
+            .iter()
+            .any(|(&reader, &count)| reader != session_id && count > 0);
+        for (&session, epoch) in &mut state.foreign_epochs {
+            if session != session_id {
+                *epoch += 1;
+            }
+        }
+        if has_foreign_readers {
+            drop(state);
+            cancel();
+            state = self
+                .state
+                .lock()
+                .expect("shared world access mutex poisoned");
+        }
+        while state.write_is_blocked(owner) {
+            state = self
+                .ready
+                .wait(state)
+                .expect("shared world access mutex poisoned");
+        }
+        permit
+    }
+
+    fn unregister_session(&self, session_id: u64) {
+        self.state
+            .lock()
+            .expect("shared world access mutex poisoned")
+            .foreign_epochs
+            .remove(&session_id);
     }
 }
 
@@ -295,6 +360,10 @@ impl SharedAnalyzerReadPermit {
             .state
             .lock()
             .expect("shared world access mutex poisoned")
+    }
+
+    fn foreign_epoch(&self) -> u64 {
+        self.foreign_epoch
     }
 }
 
@@ -1105,8 +1174,10 @@ struct SharedAnalyzerRuntimeSession {
     access: Arc<SharedWorldAccess>,
     gc: Option<Arc<SharedAnalyzerGcCoordinator>>,
     id: u64,
+    active: AtomicBool,
     busy: AtomicBool,
     input_generation: Arc<AtomicU64>,
+    overlay_generation: AtomicU64,
     config_generation_seen: AtomicU64,
     workspace_indexes: Vec<usize>,
     excluded_paths: Vec<String>,
@@ -1114,6 +1185,66 @@ struct SharedAnalyzerRuntimeSession {
     file_mappings: Mutex<SharedFileMappings>,
     analysis_cache: Mutex<SharedAnalysisCache>,
     registry_lease: Option<SharedAnalyzerRegistryLease>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedAnalyzerSnapshotToken {
+    session: Arc<SharedAnalyzerRuntimeSession>,
+    base_generation: u64,
+    overlay_generation: u64,
+    foreign_epoch: u64,
+}
+
+struct SharedAnalyzerAnalysisGuard {
+    _world: SharedAnalyzerReadPermit,
+    _gc: Option<SharedAnalyzerReadPermit>,
+    snapshot: SharedAnalyzerSnapshotToken,
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedAnalyzerPendingAnalysis {
+    runtime: SharedAnalyzerRuntime,
+}
+
+impl SharedAnalyzerPendingAnalysis {
+    pub(crate) fn activate(&self) -> Analysis {
+        self.runtime.analysis()
+    }
+
+    pub(crate) fn activate_snapshot(&self) -> (Analysis, SharedAnalyzerSnapshotToken) {
+        let analysis = self.runtime.analysis();
+        let snapshot = self.runtime.snapshot_token(&analysis);
+        (analysis, snapshot)
+    }
+}
+
+impl SharedAnalyzerSnapshotToken {
+    pub(crate) fn can_replay(&self, next: &Self) -> bool {
+        self.session.active.load(Ordering::SeqCst)
+            && Arc::ptr_eq(&self.session, &next.session)
+            && self.base_generation == next.base_generation
+            && self.overlay_generation == next.overlay_generation
+            && self.foreign_epoch < next.foreign_epoch
+    }
+
+    pub(crate) fn replayable(&self) -> bool {
+        self.session.active.load(Ordering::SeqCst)
+            && self.base_generation == self.session.input_generation.load(Ordering::SeqCst)
+            && self.overlay_generation == self.session.overlay_generation.load(Ordering::SeqCst)
+            && self
+                .session
+                .access
+                .state
+                .lock()
+                .expect("shared world access mutex poisoned")
+                .foreign_epochs
+                .get(&self.session.id)
+                .is_some_and(|epoch| *epoch > self.foreign_epoch)
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        self.session.active.load(Ordering::SeqCst)
+    }
 }
 
 // Visible crate roots and the session mappings only move when the world's
@@ -1129,6 +1260,7 @@ struct SharedAnalysisCache {
 
 impl Drop for SharedAnalyzerRuntimeSession {
     fn drop(&mut self) {
+        self.active.store(false, Ordering::SeqCst);
         {
             let _write = self.access.write(Some(self.id));
             if let Ok(mut world) = self.world.lock()
@@ -1143,6 +1275,7 @@ impl Drop for SharedAnalyzerRuntimeSession {
         {
             registry.unregister(&lease.key);
         }
+        self.access.unregister_session(self.id);
         if let Some(gc) = &self.gc {
             gc.unregister_session(self.busy.load(Ordering::SeqCst));
         }
@@ -1203,8 +1336,10 @@ impl SharedAnalyzerRuntime {
             access,
             gc,
             id,
+            active: AtomicBool::new(true),
             busy: AtomicBool::new(registry_lease.is_some()),
             input_generation,
+            overlay_generation: AtomicU64::new(0),
             config_generation_seen: AtomicU64::new(u64::MAX),
             workspace_indexes,
             excluded_paths,
@@ -1221,6 +1356,11 @@ impl SharedAnalyzerRuntime {
 
     fn session_id(&self) -> u64 {
         self.session.id
+    }
+
+    pub(crate) fn retire(&self) {
+        self.session.active.store(false, Ordering::SeqCst);
+        self.set_busy(false);
     }
 
     pub(crate) fn set_busy(&self, busy: bool) {
@@ -1269,18 +1409,21 @@ impl SharedAnalyzerRuntime {
             .expect("shared analyzer file mappings mutex poisoned") = file_mappings;
     }
 
-    pub(crate) fn analysis(&self) -> Analysis {
-        let gc_read_permit = self
-            .session
-            .gc
-            .as_ref()
-            .map(SharedAnalyzerGcCoordinator::read);
-        let read_permit = self.session.access.read(self.session_id());
-        let world = self
-            .world
-            .lock()
-            .expect("shared world mutex poisoned");
-        let generation = self.session.input_generation.load(Ordering::SeqCst);
+    fn analysis_snapshot(
+        &self,
+        foreign_epoch: u64,
+    ) -> (
+        Analysis,
+        SharedAnalyzerSnapshotToken,
+    ) {
+        let snapshot = SharedAnalyzerSnapshotToken {
+            session: Arc::clone(&self.session),
+            base_generation: self.session.input_generation.load(Ordering::SeqCst),
+            overlay_generation: self.session.overlay_generation.load(Ordering::SeqCst),
+            foreign_epoch,
+        };
+        let world = self.world.lock().expect("shared world mutex poisoned");
+        let generation = snapshot.base_generation;
         let mut cache = self
             .session
             .analysis_cache
@@ -1297,10 +1440,37 @@ impl SharedAnalyzerRuntime {
         }
         let visible_files = Arc::clone(&cache.visible_files);
         drop(cache);
-        let analysis = world
-            .host
-            .analysis_with_visible_files(visible_files);
-        analysis.with_guard((read_permit, gc_read_permit))
+        (world.host.analysis_with_visible_files(visible_files), snapshot)
+    }
+
+    pub(crate) fn analysis(&self) -> Analysis {
+        let gc = self
+            .session
+            .gc
+            .as_ref()
+            .map(SharedAnalyzerGcCoordinator::read);
+        let read = self.session.access.read(self.session_id());
+        let (analysis, snapshot) = self.analysis_snapshot(read.foreign_epoch());
+        analysis.with_guard(SharedAnalyzerAnalysisGuard {
+            _world: read,
+            _gc: gc,
+            snapshot,
+        })
+    }
+
+    pub(crate) fn pending_analysis(&self) -> SharedAnalyzerPendingAnalysis {
+        SharedAnalyzerPendingAnalysis {
+            runtime: self.clone(),
+        }
+    }
+
+    pub(crate) fn snapshot_token(&self, analysis: &Analysis) -> SharedAnalyzerSnapshotToken {
+        let snapshot = &analysis
+            .guard::<SharedAnalyzerAnalysisGuard>()
+            .expect("shared analyzer analysis must retain its access permits")
+            .snapshot;
+        assert!(Arc::ptr_eq(&self.session, &snapshot.session));
+        snapshot.clone()
     }
 
     pub(crate) fn url_to_file_id(&self, url: &Uri) -> anyhow::Result<Option<FileId>> {
@@ -1444,20 +1614,36 @@ impl SharedAnalyzerRuntime {
 
     pub(crate) fn sync_open_files(
         &self,
-        files: Vec<(
-            VfsPath,
-            VfsPath,
-            String,
-            crate::line_index::LineEndings,
-        )>,
+        files: Vec<(VfsPath, VfsPath, String, crate::line_index::LineEndings)>,
     ) -> anyhow::Result<SharedOverlaySync> {
-        let _write = self.session.access.write(Some(self.session_id()));
+        let _read = self.session.access.read(self.session_id());
+        {
+            let world = self
+                .world
+                .lock()
+                .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
+            if !world.session_overlay_changed(self.session_id(), self.workspace_indexes(), &files) {
+                self.refresh_session_cache(&world);
+                return Ok(SharedOverlaySync::default());
+            }
+        }
+        let _write = self.session.access.write_overlay(self.session_id(), || {
+            self.world
+                .lock()
+                .expect("shared world mutex poisoned")
+                .host
+                .trigger_cancellation();
+        });
         let mut world = self
             .world
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
-        let sync = world.sync_session_overlay(self.session_id(), self.workspace_indexes(), files)?;
+        let sync =
+            world.sync_session_overlay(self.session_id(), self.workspace_indexes(), files)?;
         if sync.changed {
+            self.session
+                .overlay_generation
+                .fetch_add(1, Ordering::SeqCst);
             if let Some(gc) = &self.session.gc {
                 gc.changed();
             }
@@ -2594,6 +2780,35 @@ impl SharedWorld {
         }
 
         best.map(|(_, source_root_id, is_library)| (source_root_id, is_library))
+    }
+
+    fn session_overlay_changed(
+        &self,
+        session_id: u64,
+        workspaces: &[usize],
+        files: &[(VfsPath, VfsPath, String, crate::line_index::LineEndings)],
+    ) -> bool {
+        let old_overlay = self.session_overlays.get(&session_id);
+        let mut open_files = 0;
+        for (path, _, text, _) in files {
+            let Some(base_file) = self.base_file(workspaces, &normalize_vfs_path(path)) else {
+                continue;
+            };
+            let db = self.host.raw_database();
+            if db.file_text(base_file).text(db).as_ref() == text.as_str() {
+                continue;
+            }
+            open_files += 1;
+            let key = path_key(path);
+            if !old_overlay
+                .and_then(|overlay| overlay.open_files.get(&key))
+                .is_some_and(|old| old.text == *text)
+            {
+                return true;
+            }
+        }
+
+        old_overlay.is_some_and(|overlay| overlay.open_files.len() != open_files)
     }
 
     pub(crate) fn sync_session_overlay(

@@ -6,7 +6,17 @@ use rustc_hash::FxHashSet;
 use crate::{Analysis, AnalysisHost};
 
 pub(crate) struct AnalysisGuard {
-    _guard: Box<dyn Any + Send + Sync + RefUnwindSafe>,
+    _guard: Box<dyn Guard>,
+}
+
+trait Guard: Any + Send + Sync + RefUnwindSafe {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Any + Send + Sync + RefUnwindSafe> Guard for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 impl fmt::Debug for AnalysisGuard {
@@ -20,16 +30,19 @@ impl Analysis {
         mut self,
         guard: impl Any + Send + Sync + RefUnwindSafe + 'static,
     ) -> Analysis {
-        self.guard = Some(AnalysisGuard { _guard: Box::new(guard) });
+        self.guard = Some(AnalysisGuard {
+            _guard: Box::new(guard),
+        });
         self
+    }
+
+    pub fn guard<T: Any>(&self) -> Option<&T> {
+        self.guard.as_ref()?._guard.as_ref().as_any().downcast_ref()
     }
 }
 
 impl AnalysisHost {
-    pub fn analysis_with_visible_files(
-        &self,
-        visible_files: Arc<FxHashSet<FileId>>,
-    ) -> Analysis {
+    pub fn analysis_with_visible_files(&self, visible_files: Arc<FxHashSet<FileId>>) -> Analysis {
         Analysis {
             db: self.db.clone().with_visible_files(visible_files),
             guard: None,
