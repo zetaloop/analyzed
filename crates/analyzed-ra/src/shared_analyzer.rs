@@ -1,33 +1,35 @@
-	use std::{
-	    collections::{BTreeMap, BTreeSet, btree_map::Entry},
-	    env,
-	    path::PathBuf,
-	    sync::{
-	        Arc, Condvar, LazyLock, Mutex, OnceLock, Weak,
-	        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-	    },
-	};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry},
+    env, fmt,
+    path::PathBuf,
+    sync::{
+        Arc, Condvar, LazyLock, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
+};
 
-	use hir::{ChangeWithProcMacros, ProcMacrosBuilder};
-	use ide::{Analysis, AnalysisHost, FileId, RootDatabase};
-	use ide_db::{
-	    FxHashMap,
-	    base_db::{
-	        CrateGraphBuilder, DependencyBuilder, FileSet, LibraryRoots, LocalRoots,
-	        ProcMacroLoadingError, ProcMacroPaths, SourceDatabase, SourceRoot, SourceRootId,
-	        all_crates,
-	        salsa::{Durability, Setter as _},
-	    },
-	};
-	use load_cargo::{
-	    ProcMacroLoad, WorkspaceLoad, LoadCargoConfig, ProcMacroServerChoice,
-	    load_workspace_change,
-	};
-	use lsp_types::Uri;
-	use proc_macro_api::ProcMacroClient;
-	use project_model::{CargoConfig, ManifestPath, ProjectWorkspace, ProjectWorkspaceKind};
-	use serde::Serialize;
-	use vfs::{AbsPathBuf, Vfs, VfsPath};
+use hir::{ChangeWithProcMacros, ProcMacrosBuilder};
+use ide::{Analysis, AnalysisHost, FileId};
+use ide_db::{
+    FxHashMap,
+    base_db::{
+        CrateGraphBuilder, DependencyBuilder, FileSet, LibraryRoots, LocalRoots,
+        ProcMacroLoadingError, ProcMacroPaths, SourceDatabase, SourceRoot, SourceRootId,
+        all_crates,
+        salsa::{Durability, Revision, Setter as _},
+    },
+};
+use load_cargo::{
+    LoadCargoConfig, ProcMacroLoad, ProcMacroLoadState, ProcMacroServerChoice, SourceRootConfig,
+    WorkspaceLoad, collect_proc_macros, load_workspace_change, source_roots_for_files,
+    workspace_source_root_config,
+};
+use lsp_types::Uri;
+use proc_macro_api::ProcMacroClient;
+use project_model::{
+    CargoConfig, ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, WorkspaceBuildScripts,
+};
+use vfs::{AbsPathBuf, Vfs, VfsPath};
 
 pub static RUST_ANALYZER_VERSION: LazyLock<String> = LazyLock::new(|| {
     let commit = env!("ANALYZED_RA_COMMIT_HASH");
@@ -38,113 +40,17 @@ pub static RUST_ANALYZER_VERSION: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-#[derive(Clone, Debug, Serialize)]
-pub struct RustAnalyzerLspBoundary {
-    pub main_loop: &'static str,
-}
-
-pub fn rust_analyzer_lsp_boundary() -> RustAnalyzerLspBoundary {
-    let _main_loop = crate::main_loop;
-
-    RustAnalyzerLspBoundary {
-        main_loop: "ra_ap_rust_analyzer::main_loop",
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct RustAnalyzerPrivateBoundary {
-    pub global_state: &'static str,
-    pub request_dispatcher: &'static str,
-    pub notification_dispatcher: &'static str,
-}
-
-pub fn rust_analyzer_private_boundary() -> RustAnalyzerPrivateBoundary {
-    let _global_state_size = std::mem::size_of::<crate::global_state::GlobalState>();
-    let _request_dispatcher_size =
-        std::mem::size_of::<crate::handlers::dispatch::RequestDispatcher<'_>>();
-    let _notification_dispatcher_size =
-        std::mem::size_of::<crate::handlers::dispatch::NotificationDispatcher<'_>>();
-
-    RustAnalyzerPrivateBoundary {
-        global_state: std::any::type_name::<crate::global_state::GlobalState>(),
-        request_dispatcher: std::any::type_name::<
-            crate::handlers::dispatch::RequestDispatcher<'_>,
-        >(),
-        notification_dispatcher: std::any::type_name::<
-            crate::handlers::dispatch::NotificationDispatcher<'_>,
-        >(),
-    }
-}
-
 pub fn run_shared_rust_analyzer_lsp_session(
     connection: lsp_server::Connection,
-    provider: SharedAnalyzerProvider,
 ) -> anyhow::Result<()> {
-    crate::main_loop::session::run_shared_lsp_session(connection, provider)
+    crate::main_loop::session::run_shared_lsp_session(connection)
 }
 
 pub fn run_shared_rust_analyzer_lsp_session_with_config(
     config: crate::config::Config,
     connection: lsp_server::Connection,
 ) -> anyhow::Result<()> {
-    let registry = shared_analyzer_registry();
-    let provider = SharedAnalyzerProvider::new(move |key, config, reload_path| {
-        registry.register(key, config, reload_path)
-    });
-
-    crate::main_loop::session::run_shared_lsp_session_with_config(
-        config,
-        connection,
-        provider,
-    )
-}
-
-#[derive(Clone)]
-pub struct SharedAnalyzerProvider {
-    resolve: Arc<
-        dyn Fn(
-                SharedAnalyzerBackendKey,
-                Arc<SharedAnalyzerConfig>,
-                Option<AbsPathBuf>,
-            ) -> anyhow::Result<SharedAnalyzerSession>
-            + Send
-            + Sync
-            + std::panic::RefUnwindSafe,
-    >,
-}
-
-impl SharedAnalyzerProvider {
-    pub fn new<F>(resolve: F) -> Self
-    where
-        F: Fn(
-                SharedAnalyzerBackendKey,
-                Arc<SharedAnalyzerConfig>,
-                Option<AbsPathBuf>,
-            ) -> anyhow::Result<SharedAnalyzerSession>
-            + Send
-            + Sync
-            + std::panic::RefUnwindSafe
-            + 'static,
-    {
-        Self { resolve: Arc::new(resolve) }
-    }
-
-    pub(crate) fn resolve(
-        &self,
-        key: SharedAnalyzerBackendKey,
-        config: Arc<SharedAnalyzerConfig>,
-    ) -> anyhow::Result<SharedAnalyzerSession> {
-        (self.resolve)(key, config, None)
-    }
-
-    pub(crate) fn resolve_reloading(
-        &self,
-        key: SharedAnalyzerBackendKey,
-        config: Arc<SharedAnalyzerConfig>,
-        reload_path: Option<AbsPathBuf>,
-    ) -> anyhow::Result<SharedAnalyzerSession> {
-        (self.resolve)(key, config, reload_path)
-    }
+    crate::main_loop::session::run_shared_lsp_session_with_config(config, connection)
 }
 
 pub fn shared_analyzer_registry() -> Arc<SharedAnalyzerRegistry> {
@@ -171,11 +77,30 @@ struct SharedAnalyzerRegistryState {
     worlds: BTreeMap<SharedAnalyzerWorldKey, SharedAnalyzerWorldEntry>,
     views: BTreeMap<SharedAnalyzerBackendKey, SharedAnalyzerViewEntry>,
     loads: BTreeMap<SharedAnalyzerWorkspaceLoadKey, Arc<SharedAnalyzerWorkspaceLoad>>,
+    operations: BTreeMap<
+        SharedAnalyzerWorldKey,
+        VecDeque<(SharedAnalyzerBackendKey, Arc<SharedAnalyzerReload>)>,
+    >,
+    normal_operations: BTreeMap<SharedAnalyzerWorldKey, Vec<Arc<SharedAnalyzerReload>>>,
 }
 
 struct SharedAnalyzerWorldEntry {
     client_sessions: usize,
     world: Arc<Mutex<SharedWorld>>,
+}
+
+#[derive(Default)]
+struct SharedBaseFileIds(Mutex<BTreeMap<String, FileId>>);
+
+impl SharedBaseFileIds {
+    fn resolve(&self, path: &VfsPath) -> FileId {
+        *self
+            .0
+            .lock()
+            .expect("shared base file ID map is poisoned")
+            .entry(path_key(path))
+            .or_insert_with(allocate_shared_file_id)
+    }
 }
 
 struct SharedAnalyzerViewEntry {
@@ -189,9 +114,57 @@ struct SharedAnalyzerWorkspaceLoadKey {
     project: String,
 }
 
+enum SharedAnalyzerWorkspaceLoadEvent {
+    Progress(String),
+    Finished,
+}
+
 struct SharedAnalyzerWorkspaceLoad {
     result: Mutex<Option<Result<usize, String>>>,
+    listeners: Mutex<Vec<crossbeam_channel::Sender<SharedAnalyzerWorkspaceLoadEvent>>>,
     ready: Condvar,
+}
+
+pub(crate) struct SharedAnalyzerReload {
+    pending_loads: Vec<Arc<SharedAnalyzerWorkspaceLoad>>,
+    pending_normal_operations: Vec<Arc<SharedAnalyzerReload>>,
+    phase: Mutex<()>,
+    keys: Mutex<Vec<ProcMacroSpawnKey>>,
+    generation: AtomicU64,
+    turn_ready: AtomicBool,
+    result: Mutex<Option<Result<Vec<usize>, String>>>,
+    ready: Condvar,
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedAnalyzerOperationToken {
+    session_id: u64,
+    operation: Option<Arc<SharedAnalyzerReload>>,
+    generation: u64,
+}
+
+impl fmt::Debug for SharedAnalyzerOperationToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SharedAnalyzerOperationToken")
+            .field("session_id", &self.session_id)
+            .field("active", &self.operation.is_some())
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+pub(crate) struct SharedAnalyzerOperationWaiter {
+    registry: Weak<SharedAnalyzerRegistry>,
+    world: SharedAnalyzerWorldKey,
+    operation: Arc<SharedAnalyzerReload>,
+    kind: SharedAnalyzerOperationKind,
+}
+
+#[derive(Clone, Copy)]
+enum SharedAnalyzerOperationKind {
+    Explicit,
+    Normal,
 }
 
 struct SharedAnalyzerRegistryLease {
@@ -398,54 +371,68 @@ impl SharedAnalyzerRegistry {
         }
     }
 
-    fn state(
-        &self,
-    ) -> anyhow::Result<std::sync::MutexGuard<'_, SharedAnalyzerRegistryState>> {
-        self.state
-            .lock()
-            .map_err(|error| anyhow::format_err!("shared analyzer registry mutex is poisoned: {error}"))
+    fn state(&self) -> anyhow::Result<std::sync::MutexGuard<'_, SharedAnalyzerRegistryState>> {
+        self.state.lock().map_err(|error| {
+            anyhow::format_err!("shared analyzer registry mutex is poisoned: {error}")
+        })
     }
 
-    pub fn register(
+    pub(crate) fn register(
         self: &Arc<Self>,
         key: SharedAnalyzerBackendKey,
         config: Arc<SharedAnalyzerConfig>,
         reload_path: Option<AbsPathBuf>,
+        reload: bool,
+        load: bool,
+        continuation: Option<SharedAnalyzerOperationToken>,
+        progress: &(dyn Fn(String) + Sync),
     ) -> anyhow::Result<SharedAnalyzerSession> {
         let world = self.world(&key.shared_world)?;
         self.retain_world(&key.shared_world)?;
-        let reload = reload_path.is_some();
 
+        let reload = reload || reload_path.is_some() || continuation.is_some();
         let result = (|| {
-            let mut workspaces = Vec::new();
-
-            for project in config.projects() {
-                workspaces.push(self.ensure_workspace_loaded(
-                    key.shared_world.clone(),
+            let (workspaces, reload_operation) = if !load {
+                (Vec::new(), None)
+            } else if reload {
+                let (workspaces, operation) = self.reload_workspaces(
+                    key.clone(),
                     Arc::clone(&world),
-                    shared_project_key(project),
-                    SharedAnalyzerWorkspaceLoadSource::Project(project.clone()),
                     &config,
-                    reload,
-                )?);
-            }
-            for file in config.detached_files() {
-                workspaces.push(self.ensure_workspace_loaded(
-                    key.shared_world.clone(),
-                    Arc::clone(&world),
-                    shared_detached_file_key(file),
-                    SharedAnalyzerWorkspaceLoadSource::DetachedFile(file.clone()),
-                    &config,
-                    reload,
-                )?);
-            }
-
-            let view = WorkspaceView::new(workspaces, config.excluded_paths().to_vec());
+                    continuation.as_ref(),
+                    progress,
+                )?;
+                (
+                    workspaces
+                        .into_iter()
+                        .map(Ok)
+                        .collect(),
+                    operation,
+                )
+            } else {
+                (
+                    self.load_workspaces(
+                        key.shared_world.clone(),
+                        Arc::clone(&world),
+                        &config,
+                        progress,
+                    ),
+                    None,
+                )
+            };
+            let view = WorkspaceView::new(
+                workspaces
+                    .iter()
+                    .filter_map(|workspace| workspace.as_ref().ok().copied())
+                    .collect(),
+                config.excluded_paths().to_vec(),
+            );
             {
                 let mut state = self.state()?;
                 match state.views.entry(key.clone()) {
                     Entry::Occupied(mut entry) => {
                         entry.get_mut().client_sessions += 1;
+                        entry.get_mut().view = view.clone();
                     }
                     Entry::Vacant(entry) => {
                         entry.insert(SharedAnalyzerViewEntry {
@@ -456,12 +443,15 @@ impl SharedAnalyzerRegistry {
                 }
             }
 
-            Ok(SharedAnalyzerSession::new_registered(
+            Ok(SharedAnalyzerSession::new(
                 world,
                 view,
                 Arc::downgrade(self),
                 Arc::clone(&self.gc),
                 key.clone(),
+                Arc::clone(&config),
+                reload_operation,
+                workspaces,
             ))
         })();
 
@@ -470,6 +460,407 @@ impl SharedAnalyzerRegistry {
         }
 
         result
+    }
+
+    fn load_workspaces(
+        &self,
+        world_key: SharedAnalyzerWorldKey,
+        world: Arc<Mutex<SharedWorld>>,
+        config: &SharedAnalyzerConfig,
+        progress: &(dyn Fn(String) + Sync),
+    ) -> Vec<SharedWorkspaceResult> {
+        let mut workspaces = Vec::new();
+
+        for (load_key, source) in config.workspace_sources() {
+            workspaces.push(
+                self.ensure_workspace_loaded(
+                    world_key.clone(),
+                    Arc::clone(&world),
+                    load_key,
+                    source,
+                    config,
+                    progress,
+                )
+                .map_err(|error| format!("{error:#}")),
+            );
+        }
+
+        workspaces
+    }
+
+    fn prepare_reload_workspaces(
+        &self,
+        world: &Arc<Mutex<SharedWorld>>,
+        config: &SharedAnalyzerConfig,
+        progress: &(dyn Fn(String) + Sync),
+    ) -> anyhow::Result<(Vec<PreparedWorkspaceLoad>, Vec<ProcMacroSpawnKey>)> {
+        let sources = config.workspace_sources().collect::<Vec<_>>();
+        let load_keys = sources
+            .iter()
+            .map(|(load_key, _)| load_key.clone())
+            .collect::<Vec<_>>();
+        let (mut keys, mut clients, base_file_ids) = {
+            let world = world
+                .lock()
+                .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
+            (
+                world.proc_macro_reload_keys(&load_keys, config),
+                world.proc_macro_clients(None),
+                Arc::clone(&world.base_file_ids),
+            )
+        };
+        clients.retain(|(key, _)| !keys.iter().any(|reload| reload == key));
+        let mut loaded = Vec::new();
+        for (_, source) in sources {
+            let (load_key, workspace) = SharedWorld::load_workspace(source, config, progress)?;
+            if let Some(Ok(key)) = proc_macro_spawn_key(
+                &workspace,
+                &config.cargo_config.extra_env,
+                &config.load.to_load_cargo_config(),
+            ) && !keys.iter().any(|old| old == &key)
+            {
+                clients.retain(|(client, _)| client != &key);
+                keys.push(key);
+            }
+            loaded.push(SharedWorld::prepare_loaded_workspace(
+                load_key,
+                workspace,
+                config,
+                &mut clients,
+                metadata_proc_macro_state(config),
+                &base_file_ids,
+            )?);
+        }
+        Ok((loaded, keys))
+    }
+
+    fn reload_continuation(
+        &self,
+        key: &SharedAnalyzerBackendKey,
+        token: Option<&SharedAnalyzerOperationToken>,
+    ) -> anyhow::Result<Option<Arc<SharedAnalyzerReload>>> {
+        let Some(token) = token else {
+            return Ok(None);
+        };
+        let Some(operation) = token
+            .operation
+            .as_ref()
+            .filter(|operation| !operation.finished())
+        else {
+            return Ok(None);
+        };
+        self.continue_operation(key, operation, token.generation)
+            .map(|continued| continued.then(|| Arc::clone(operation)))
+    }
+
+    fn reload_workspaces(
+        &self,
+        key: SharedAnalyzerBackendKey,
+        world: Arc<Mutex<SharedWorld>>,
+        config: &SharedAnalyzerConfig,
+        continuation: Option<&SharedAnalyzerOperationToken>,
+        progress: &(dyn Fn(String) + Sync),
+    ) -> anyhow::Result<(Vec<usize>, Option<Arc<SharedAnalyzerReload>>)> {
+        let continuation = self.reload_continuation(&key, continuation)?;
+        let continued = continuation.is_some();
+        let reload = match continuation {
+            Some(reload) => reload,
+            None => self.enqueue_operation(key.clone())?,
+        };
+        if let Err(error) = self.wait_operation_ready(&key.shared_world, &reload) {
+            self.cancel_operation(&key, &reload, &error);
+            return Err(error);
+        }
+        reload.turn_ready.store(true, Ordering::SeqCst);
+
+        let result = (|| {
+            let (access, base_file_access) = {
+                let world = world.lock().map_err(|error| {
+                    anyhow::format_err!("shared world mutex is poisoned: {error}")
+                })?;
+                (world.access(), world.base_file_access())
+            };
+            let _base_files = base_file_access.lock().map_err(|error| {
+                anyhow::format_err!("shared base-file mutex is poisoned: {error}")
+            })?;
+            let (loaded, keys) = self.prepare_reload_workspaces(&world, config, progress)?;
+            let _phase = self.begin_operation_phase(&key, &reload)?;
+            reload.set_keys(keys.clone());
+            self.commit_workspace_batch_load(&world, &access, loaded, &keys, config)
+        })();
+        if let Err(error) = &result {
+            if !continued {
+                self.finish_operation(&key, &reload, &Err(anyhow::format_err!("{error:#}")));
+            }
+            return Err(anyhow::format_err!("{error:#}"));
+        }
+        Ok((result?, (!continued).then_some(reload)))
+    }
+
+    fn enqueue_operation(
+        &self,
+        key: SharedAnalyzerBackendKey,
+    ) -> anyhow::Result<Arc<SharedAnalyzerReload>> {
+        let mut state = self.state()?;
+        let world_key = key.shared_world.clone();
+        let pending_loads = state
+            .loads
+            .iter()
+            .filter(|(load_key, _)| load_key.world == world_key)
+            .map(|(_, load)| Arc::clone(load))
+            .collect();
+        let pending_normal_operations = state
+            .normal_operations
+            .get(&world_key)
+            .cloned()
+            .unwrap_or_default();
+        let operation = Arc::new(SharedAnalyzerReload::new(
+            pending_loads,
+            pending_normal_operations,
+        ));
+        state
+            .operations
+            .entry(world_key)
+            .or_default()
+            .push_back((key, Arc::clone(&operation)));
+        Ok(operation)
+    }
+
+    fn wait_operation_ready(
+        &self,
+        world_key: &SharedAnalyzerWorldKey,
+        operation: &Arc<SharedAnalyzerReload>,
+    ) -> anyhow::Result<()> {
+        for load in &operation.pending_loads {
+            let _ = load.wait();
+        }
+        for normal_operation in &operation.pending_normal_operations {
+            let _ = normal_operation.wait();
+        }
+        loop {
+            let predecessor = {
+                let state = self.state()?;
+                let queue = state.operations.get(world_key).ok_or_else(|| {
+                    anyhow::format_err!("shared operation is no longer registered")
+                })?;
+                if queue
+                    .front()
+                    .is_some_and(|(_, active)| Arc::ptr_eq(active, operation))
+                {
+                    return Ok(());
+                }
+                if !queue
+                    .iter()
+                    .any(|(_, queued)| Arc::ptr_eq(queued, operation))
+                {
+                    anyhow::bail!("shared operation is no longer registered");
+                }
+                queue.front().map(|(_, active)| Arc::clone(active))
+            };
+            let predecessor = predecessor
+                .ok_or_else(|| anyhow::format_err!("shared operation queue is empty"))?;
+            let _ = predecessor.wait();
+        }
+    }
+
+    fn continue_operation(
+        &self,
+        key: &SharedAnalyzerBackendKey,
+        operation: &Arc<SharedAnalyzerReload>,
+        generation: u64,
+    ) -> anyhow::Result<bool> {
+        let _phase = operation.phase.lock().map_err(|error| {
+            anyhow::format_err!("shared operation phase mutex is poisoned: {error}")
+        })?;
+        let state = self.state()?;
+        let active = state.operations.get(&key.shared_world).is_some_and(|queue| {
+            queue.front().is_some_and(|(active_key, active)| {
+                active_key == key && Arc::ptr_eq(active, operation)
+            })
+        });
+        Ok(active && operation.continue_from(generation))
+    }
+
+    fn begin_operation_phase<'a>(
+        &self,
+        key: &SharedAnalyzerBackendKey,
+        operation: &'a Arc<SharedAnalyzerReload>,
+    ) -> anyhow::Result<std::sync::MutexGuard<'a, ()>> {
+        let phase = operation.phase.lock().map_err(|error| {
+            anyhow::format_err!("shared operation phase mutex is poisoned: {error}")
+        })?;
+        let state = self.state()?;
+        if !state.operations.get(&key.shared_world).is_some_and(|queue| {
+            queue.front().is_some_and(|(active_key, active)| {
+                active_key == key && Arc::ptr_eq(active, operation)
+            })
+        }) {
+            anyhow::bail!("shared operation is no longer registered");
+        }
+        drop(state);
+        Ok(phase)
+    }
+
+    fn begin_normal_operation(
+        &self,
+        key: SharedAnalyzerBackendKey,
+    ) -> anyhow::Result<Arc<SharedAnalyzerReload>> {
+        let mut state = self.state()?;
+        let operation = Arc::new(SharedAnalyzerReload::new(Vec::new(), Vec::new()));
+        state
+            .normal_operations
+            .entry(key.shared_world)
+            .or_default()
+            .push(Arc::clone(&operation));
+        Ok(operation)
+    }
+
+    fn normal_operation_ready(
+        &self,
+        key: &SharedAnalyzerBackendKey,
+        operation: &Arc<SharedAnalyzerReload>,
+    ) -> anyhow::Result<bool> {
+        let state = self.state()?;
+        let Some(active) = state
+            .operations
+            .get(&key.shared_world)
+            .and_then(|queue| queue.front())
+            .map(|(_, operation)| operation)
+        else {
+            return Ok(true);
+        };
+        Ok(active
+            .pending_normal_operations
+            .iter()
+            .any(|pending| Arc::ptr_eq(pending, operation)))
+    }
+
+    fn wait_normal_operation_ready(
+        &self,
+        key: &SharedAnalyzerWorldKey,
+        operation: &Arc<SharedAnalyzerReload>,
+    ) -> anyhow::Result<()> {
+        loop {
+            let active = {
+                let state = self.state()?;
+                if !state.normal_operations.get(key).is_some_and(|operations| {
+                    operations.iter().any(|item| Arc::ptr_eq(item, operation))
+                }) {
+                    anyhow::bail!("shared normal operation is no longer registered");
+                }
+                state
+                    .operations
+                    .get(key)
+                    .and_then(|queue| queue.front())
+                    .map(|(_, active)| Arc::clone(active))
+            };
+            let Some(active) = active else {
+                return Ok(());
+            };
+            if active
+                .pending_normal_operations
+                .iter()
+                .any(|pending| Arc::ptr_eq(pending, operation))
+            {
+                return Ok(());
+            }
+            let _ = active.wait();
+        }
+    }
+
+    fn finish_normal_operation(
+        &self,
+        key: &SharedAnalyzerBackendKey,
+        operation: &Arc<SharedAnalyzerReload>,
+        result: &anyhow::Result<Vec<usize>>,
+    ) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(operations) = state.normal_operations.get_mut(&key.shared_world) else {
+            return false;
+        };
+        let Some(index) = operations
+            .iter()
+            .position(|active| Arc::ptr_eq(active, operation))
+        else {
+            return false;
+        };
+        operation.finish(result);
+        operations.remove(index);
+        if operations.is_empty() {
+            state.normal_operations.remove(&key.shared_world);
+        }
+        true
+    }
+
+    fn active_operation(
+        &self,
+        key: &SharedAnalyzerBackendKey,
+    ) -> anyhow::Result<Option<Arc<SharedAnalyzerReload>>> {
+        let state = self.state()?;
+        Ok(state
+            .operations
+            .get(&key.shared_world)
+            .and_then(|queue| queue.front())
+            .map(|(_, operation)| Arc::clone(operation)))
+    }
+
+    fn finish_operation(
+        &self,
+        key: &SharedAnalyzerBackendKey,
+        operation: &Arc<SharedAnalyzerReload>,
+        result: &anyhow::Result<Vec<usize>>,
+    ) -> bool {
+        let Ok(_phase) = operation.phase.lock() else {
+            return false;
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(queue) = state.operations.get_mut(&key.shared_world) else {
+            return false;
+        };
+        if !queue
+            .front()
+            .is_some_and(|(active_key, active)| active_key == key && Arc::ptr_eq(active, operation))
+        {
+            return false;
+        }
+        operation.finish(result);
+        queue.pop_front();
+        if queue.is_empty() {
+            state.operations.remove(&key.shared_world);
+        }
+        true
+    }
+
+    fn cancel_operation(
+        &self,
+        key: &SharedAnalyzerBackendKey,
+        operation: &Arc<SharedAnalyzerReload>,
+        error: &anyhow::Error,
+    ) {
+        let Ok(_phase) = operation.phase.lock() else {
+            return;
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Some(queue) = state.operations.get_mut(&key.shared_world) else {
+            return;
+        };
+        let Some(index) = queue
+            .iter()
+            .position(|(active_key, active)| active_key == key && Arc::ptr_eq(active, operation))
+        else {
+            return;
+        };
+        operation.finish(&Err(anyhow::format_err!("{error:#}")));
+        queue.remove(index);
+        if queue.is_empty() {
+            state.operations.remove(&key.shared_world);
+        }
     }
 
     fn retain_world(&self, key: &SharedAnalyzerWorldKey) -> anyhow::Result<()> {
@@ -490,15 +881,12 @@ impl SharedAnalyzerRegistry {
         release_world_state(&mut state, key);
     }
 
-    fn world(
-        &self,
-        key: &SharedAnalyzerWorldKey,
-    ) -> anyhow::Result<Arc<Mutex<SharedWorld>>> {
+    fn world(&self, key: &SharedAnalyzerWorldKey) -> anyhow::Result<Arc<Mutex<SharedWorld>>> {
         let mut state = self.state()?;
         let entry = match state.worlds.entry(key.clone()) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
-                let world = SharedWorld::new();
+                let world = SharedWorld::new(&key.database);
                 entry.insert(SharedAnalyzerWorldEntry {
                     client_sessions: 0,
                     world: Arc::new(Mutex::new(world)),
@@ -509,6 +897,44 @@ impl SharedAnalyzerRegistry {
         Ok(Arc::clone(&entry.world))
     }
 
+    fn commit_workspace_load(
+        &self,
+        world: &Arc<Mutex<SharedWorld>>,
+        access: &Arc<SharedWorldAccess>,
+        loaded: PreparedWorkspaceLoad,
+    ) -> anyhow::Result<usize> {
+        let _write = access.write(Some(0));
+        let mut world = world
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
+        let generation = world.input_generation.load(Ordering::SeqCst);
+        let result = world.commit_workspace(loaded);
+        if world.input_generation.load(Ordering::SeqCst) != generation {
+            self.gc.changed();
+        }
+        Ok(result)
+    }
+
+    fn commit_workspace_batch_load(
+        &self,
+        world: &Arc<Mutex<SharedWorld>>,
+        access: &Arc<SharedWorldAccess>,
+        loaded: Vec<PreparedWorkspaceLoad>,
+        reload_keys: &[ProcMacroSpawnKey],
+        config: &SharedAnalyzerConfig,
+    ) -> anyhow::Result<Vec<usize>> {
+        let _write = access.write(Some(0));
+        let mut world = world
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
+        let generation = world.input_generation.load(Ordering::SeqCst);
+        let result = world.commit_workspace_batch(loaded, reload_keys, config);
+        if world.input_generation.load(Ordering::SeqCst) != generation {
+            self.gc.changed();
+        }
+        result
+    }
+
     fn ensure_workspace_loaded(
         &self,
         world_key: SharedAnalyzerWorldKey,
@@ -516,64 +942,95 @@ impl SharedAnalyzerRegistry {
         load_key: String,
         source: SharedAnalyzerWorkspaceLoadSource,
         config: &SharedAnalyzerConfig,
-        reload: bool,
+        progress: &(dyn Fn(String) + Sync),
     ) -> anyhow::Result<usize> {
-        if !reload
-            && let Some(index) = world
-                .lock()
-                .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
-                .workspace_index(&load_key)
-        {
-            return Ok(index);
-        }
-
         let registry_load_key = SharedAnalyzerWorkspaceLoadKey {
             world: world_key,
             project: load_key,
         };
-        let (load, leader) = {
-            let mut state = self.state()?;
-            match state.loads.entry(registry_load_key.clone()) {
-                Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
-                Entry::Vacant(entry) => {
-                    let load = Arc::new(SharedAnalyzerWorkspaceLoad::new());
-                    entry.insert(Arc::clone(&load));
-                    (load, true)
+        loop {
+            let (load, leader, active_operation) = {
+                let mut state = self.state()?;
+                let active_operation = state
+                    .operations
+                    .get(&registry_load_key.world)
+                    .and_then(|queue| queue.front())
+                    .map(|(_, operation)| Arc::clone(operation));
+                if let Some(active_operation) = active_operation {
+                    (None, false, Some(active_operation))
+                } else {
+                    let (load, leader) = match state.loads.entry(registry_load_key.clone()) {
+                        Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
+                        Entry::Vacant(entry) => {
+                            let load = Arc::new(SharedAnalyzerWorkspaceLoad::new());
+                            entry.insert(Arc::clone(&load));
+                            (load, true)
+                        }
+                    };
+                    (Some(load), leader, None)
                 }
-            }
-        };
+            };
 
-        if leader {
-            let result = world
-                .lock()
-                .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))
-                .map(|world| {
-                    world.proc_macro_clients(reload.then_some(registry_load_key.project.as_str()))
-                })
-                .and_then(|proc_macro_clients| {
-                    SharedWorld::prepare_workspace_load(source, config, &proc_macro_clients)
-                })
-                .and_then(|loaded| {
+            if let Some(active_operation) = active_operation {
+                let _ = active_operation.wait();
+                continue;
+            }
+            let load = load.expect("shared analyzer load was registered");
+            let listener = if leader { None } else { load.subscribe()? };
+            if leader {
+                let existing = world
+                    .lock()
+                    .map_err(|error| {
+                        anyhow::format_err!("shared world mutex is poisoned: {error}")
+                    })?
+                    .workspace_index(&registry_load_key.project);
+                let result = if let Some(index) = existing {
+                    Ok(index)
+                } else {
                     let access = world
                         .lock()
-                        .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
+                        .map_err(|error| {
+                            anyhow::format_err!("shared world mutex is poisoned: {error}")
+                        })?
                         .access();
-                    let _write = access.write(None);
-                    let mut world = world
+                    let _read = access.read(0);
+                    world
                         .lock()
-                        .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
-                    let generation = world.input_generation.load(Ordering::SeqCst);
-                    let result = world.commit_workspace(loaded, reload);
-                    if world.input_generation.load(Ordering::SeqCst) != generation {
-                        self.gc.changed();
-                    }
-                    result
-                });
-            load.finish(result);
-            self.state()?.loads.remove(&registry_load_key);
+                        .map_err(|error| {
+                            anyhow::format_err!("shared world mutex is poisoned: {error}")
+                        })
+                        .map(|world| {
+                            (
+                                world.proc_macro_clients(None),
+                                Arc::clone(&world.base_file_ids),
+                            )
+                        })
+                        .and_then(|(proc_macro_clients, base_file_ids)| {
+                            let report = |message: String| {
+                                progress(message.clone());
+                                load.report(message);
+                            };
+                            SharedWorld::prepare_workspace_load(
+                                source.clone(),
+                                config,
+                                &proc_macro_clients,
+                                &base_file_ids,
+                                &report,
+                            )
+                        })
+                        .and_then(|loaded| self.commit_workspace_load(&world, &access, loaded))
+                };
+                load.finish(result);
+                self.state()?.loads.remove(&registry_load_key);
+            }
+            let result = match listener {
+                Some(listener) => load.wait_with_progress(listener, progress),
+                None => load.wait(),
+            };
+            if leader || result.is_ok() {
+                return result;
+            }
         }
-
-        load.wait()
     }
 
     pub fn unregister(&self, key: &SharedAnalyzerBackendKey) {
@@ -665,10 +1122,7 @@ impl SharedAnalyzerRegistry {
     }
 }
 
-fn release_world_state(
-    state: &mut SharedAnalyzerRegistryState,
-    key: &SharedAnalyzerWorldKey,
-) {
+fn release_world_state(state: &mut SharedAnalyzerRegistryState, key: &SharedAnalyzerWorldKey) {
     if let Some(entry) = state.worlds.get_mut(key) {
         entry.client_sessions = entry.client_sessions.saturating_sub(1);
         if entry.client_sessions == 0 {
@@ -681,22 +1135,56 @@ impl SharedAnalyzerWorkspaceLoad {
     fn new() -> Self {
         Self {
             result: Mutex::new(None),
+            listeners: Mutex::new(Vec::new()),
             ready: Condvar::new(),
+        }
+    }
+
+    fn subscribe(
+        &self,
+    ) -> anyhow::Result<Option<crossbeam_channel::Receiver<SharedAnalyzerWorkspaceLoadEvent>>> {
+        let slot = self.result.lock().map_err(|error| {
+            anyhow::format_err!("shared analyzer load mutex is poisoned: {error}")
+        })?;
+        if slot.is_some() {
+            return Ok(None);
+        }
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        self.listeners
+            .lock()
+            .map_err(|error| {
+                anyhow::format_err!("shared analyzer load listener mutex is poisoned: {error}")
+            })?
+            .push(sender);
+        Ok(Some(receiver))
+    }
+
+    fn report(&self, message: String) {
+        if let Ok(mut listeners) = self.listeners.lock() {
+            listeners.retain(|listener| {
+                listener
+                    .send(SharedAnalyzerWorkspaceLoadEvent::Progress(message.clone()))
+                    .is_ok()
+            });
         }
     }
 
     fn finish(&self, result: anyhow::Result<usize>) {
         if let Ok(mut slot) = self.result.lock() {
             *slot = Some(result.map_err(|error| format!("{error:#}")));
+            if let Ok(mut listeners) = self.listeners.lock() {
+                for listener in listeners.drain(..) {
+                    _ = listener.send(SharedAnalyzerWorkspaceLoadEvent::Finished);
+                }
+            }
             self.ready.notify_all();
         }
     }
 
     fn wait(&self) -> anyhow::Result<usize> {
-        let mut slot = self
-            .result
-            .lock()
-            .map_err(|error| anyhow::format_err!("shared analyzer load mutex is poisoned: {error}"))?;
+        let mut slot = self.result.lock().map_err(|error| {
+            anyhow::format_err!("shared analyzer load mutex is poisoned: {error}")
+        })?;
 
         loop {
             if let Some(result) = &*slot {
@@ -705,10 +1193,143 @@ impl SharedAnalyzerWorkspaceLoad {
                     .copied()
                     .map_err(|error| anyhow::format_err!("{error}"));
             }
-            slot = self
-                .ready
-                .wait(slot)
-                .map_err(|error| anyhow::format_err!("shared analyzer load mutex is poisoned: {error}"))?;
+            slot = self.ready.wait(slot).map_err(|error| {
+                anyhow::format_err!("shared analyzer load mutex is poisoned: {error}")
+            })?;
+        }
+    }
+
+    fn wait_with_progress(
+        &self,
+        receiver: crossbeam_channel::Receiver<SharedAnalyzerWorkspaceLoadEvent>,
+        progress: &(dyn Fn(String) + Sync),
+    ) -> anyhow::Result<usize> {
+        while let Ok(event) = receiver.recv() {
+            match event {
+                SharedAnalyzerWorkspaceLoadEvent::Progress(message) => progress(message),
+                SharedAnalyzerWorkspaceLoadEvent::Finished => break,
+            }
+        }
+        self.wait()
+    }
+}
+
+impl SharedAnalyzerOperationWaiter {
+    pub(crate) fn wait(self) -> anyhow::Result<()> {
+        let Some(registry) = self.registry.upgrade() else {
+            return Ok(());
+        };
+        let result = match self.kind {
+            SharedAnalyzerOperationKind::Explicit => {
+                registry.wait_operation_ready(&self.world, &self.operation)
+            }
+            SharedAnalyzerOperationKind::Normal => {
+                registry.wait_normal_operation_ready(&self.world, &self.operation)
+            }
+        };
+        if result.is_ok() {
+            self.operation.turn_ready.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+}
+
+impl SharedAnalyzerReload {
+    fn new(
+        pending_loads: Vec<Arc<SharedAnalyzerWorkspaceLoad>>,
+        pending_normal_operations: Vec<Arc<SharedAnalyzerReload>>,
+    ) -> Self {
+        Self {
+            pending_loads,
+            pending_normal_operations,
+            phase: Mutex::new(()),
+            keys: Mutex::new(Vec::new()),
+            generation: AtomicU64::new(0),
+            turn_ready: AtomicBool::new(false),
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn turn_ready(&self) -> bool {
+        self.turn_ready.load(Ordering::SeqCst)
+    }
+
+    fn continue_from(&self, generation: u64) -> bool {
+        self.generation
+            .compare_exchange(
+                generation,
+                generation + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn set_keys(&self, keys: Vec<ProcMacroSpawnKey>) {
+        *self
+            .keys
+            .lock()
+            .expect("shared analyzer reload mutex poisoned") = keys;
+    }
+
+    fn active_keys(&self) -> Option<Vec<ProcMacroSpawnKey>> {
+        if !self.turn_ready() {
+            return None;
+        }
+        let result = self
+            .result
+            .lock()
+            .expect("shared analyzer reload mutex poisoned");
+        if result.is_some() {
+            return None;
+        }
+        Some(
+            self.keys
+                .lock()
+                .expect("shared analyzer reload mutex poisoned")
+                .clone(),
+        )
+    }
+
+    fn finished(&self) -> bool {
+        self.result
+            .lock()
+            .expect("shared analyzer reload mutex poisoned")
+            .is_some()
+    }
+
+    fn finish(&self, result: &anyhow::Result<Vec<usize>>) {
+        if let Ok(mut slot) = self.result.lock() {
+            *slot = Some(
+                result
+                    .as_ref()
+                    .map(Vec::clone)
+                    .map_err(|error| format!("{error:#}")),
+            );
+            self.ready.notify_all();
+        }
+    }
+
+    fn wait(&self) -> anyhow::Result<Vec<usize>> {
+        let mut slot = self.result.lock().map_err(|error| {
+            anyhow::format_err!("shared analyzer reload mutex is poisoned: {error}")
+        })?;
+
+        loop {
+            if let Some(result) = &*slot {
+                return result
+                    .as_ref()
+                    .cloned()
+                    .map_err(|error| anyhow::format_err!("{error}"));
+            }
+            slot = self.ready.wait(slot).map_err(|error| {
+                anyhow::format_err!("shared analyzer reload mutex is poisoned: {error}")
+            })?;
         }
     }
 }
@@ -734,7 +1355,10 @@ impl SharedAnalyzerGcCoordinator {
 
     fn set_session_busy(&self, busy: bool) {
         let collect = {
-            let mut state = self.state.lock().expect("shared analyzer gc mutex poisoned");
+            let mut state = self
+                .state
+                .lock()
+                .expect("shared analyzer gc mutex poisoned");
             if busy {
                 state.busy_sessions += 1;
             } else {
@@ -749,7 +1373,10 @@ impl SharedAnalyzerGcCoordinator {
 
     fn unregister_session(&self, busy: bool) {
         let collect = {
-            let mut state = self.state.lock().expect("shared analyzer gc mutex poisoned");
+            let mut state = self
+                .state
+                .lock()
+                .expect("shared analyzer gc mutex poisoned");
             if busy {
                 state.busy_sessions -= 1;
             }
@@ -769,7 +1396,10 @@ impl SharedAnalyzerGcCoordinator {
 
     fn request(&self) {
         let collect = {
-            let mut state = self.state.lock().expect("shared analyzer gc mutex poisoned");
+            let mut state = self
+                .state
+                .lock()
+                .expect("shared analyzer gc mutex poisoned");
             state.dirty = true;
             self.start_if_ready(&mut state)
         };
@@ -795,7 +1425,10 @@ impl SharedAnalyzerGcCoordinator {
                 shared_analyzer_registry().collect_garbage();
             }
 
-            let mut state = self.state.lock().expect("shared analyzer gc mutex poisoned");
+            let mut state = self
+                .state
+                .lock()
+                .expect("shared analyzer gc mutex poisoned");
             state.collecting = false;
             if !self.start_if_ready(&mut state) {
                 return;
@@ -813,7 +1446,15 @@ pub struct SharedAnalyzerBackendKey {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SharedAnalyzerWorldKey {
     pub cargo: SharedAnalyzerCargoConfigKey,
+    pub database: SharedAnalyzerDatabaseConfigKey,
     pub load: SharedAnalyzerLoadKey,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SharedAnalyzerDatabaseConfigKey {
+    pub lru_parse_query_capacity: Option<u16>,
+    pub lru_query_capacities: BTreeMap<Box<str>, u16>,
+    pub expand_proc_attr_macros: bool,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -841,6 +1482,7 @@ pub struct SharedAnalyzerCargoConfigKey {
 pub struct SharedAnalyzerLoadKey {
     pub load_out_dirs_from_check: bool,
     pub proc_macro_server: SharedAnalyzerProcMacroServerKey,
+    pub ignored_proc_macros: Vec<(Box<str>, Vec<Box<str>>)>,
     pub proc_macro_processes: u16,
 }
 
@@ -861,6 +1503,21 @@ pub struct SharedAnalyzerViewKey {
 enum SharedAnalyzerWorkspaceLoadSource {
     Project(crate::config::LinkedProject),
     DetachedFile(ManifestPath),
+}
+
+pub(crate) fn shared_database_config_key(
+    config: &crate::config::Config,
+) -> SharedAnalyzerDatabaseConfigKey {
+    SharedAnalyzerDatabaseConfigKey {
+        lru_parse_query_capacity: config.lru_parse_query_capacity(),
+        lru_query_capacities: config
+            .lru_query_capacities_config()
+            .into_iter()
+            .flatten()
+            .map(|(query, capacity)| (query.clone(), *capacity))
+            .collect(),
+        expand_proc_attr_macros: config.expand_proc_attr_macros(),
+    }
 }
 
 pub(crate) fn shared_analyzer_context_from_config(
@@ -889,6 +1546,7 @@ pub(crate) fn shared_analyzer_context_from_config(
     let backend_key = SharedAnalyzerBackendKey {
         shared_world: SharedAnalyzerWorldKey {
             cargo: cargo_config_key(&cargo_config),
+            database: shared_database_config_key(config),
             load: load.key.clone(),
         },
         workspace_view: SharedAnalyzerViewKey {
@@ -922,12 +1580,23 @@ impl SharedAnalyzerConfig {
         &self.excluded_paths
     }
 
-    fn projects(&self) -> &[crate::config::LinkedProject] {
-        &self.projects
-    }
-
-    fn detached_files(&self) -> &[ManifestPath] {
-        &self.detached_files
+    fn workspace_sources(
+        &self,
+    ) -> impl Iterator<Item = (String, SharedAnalyzerWorkspaceLoadSource)> + '_ {
+        self.projects
+            .iter()
+            .map(|project| {
+                (
+                    shared_project_key(project),
+                    SharedAnalyzerWorkspaceLoadSource::Project(project.clone()),
+                )
+            })
+            .chain(self.detached_files.iter().map(|file| {
+                (
+                    shared_detached_file_key(file),
+                    SharedAnalyzerWorkspaceLoadSource::DetachedFile(file.clone()),
+                )
+            }))
     }
 }
 
@@ -970,6 +1639,13 @@ impl SharedLoadConfig {
 fn shared_load_config_from_config(
     config: &crate::config::Config,
 ) -> anyhow::Result<SharedLoadConfig> {
+    let mut ignored_proc_macros = config
+        .ignored_proc_macros(None)
+        .iter()
+        .map(|(name, macros)| (name.clone(), macros.to_vec()))
+        .collect::<Vec<_>>();
+    ignored_proc_macros.sort();
+
     Ok(SharedLoadConfig {
         key: SharedAnalyzerLoadKey {
             load_out_dirs_from_check: config.run_build_scripts(None),
@@ -981,6 +1657,7 @@ fn shared_load_config_from_config(
             } else {
                 SharedAnalyzerProcMacroServerKey::None
             },
+            ignored_proc_macros,
             proc_macro_processes: u16::try_from(config.proc_macro_num_processes())?,
         },
         prefill_caches: config.prefill_caches(),
@@ -1021,32 +1698,6 @@ fn cargo_config_key(config: &CargoConfig) -> SharedAnalyzerCargoConfigKey {
     }
 }
 
-pub(crate) fn patch_path_prefix(path: PathBuf) -> PathBuf {
-    use std::path::{Component, Prefix};
-
-    if cfg!(windows) {
-        let mut components = path.components();
-        match components.next() {
-            Some(Component::Prefix(prefix)) => {
-                let prefix = match prefix.kind() {
-                    Prefix::Disk(disk) => format!("{}:", disk.to_ascii_uppercase() as char),
-                    Prefix::VerbatimDisk(disk) => {
-                        format!(r"\\?\{}:", disk.to_ascii_uppercase() as char)
-                    }
-                    _ => return path,
-                };
-                let mut path = PathBuf::new();
-                path.push(prefix);
-                path.extend(components);
-                path
-            }
-            _ => path,
-        }
-    } else {
-        path
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct WorkspaceSummary {
     pub root: String,
@@ -1056,57 +1707,82 @@ pub struct WorkspaceSummary {
     pub proc_macro_server: bool,
 }
 
-#[derive(Clone)]
-pub struct SharedAnalyzerSession {
-    world: Arc<Mutex<SharedWorld>>,
-    view: WorkspaceView,
+type SharedWorkspaceResult = Result<usize, String>;
+
+pub(crate) struct SharedAnalyzerSession {
     runtime: SharedAnalyzerRuntime,
+    workspaces: Vec<SharedWorkspaceResult>,
 }
 
 impl SharedAnalyzerSession {
-    fn new_registered(
+    fn new(
         world: Arc<Mutex<SharedWorld>>,
         view: WorkspaceView,
         registry: Weak<SharedAnalyzerRegistry>,
         gc: Arc<SharedAnalyzerGcCoordinator>,
         key: SharedAnalyzerBackendKey,
+        config: Arc<SharedAnalyzerConfig>,
+        reload: Option<Arc<SharedAnalyzerReload>>,
+        workspaces: Vec<SharedWorkspaceResult>,
     ) -> Self {
-        let runtime = SharedAnalyzerRuntime::new_registered(
+        let runtime = SharedAnalyzerRuntime::new(
             Arc::clone(&world),
             &view,
             registry,
             gc,
             key,
+            config,
+            reload,
         );
 
-        Self {
-            world,
-            view,
-            runtime,
-        }
+        Self { runtime, workspaces }
     }
 
-    pub fn workspaces(&self) -> anyhow::Result<Vec<ProjectWorkspace>> {
+    pub(crate) fn workspaces(
+        &self,
+    ) -> anyhow::Result<(Vec<anyhow::Result<ProjectWorkspace>>, bool)> {
         let world = self
+            .runtime
+            .session
             .world
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
+        let build_data_loaded = self.workspaces.iter().all(|workspace| {
+            workspace
+                .as_ref()
+                .map_or(true, |index| {
+                    world.loaded_workspaces[*index].input.build_data_loaded
+                })
+        });
+        let workspaces = self
+            .workspaces
+            .iter()
+            .map(|workspace| match workspace.as_ref() {
+                Ok(index) => Ok(world.loaded_workspaces[*index].workspace.clone()),
+                Err(error) => Err(anyhow::format_err!("{error}")),
+            })
+            .collect();
 
-        Ok(world.workspaces(&self.view))
+        Ok((workspaces, build_data_loaded))
     }
 
-    pub fn runtime(&self) -> SharedAnalyzerRuntime {
+    pub(crate) fn runtime(&self) -> SharedAnalyzerRuntime {
         self.runtime.clone()
     }
 }
 
 #[derive(Clone)]
-pub struct SharedAnalyzerRuntime {
+pub(crate) struct SharedAnalyzerRuntime {
     session: Arc<SharedAnalyzerRuntimeSession>,
+}
+
+pub(crate) struct SharedAnalyzerRuntimeWeak {
+    session: Weak<SharedAnalyzerRuntimeSession>,
 }
 
 struct SharedAnalyzerRuntimeSession {
     world: Arc<Mutex<SharedWorld>>,
+    config: Arc<SharedAnalyzerConfig>,
     access: Arc<SharedWorldAccess>,
     gc: Arc<SharedAnalyzerGcCoordinator>,
     id: u64,
@@ -1115,12 +1791,18 @@ struct SharedAnalyzerRuntimeSession {
     input_generation: Arc<AtomicU64>,
     overlay_generation: AtomicU64,
     config_generation_seen: AtomicU64,
+    workspace_updates: crossbeam_channel::Receiver<()>,
+    workspace_update_pending: Arc<AtomicBool>,
     workspace_indexes: Vec<usize>,
     excluded_paths: Vec<String>,
     line_endings: Mutex<SharedLineEndings>,
     file_mappings: Mutex<SharedFileMappings>,
     analysis_cache: Mutex<SharedAnalysisCache>,
     registry_lease: SharedAnalyzerRegistryLease,
+    reload: Mutex<Option<Arc<SharedAnalyzerReload>>>,
+    next_reload: Mutex<Option<Arc<SharedAnalyzerReload>>>,
+    rebuild: Mutex<Option<Arc<SharedAnalyzerReload>>>,
+    normal: Mutex<Option<Arc<SharedAnalyzerReload>>>,
 }
 
 #[derive(Clone)]
@@ -1194,9 +1876,40 @@ struct SharedAnalysisCache {
     visible_files: Arc<rustc_hash::FxHashSet<FileId>>,
 }
 
+impl SharedAnalyzerRuntimeSession {
+    fn cancel_operations(&self, registry: &SharedAnalyzerRegistry, error: &anyhow::Error) {
+        for slot in [&self.reload, &self.next_reload, &self.rebuild] {
+            if let Ok(mut slot) = slot.lock()
+                && let Some(operation) = slot.take()
+                && !operation.finished()
+            {
+                registry.cancel_operation(&self.registry_lease.key, &operation, error);
+            }
+        }
+        if let Ok(mut normal) = self.normal.lock()
+            && let Some(operation) = normal.take()
+            && !operation.finished()
+        {
+            registry.finish_normal_operation(
+                &self.registry_lease.key,
+                &operation,
+                &Err(anyhow::format_err!("{error:#}")),
+            );
+        }
+    }
+}
+
 impl Drop for SharedAnalyzerRuntimeSession {
     fn drop(&mut self) {
         self.active.store(false, Ordering::SeqCst);
+        let lease = &self.registry_lease;
+        if let Some(registry) = lease.registry.upgrade() {
+            self.cancel_operations(
+                &registry,
+                &anyhow::format_err!("shared analyzer session dropped"),
+            );
+            registry.unregister(&lease.key);
+        }
         {
             let _write = self.access.write(Some(self.id));
             if let Ok(mut world) = self.world.lock()
@@ -1204,9 +1917,6 @@ impl Drop for SharedAnalyzerRuntimeSession {
             {
                 self.gc.changed();
             }
-        }
-        if let Some(registry) = self.registry_lease.registry.upgrade() {
-            registry.unregister(&self.registry_lease.key);
         }
         self.access.unregister_session(self.id);
         self.gc
@@ -1222,23 +1932,33 @@ impl std::fmt::Debug for SharedAnalyzerRuntime {
     }
 }
 
+impl SharedAnalyzerRuntimeWeak {
+    pub(crate) fn upgrade(&self) -> Option<SharedAnalyzerRuntime> {
+        let session = self.session.upgrade()?;
+        Some(SharedAnalyzerRuntime { session })
+    }
+}
+
 impl SharedAnalyzerRuntime {
-    fn new_registered(
+    fn new(
         world: Arc<Mutex<SharedWorld>>,
         view: &WorkspaceView,
         registry: Weak<SharedAnalyzerRegistry>,
         gc: Arc<SharedAnalyzerGcCoordinator>,
         key: SharedAnalyzerBackendKey,
+        config: Arc<SharedAnalyzerConfig>,
+        reload: Option<Arc<SharedAnalyzerReload>>,
     ) -> Self {
         gc.register_session();
-        let workspace_indexes = view.workspace_indexes().collect();
+        let workspace_indexes = view.workspace_indexes().collect::<Vec<_>>();
         let excluded_paths = view.excluded_paths().to_vec();
-        let (id, input_generation, access) = world
+        let (id, input_generation, access, workspace_updates, workspace_update_pending) = world
             .lock()
             .expect("shared world mutex poisoned")
-            .register_session();
+            .register_session(&workspace_indexes);
         let session = Arc::new(SharedAnalyzerRuntimeSession {
             world: Arc::clone(&world),
+            config,
             access,
             gc,
             id,
@@ -1247,12 +1967,18 @@ impl SharedAnalyzerRuntime {
             input_generation,
             overlay_generation: AtomicU64::new(0),
             config_generation_seen: AtomicU64::new(u64::MAX),
+            workspace_updates,
+            workspace_update_pending,
             workspace_indexes,
             excluded_paths,
             line_endings: Mutex::new(SharedLineEndings::default()),
             file_mappings: Mutex::new(SharedFileMappings::default()),
             analysis_cache: Mutex::new(SharedAnalysisCache::default()),
             registry_lease: SharedAnalyzerRegistryLease { registry, key },
+            reload: Mutex::new(reload),
+            next_reload: Mutex::new(None),
+            rebuild: Mutex::new(None),
+            normal: Mutex::new(None),
         });
 
         let runtime = Self { session };
@@ -1260,13 +1986,525 @@ impl SharedAnalyzerRuntime {
         runtime
     }
 
-    fn session_id(&self) -> u64 {
+    pub(crate) fn session_id(&self) -> u64 {
         self.session.id
+    }
+
+    pub(crate) fn is_same_session(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.session, &other.session)
     }
 
     pub(crate) fn retire(&self) {
         self.session.active.store(false, Ordering::SeqCst);
         self.set_busy(false);
+    }
+
+    pub(crate) fn downgrade(&self) -> SharedAnalyzerRuntimeWeak {
+        SharedAnalyzerRuntimeWeak {
+            session: Arc::downgrade(&self.session),
+        }
+    }
+
+    pub(crate) fn begin_reload(
+        &self,
+    ) -> anyhow::Result<Option<(SharedAnalyzerOperationToken, SharedAnalyzerOperationWaiter)>> {
+        let lease = &self.session.registry_lease;
+        let Some(registry) = lease.registry.upgrade() else {
+            return Ok(None);
+        };
+        let operation = registry.enqueue_operation(lease.key.clone())?;
+        let mut reload = self
+            .session
+            .reload
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared reload mutex is poisoned: {error}"))?;
+        let slot = if reload.is_none() {
+            &mut *reload
+        } else {
+            drop(reload);
+            let mut next =
+                self.session.next_reload.lock().map_err(|error| {
+                    anyhow::format_err!("shared reload mutex is poisoned: {error}")
+                })?;
+            if next.is_some() {
+                registry.cancel_operation(
+                    &lease.key,
+                    &operation,
+                    &anyhow::format_err!("shared reload request was coalesced"),
+                );
+                return Ok(None);
+            }
+            *next = Some(Arc::clone(&operation));
+            let token = SharedAnalyzerOperationToken {
+                session_id: self.session_id(),
+                operation: Some(Arc::clone(&operation)),
+                generation: operation.generation(),
+            };
+            let waiter = SharedAnalyzerOperationWaiter {
+                registry: lease.registry.clone(),
+                world: lease.key.shared_world.clone(),
+                operation,
+                kind: SharedAnalyzerOperationKind::Explicit,
+            };
+            return Ok(Some((token, waiter)));
+        };
+        *slot = Some(Arc::clone(&operation));
+        let token = SharedAnalyzerOperationToken {
+            session_id: self.session_id(),
+            operation: Some(Arc::clone(&operation)),
+            generation: operation.generation(),
+        };
+        let waiter = SharedAnalyzerOperationWaiter {
+            registry: lease.registry.clone(),
+            world: lease.key.shared_world.clone(),
+            operation,
+            kind: SharedAnalyzerOperationKind::Explicit,
+        };
+        Ok(Some((token, waiter)))
+    }
+
+    pub(crate) fn activate_reload(&self, token: &SharedAnalyzerOperationToken) -> bool {
+        let Some(expected) = &token.operation else {
+            return false;
+        };
+        let mut reload = self
+            .session
+            .reload
+            .lock()
+            .expect("shared reload mutex poisoned");
+        if reload
+            .as_ref()
+            .is_some_and(|operation| Arc::ptr_eq(operation, expected) && operation.turn_ready())
+        {
+            return true;
+        }
+        if reload.is_some() {
+            return false;
+        }
+        let mut next = self
+            .session
+            .next_reload
+            .lock()
+            .expect("shared reload mutex poisoned");
+        if next
+            .as_ref()
+            .is_some_and(|operation| Arc::ptr_eq(operation, expected) && operation.turn_ready())
+        {
+            *reload = next.take();
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn reload_registered(&self) -> bool {
+        self.session
+            .reload
+            .lock()
+            .expect("shared reload mutex poisoned")
+            .is_some()
+            || self
+                .session
+                .next_reload
+                .lock()
+                .expect("shared reload mutex poisoned")
+                .is_some()
+    }
+
+    pub(crate) fn rebuild_registered(&self) -> bool {
+        self.session
+            .rebuild
+            .lock()
+            .expect("shared rebuild mutex poisoned")
+            .is_some()
+    }
+
+    pub(crate) fn begin_rebuild(&self) -> anyhow::Result<bool> {
+        let lease = &self.session.registry_lease;
+        let Some(registry) = lease.registry.upgrade() else {
+            return Ok(false);
+        };
+        let mut rebuild =
+            self.session.rebuild.lock().map_err(|error| {
+                anyhow::format_err!("shared rebuild mutex is poisoned: {error}")
+            })?;
+        if rebuild.is_some() {
+            return Ok(false);
+        }
+        *rebuild = Some(registry.enqueue_operation(lease.key.clone())?);
+        Ok(true)
+    }
+
+    pub(crate) fn rebuild_waiter(&self) -> Option<SharedAnalyzerOperationWaiter> {
+        let lease = &self.session.registry_lease;
+        let operation = self
+            .session
+            .rebuild
+            .lock()
+            .expect("shared rebuild mutex poisoned")
+            .clone()?;
+        Some(SharedAnalyzerOperationWaiter {
+            registry: lease.registry.clone(),
+            world: lease.key.shared_world.clone(),
+            operation,
+            kind: SharedAnalyzerOperationKind::Explicit,
+        })
+    }
+
+    pub(crate) fn begin_normal_operation(&self) -> anyhow::Result<bool> {
+        let lease = &self.session.registry_lease;
+        let Some(registry) = lease.registry.upgrade() else {
+            return Ok(true);
+        };
+        let mut normal = self.session.normal.lock().map_err(|error| {
+            anyhow::format_err!("shared normal operation mutex is poisoned: {error}")
+        })?;
+        if normal.is_some() {
+            return Ok(true);
+        }
+        let operation = registry.begin_normal_operation(lease.key.clone())?;
+        let ready = registry.normal_operation_ready(&lease.key, &operation)?;
+        *normal = Some(operation);
+        Ok(ready)
+    }
+
+    pub(crate) fn normal_waiter(&self) -> Option<SharedAnalyzerOperationWaiter> {
+        let lease = &self.session.registry_lease;
+        let operation = self
+            .session
+            .normal
+            .lock()
+            .expect("shared normal operation mutex poisoned")
+            .clone()?;
+        Some(SharedAnalyzerOperationWaiter {
+            registry: lease.registry.clone(),
+            world: lease.key.shared_world.clone(),
+            operation,
+            kind: SharedAnalyzerOperationKind::Normal,
+        })
+    }
+
+    pub(crate) fn finish_normal_operation(&self, result: anyhow::Result<()>) -> bool {
+        let lease = &self.session.registry_lease;
+        let Some(registry) = lease.registry.upgrade() else {
+            return false;
+        };
+        let Ok(mut normal) = self.session.normal.lock() else {
+            return false;
+        };
+        let Some(operation) = normal.take() else {
+            return false;
+        };
+        let notify = result.is_ok();
+        let result = result.map(|_| self.session.workspace_indexes.clone());
+        let finished = registry.finish_normal_operation(&lease.key, &operation, &result);
+        if !finished && !operation.finished() {
+            *normal = Some(operation);
+        } else if finished && notify {
+            self.notify_workspace_updates();
+        }
+        finished
+    }
+
+    fn reload_keys(&self) -> Option<Vec<ProcMacroSpawnKey>> {
+        self.session
+            .reload
+            .lock()
+            .expect("shared reload mutex poisoned")
+            .as_ref()
+            .and_then(|reload| reload.active_keys())
+    }
+
+    fn rebuild_keys(&self) -> Option<Vec<ProcMacroSpawnKey>> {
+        self.session
+            .rebuild
+            .lock()
+            .expect("shared rebuild mutex poisoned")
+            .as_ref()
+            .and_then(|rebuild| rebuild.active_keys())
+    }
+
+    fn operation_keys(&self) -> Option<Vec<ProcMacroSpawnKey>> {
+        self.reload_keys().or_else(|| self.rebuild_keys())
+    }
+
+    fn set_operation_keys(&self, rebuild: bool, keys: Vec<ProcMacroSpawnKey>) {
+        let operation = if rebuild {
+            &self.session.rebuild
+        } else {
+            &self.session.reload
+        };
+        if let Some(operation) = operation
+            .lock()
+            .expect("shared operation mutex poisoned")
+            .as_ref()
+        {
+            operation.set_keys(keys);
+        }
+    }
+
+    pub(crate) fn reload_operation_token(&self) -> Option<SharedAnalyzerOperationToken> {
+        let operation = self
+            .session
+            .reload
+            .lock()
+            .expect("shared reload mutex poisoned")
+            .clone()
+            .filter(|operation| operation.turn_ready() && !operation.finished())?;
+        let generation = operation.generation();
+        Some(SharedAnalyzerOperationToken {
+            session_id: self.session_id(),
+            operation: Some(operation),
+            generation,
+        })
+    }
+
+    pub(crate) fn rebuild_operation_token(&self) -> Option<SharedAnalyzerOperationToken> {
+        let operation = self
+            .session
+            .rebuild
+            .lock()
+            .expect("shared rebuild mutex poisoned")
+            .clone()
+            .filter(|operation| !operation.finished())?;
+        let generation = operation.generation();
+        Some(SharedAnalyzerOperationToken {
+            session_id: self.session_id(),
+            operation: Some(operation),
+            generation,
+        })
+    }
+
+    pub(crate) fn operation_scope_matches(&self, target: &Self) -> bool {
+        self.session.registry_lease.key == target.session.registry_lease.key
+    }
+
+    pub(crate) fn operation_token(&self) -> SharedAnalyzerOperationToken {
+        let operation = self
+            .session
+            .normal
+            .lock()
+            .expect("shared operation mutex poisoned")
+            .clone()
+            .or_else(|| {
+                [&self.session.reload, &self.session.rebuild]
+                    .into_iter()
+                    .find_map(|slot| {
+                        slot.lock()
+                            .expect("shared operation mutex poisoned")
+                            .clone()
+                            .filter(|operation| operation.turn_ready())
+                    })
+            });
+        let generation = operation
+            .as_ref()
+            .map_or(0, |operation| operation.generation());
+        SharedAnalyzerOperationToken {
+            session_id: self.session.id,
+            operation,
+            generation,
+        }
+    }
+
+    pub(crate) fn operation_token_matches(&self, token: &SharedAnalyzerOperationToken) -> bool {
+        let current = self.operation_token();
+        match (&token.operation, &current.operation) {
+            (Some(expected), Some(actual)) => {
+                Arc::ptr_eq(expected, actual)
+                    && token.generation == current.generation
+                    && !expected.finished()
+            }
+            (None, None) => token.session_id == current.session_id,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn normal_operation_matches(&self, token: &SharedAnalyzerOperationToken) -> bool {
+        let normal = self
+            .session
+            .normal
+            .lock()
+            .expect("shared normal operation mutex poisoned")
+            .clone();
+        token
+            .operation
+            .as_ref()
+            .zip(normal.as_ref())
+            .is_some_and(|(expected, current)| {
+                Arc::ptr_eq(expected, current)
+                    && token.generation == current.generation()
+                    && !expected.finished()
+            })
+    }
+
+    pub(crate) fn cancel_operations(&self, reason: &str) {
+        let Some(registry) = self.session.registry_lease.registry.upgrade() else {
+            return;
+        };
+        self.session
+            .cancel_operations(&registry, &anyhow::format_err!("{reason}"));
+    }
+
+    pub(crate) fn transfer_operations(&self, target: &Self) {
+        if Arc::ptr_eq(&self.session, &target.session) {
+            return;
+        }
+        Self::transfer_operation(&self.session.reload, &target.session.reload, "reload");
+        Self::transfer_operation(
+            &self.session.next_reload,
+            &target.session.next_reload,
+            "next reload",
+        );
+        Self::transfer_operation(&self.session.rebuild, &target.session.rebuild, "rebuild");
+        Self::transfer_operation(&self.session.normal, &target.session.normal, "normal");
+    }
+
+    fn transfer_operation(
+        source: &Mutex<Option<Arc<SharedAnalyzerReload>>>,
+        target: &Mutex<Option<Arc<SharedAnalyzerReload>>>,
+        name: &str,
+    ) {
+        let mut source = source
+            .lock()
+            .unwrap_or_else(|_| panic!("shared {name} operation mutex poisoned"));
+        if source
+            .as_ref()
+            .is_some_and(|operation| operation.finished())
+        {
+            source.take();
+        } else if source.is_some() {
+            let mut target = target
+                .lock()
+                .unwrap_or_else(|_| panic!("shared {name} operation mutex poisoned"));
+            assert!(
+                target.is_none(),
+                "shared {name} operation already transferred"
+            );
+            *target = source.take();
+        }
+    }
+
+    fn operation_ready(&self) -> anyhow::Result<bool> {
+        let lease = &self.session.registry_lease;
+        let Some(registry) = lease.registry.upgrade() else {
+            return Ok(true);
+        };
+        let reload = self
+            .session
+            .reload
+            .lock()
+            .expect("shared reload mutex poisoned")
+            .clone();
+        let rebuild = self
+            .session
+            .rebuild
+            .lock()
+            .expect("shared rebuild mutex poisoned")
+            .clone();
+        let normal = self
+            .session
+            .normal
+            .lock()
+            .expect("shared normal operation mutex poisoned")
+            .clone();
+        let Some(active) = registry.active_operation(&lease.key)? else {
+            return Ok(reload.is_none() && rebuild.is_none());
+        };
+        Ok(reload.as_ref().is_some_and(|own| Arc::ptr_eq(own, &active))
+            || rebuild
+                .as_ref()
+                .is_some_and(|own| Arc::ptr_eq(own, &active))
+            || normal.as_ref().is_some_and(|own| {
+                active
+                    .pending_normal_operations
+                    .iter()
+                    .any(|pending| Arc::ptr_eq(pending, own))
+            }))
+    }
+
+    fn commit_operation<T>(
+        &self,
+        expected: &SharedAnalyzerOperationToken,
+        commit: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<Option<T>> {
+        if self
+            .session
+            .normal
+            .lock()
+            .expect("shared normal operation mutex poisoned")
+            .is_some()
+        {
+            return self
+                .operation_token_matches(expected)
+                .then(commit)
+                .transpose();
+        }
+        let reload = self
+            .session
+            .reload
+            .lock()
+            .expect("shared reload mutex poisoned")
+            .clone();
+        let rebuild = self
+            .session
+            .rebuild
+            .lock()
+            .expect("shared rebuild mutex poisoned")
+            .clone();
+        if reload.is_none() && rebuild.is_none() {
+            return self
+                .operation_token_matches(expected)
+                .then(commit)
+                .transpose();
+        }
+        let lease = &self.session.registry_lease;
+        let Some(registry) = lease.registry.upgrade() else {
+            return Ok(None);
+        };
+        let Some(active) = registry.active_operation(&lease.key)? else {
+            return Ok(None);
+        };
+        let Some(operation) = [reload, rebuild]
+            .into_iter()
+            .flatten()
+            .find(|operation| Arc::ptr_eq(operation, &active))
+        else {
+            return Ok(None);
+        };
+        let _phase = registry.begin_operation_phase(&lease.key, &operation)?;
+        self.operation_token_matches(expected)
+            .then(commit)
+            .transpose()
+    }
+
+    pub(crate) fn finish_rebuild(&self, result: anyhow::Result<()>) -> bool {
+        self.finish_explicit_operation(&self.session.rebuild, result, false)
+    }
+
+    fn finish_explicit_operation(
+        &self,
+        slot: &Mutex<Option<Arc<SharedAnalyzerReload>>>,
+        result: anyhow::Result<()>,
+        notify: bool,
+    ) -> bool {
+        let lease = &self.session.registry_lease;
+        let Some(registry) = lease.registry.upgrade() else {
+            return false;
+        };
+        let Ok(mut slot) = slot.lock() else {
+            return false;
+        };
+        let Some(operation) = slot.take() else {
+            return false;
+        };
+        let succeeded = result.is_ok();
+        let result = result.map(|_| self.session.workspace_indexes.clone());
+        let finished = registry.finish_operation(&lease.key, &operation, &result);
+        if !finished && !operation.finished() {
+            *slot = Some(operation);
+        } else if finished && succeeded && notify {
+            self.notify_workspace_updates();
+        }
+        finished
     }
 
     pub(crate) fn set_busy(&self, busy: bool) {
@@ -1283,6 +2521,215 @@ impl SharedAnalyzerRuntime {
             != generation
     }
 
+    pub(crate) fn workspace_updates(&self) -> crossbeam_channel::Receiver<()> {
+        self.session.workspace_updates.clone()
+    }
+
+    pub(crate) fn workspace_update_pending(&self) -> bool {
+        self.session.workspace_update_pending.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn take_workspace_update(&self, key: &SharedAnalyzerBackendKey) -> bool {
+        self.session.registry_lease.key == *key
+            && self
+                .session
+                .workspace_update_pending
+                .swap(false, Ordering::SeqCst)
+    }
+
+    fn notify_workspace_updates(&self) {
+        if let Ok(world) = self.session.world.lock() {
+            world.notify_workspace_updates(self.session_id(), &self.session.workspace_indexes);
+        }
+    }
+
+    pub(crate) fn proc_macro_clients(
+        &self,
+    ) -> triomphe::Arc<[Option<anyhow::Result<ProcMacroClient>>]> {
+        let world = self
+            .session
+            .world
+            .lock()
+            .expect("shared world mutex poisoned");
+        triomphe::Arc::from_iter(world.proc_macro_clients_for(&self.session.workspace_indexes))
+    }
+
+    pub(crate) fn finish_reload(&self, result: anyhow::Result<()>) -> bool {
+        self.finish_explicit_operation(&self.session.reload, result, true)
+    }
+
+    pub(crate) fn update_build_data(
+        &self,
+        workspaces: &[ProjectWorkspace],
+        build_scripts: &[anyhow::Result<WorkspaceBuildScripts>],
+        expected_generation: u64,
+        operation: &SharedAnalyzerOperationToken,
+    ) -> anyhow::Result<bool> {
+        let scope = self
+            .reload_keys()
+            .map_or(BuildDataScope::Normal, BuildDataScope::Reload);
+        self.apply_build_data(
+            workspaces,
+            build_scripts,
+            expected_generation,
+            operation,
+            scope,
+        )
+    }
+
+    pub(crate) fn reload_active(&self) -> bool {
+        self.session
+            .reload
+            .lock()
+            .expect("shared reload mutex poisoned")
+            .as_ref()
+            .is_some_and(|reload| reload.turn_ready() && !reload.finished())
+    }
+
+    pub(crate) fn workspace_generation(&self) -> u64 {
+        self.session
+            .world
+            .lock()
+            .expect("shared world mutex poisoned")
+            .workspace_generation()
+    }
+
+    pub(crate) fn build_data_pending(&self) -> bool {
+        if !self.operation_ready().unwrap_or(false) {
+            return false;
+        }
+        self.session
+            .world
+            .lock()
+            .expect("shared world mutex poisoned")
+            .build_data_pending(&self.session.workspace_indexes)
+    }
+
+    pub(crate) fn proc_macros_pending(&self) -> bool {
+        if !self.operation_ready().unwrap_or(false) {
+            return false;
+        }
+        let config = Some(self.session.config.as_ref());
+        let world = self
+            .session
+            .world
+            .lock()
+            .expect("shared world mutex poisoned");
+        let operation_keys = self.operation_keys();
+        world.proc_macros_pending(
+            &self.session.workspace_indexes,
+            operation_keys.as_deref(),
+            config,
+        )
+    }
+
+    pub(crate) fn proc_macro_load_request(&self) -> Option<SharedProcMacroLoadRequest> {
+        if !self.operation_ready().unwrap_or(false) {
+            return None;
+        }
+        let config = self.session.config.as_ref();
+        let world = self
+            .session
+            .world
+            .lock()
+            .expect("shared world mutex poisoned");
+        let operation_keys = self.operation_keys();
+        world.proc_macro_load_request(
+            &self.session.workspace_indexes,
+            &config.load.key.ignored_proc_macros,
+            operation_keys.as_deref(),
+            Some(config),
+        )
+    }
+
+    pub(crate) fn commit_proc_macro_load(
+        &self,
+        response: SharedProcMacroLoadResponse,
+        operation: &SharedAnalyzerOperationToken,
+    ) -> anyhow::Result<bool> {
+        self.commit_operation(operation, || {
+            let _write = self.session.access.write(None);
+            let mut world = self.session.world.lock().map_err(|error| {
+                anyhow::format_err!("shared world mutex is poisoned: {error}")
+            })?;
+            let generation = world.input_generation.load(Ordering::SeqCst);
+            let result = world.commit_proc_macro_load(response);
+            if world.input_generation.load(Ordering::SeqCst) != generation {
+                self.session.gc.changed();
+            }
+            result
+        })
+        .map(|result| result.unwrap_or(false))
+    }
+
+    pub(crate) fn update_rebuild_build_data(
+        &self,
+        workspaces: &[ProjectWorkspace],
+        build_scripts: &[anyhow::Result<WorkspaceBuildScripts>],
+        expected_generation: u64,
+        operation: &SharedAnalyzerOperationToken,
+    ) -> anyhow::Result<bool> {
+        self.apply_build_data(
+            workspaces,
+            build_scripts,
+            expected_generation,
+            operation,
+            BuildDataScope::Rebuild,
+        )
+    }
+
+    fn apply_build_data(
+        &self,
+        workspaces: &[ProjectWorkspace],
+        build_scripts: &[anyhow::Result<WorkspaceBuildScripts>],
+        expected_generation: u64,
+        operation: &SharedAnalyzerOperationToken,
+        scope: BuildDataScope,
+    ) -> anyhow::Result<bool> {
+        let config = &self.session.config;
+        if !self.operation_ready()? {
+            return Ok(false);
+        }
+        let snapshot = self
+            .session
+            .world
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
+            .build_data_snapshot(
+                &self.session.workspace_indexes,
+                workspaces,
+                build_scripts,
+                config,
+                expected_generation,
+                scope,
+            )?;
+        let Some(snapshot) = snapshot else {
+            return Ok(false);
+        };
+        let mut prepared = snapshot.prepare(config);
+        let Some(committed) = self.commit_operation(operation, || {
+            let _write = self.session.access.write(None);
+            let mut world = self.session.world.lock().map_err(|error| {
+                anyhow::format_err!("shared world mutex is poisoned: {error}")
+            })?;
+            let generation = world.input_generation.load(Ordering::SeqCst);
+            let result = world.commit_build_data(&mut prepared);
+            if world.input_generation.load(Ordering::SeqCst) != generation {
+                self.session.gc.changed();
+            }
+            result
+        })?
+        else {
+            return Ok(false);
+        };
+        if committed
+            && let Some((rebuild, keys)) = prepared.operation_keys
+        {
+            self.set_operation_keys(rebuild, keys);
+        }
+        Ok(committed)
+    }
+
     fn workspace_indexes(&self) -> &[usize] {
         &self.session.workspace_indexes
     }
@@ -1297,8 +2744,7 @@ impl SharedAnalyzerRuntime {
     }
 
     fn refresh_session_cache(&self, world: &SharedWorld) {
-        let line_endings =
-            world.session_line_endings(self.session_id(), self.workspace_indexes());
+        let line_endings = world.session_line_endings(self.session_id(), self.workspace_indexes());
         let file_mappings =
             world.session_file_mappings(self.session_id(), self.workspace_indexes());
         *self
@@ -1440,9 +2886,7 @@ impl SharedAnalyzerRuntime {
             .exists(file_id)
     }
 
-    pub(crate) fn ratoml_files(
-        &self,
-    ) -> Vec<(VfsPath, SourceRootId, bool, String)> {
+    pub(crate) fn ratoml_files(&self) -> Vec<(VfsPath, SourceRootId, bool, String)> {
         let world = self
             .session
             .world
@@ -1766,7 +3210,9 @@ fn common_path_prefix_len(left: &str, right: &str) -> usize {
     if index == end
         && (left.len() == right.len()
             || left.get(index).is_some_and(|byte| is_path_separator(*byte))
-            || right.get(index).is_some_and(|byte| is_path_separator(*byte)))
+            || right
+                .get(index)
+                .is_some_and(|byte| is_path_separator(*byte)))
     {
         return index;
     }
@@ -1832,17 +3278,29 @@ struct ActiveOverlayFile {
     line_endings: crate::line_index::LineEndings,
 }
 
-struct LoadedWorkspaceInput {
-    source_roots: Vec<SourceRoot>,
-    crate_graph: CrateGraphBuilder,
-    proc_macros: Vec<ProcMacroLoad>,
+struct WorkspaceUpdate {
+    workspace_indexes: Vec<usize>,
+    pending: Arc<AtomicBool>,
+    sender: crossbeam_channel::Sender<()>,
 }
 
+struct LoadedWorkspaceInput {
+    source_roots: Vec<SourceRoot>,
+    source_root_config: SourceRootConfig,
+    crate_graph: CrateGraphBuilder,
+    proc_macro_paths: ProcMacroPaths,
+    proc_macros: Vec<ProcMacroLoad>,
+    proc_macros_loaded: bool,
+    build_data_loaded: bool,
+}
+
+#[derive(Clone)]
 struct LoadedWorkspaceFile {
     path: VfsPath,
     exists: bool,
 }
 
+#[derive(Clone)]
 struct LoadedWorkspaceFiles {
     files_by_id: BTreeMap<FileId, LoadedWorkspaceFile>,
     file_ids_by_path: BTreeMap<String, FileId>,
@@ -1879,6 +3337,12 @@ impl LoadedWorkspaceFiles {
             .map(|(&file_id, file)| (file_id, &file.path))
     }
 
+    fn insert(&mut self, file_id: FileId, path: VfsPath, exists: bool) {
+        self.file_ids_by_path.insert(path_key(&path), file_id);
+        self.files_by_id
+            .insert(file_id, LoadedWorkspaceFile { path, exists });
+    }
+
     fn file_id(&self, path: &VfsPath) -> Option<(FileId, ())> {
         self.file_ids_by_path
             .get(&path_key(path))
@@ -1897,13 +3361,15 @@ impl LoadedWorkspaceFiles {
     }
 
     fn path(&self, file_id: FileId) -> Option<&VfsPath> {
-        self.files_by_id
-            .get(&file_id)
-            .map(|file| &file.path)
+        self.files_by_id.get(&file_id).map(|file| &file.path)
     }
 }
 
-type ProcMacroSpawnKey = (AbsPathBuf, Option<semver::Version>, FxHashMap<String, Option<String>>);
+type ProcMacroSpawnKey = (
+    AbsPathBuf,
+    Option<semver::Version>,
+    FxHashMap<String, Option<String>>,
+);
 
 struct LoadedWorkspace {
     summary: WorkspaceSummary,
@@ -1912,7 +3378,7 @@ struct LoadedWorkspace {
     _vfs: Arc<LoadedWorkspaceFiles>,
     line_endings: Arc<BTreeMap<FileId, crate::line_index::LineEndings>>,
     source_root_parent_map: FxHashMap<SourceRootId, SourceRootId>,
-    proc_macro_client: Option<(ProcMacroSpawnKey, ProcMacroClient)>,
+    proc_macro_client: Option<Result<(ProcMacroSpawnKey, ProcMacroClient), ProcMacroLoadingError>>,
 }
 
 impl LoadedWorkspace {
@@ -1927,30 +3393,204 @@ struct PreparedWorkspaceLoad {
     workspace: ProjectWorkspace,
     loaded: WorkspaceLoad,
     line_endings: BTreeMap<FileId, crate::line_index::LineEndings>,
-    proc_macro_spawn: Option<ProcMacroSpawnKey>,
+    proc_macro_spawn: Option<Result<ProcMacroSpawnKey, ProcMacroLoadingError>>,
+    proc_macros_loaded: bool,
+    build_data_loaded: bool,
+}
+
+struct BuildDataWorkspace {
+    index: usize,
+    workspace: ProjectWorkspace,
+    files: Arc<LoadedWorkspaceFiles>,
+    build_data_loaded: bool,
+    proc_macro_client: Option<Result<(ProcMacroSpawnKey, ProcMacroClient), ProcMacroLoadingError>>,
+}
+
+struct BuildDataSnapshot {
+    generation: u64,
+    workspaces: Vec<BuildDataWorkspace>,
+    proc_macro_clients: Vec<(ProcMacroSpawnKey, ProcMacroClient)>,
+    operation_keys: Option<(bool, Vec<ProcMacroSpawnKey>)>,
+}
+
+struct PreparedBuildDataWorkspace {
+    index: usize,
+    workspace: ProjectWorkspace,
+    files: Arc<LoadedWorkspaceFiles>,
+    source_root_config: SourceRootConfig,
+    crate_graph: CrateGraphBuilder,
+    proc_macro_paths: ProcMacroPaths,
+    proc_macros: Vec<ProcMacroLoad>,
+    proc_macros_loaded: bool,
+    build_data_loaded: bool,
+    proc_macro_client: Option<Result<(ProcMacroSpawnKey, ProcMacroClient), ProcMacroLoadingError>>,
+}
+
+struct PreparedBuildData {
+    generation: u64,
+    workspaces: Vec<PreparedBuildDataWorkspace>,
+    operation_keys: Option<(bool, Vec<ProcMacroSpawnKey>)>,
+}
+
+enum BuildDataScope {
+    Normal,
+    Reload(Vec<ProcMacroSpawnKey>),
+    Rebuild,
+}
+
+#[derive(Debug)]
+pub(crate) enum SharedProcMacroProgress {
+    Begin,
+    Report(String),
+    End(SharedProcMacroLoadResponse),
+}
+
+#[derive(Debug)]
+pub(crate) struct SharedProcMacroLoadResponse {
+    pub(crate) generation: u64,
+    pub(crate) workspaces: Vec<(usize, Vec<ProcMacroLoad>)>,
+}
+
+struct SharedProcMacroWorkspace {
+    index: usize,
+    client: Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
+    paths: ProcMacroPaths,
+}
+
+pub(crate) struct SharedProcMacroLoadRequest {
+    generation: u64,
+    workspaces: Vec<SharedProcMacroWorkspace>,
+    ignored_proc_macros: Vec<(Box<str>, Vec<Box<str>>)>,
+}
+
+impl SharedProcMacroLoadRequest {
+    pub(crate) fn load(self, progress: impl Fn(String)) -> SharedProcMacroLoadResponse {
+        let workspaces = self
+            .workspaces
+            .into_iter()
+            .map(|workspace| {
+                let proc_macros = collect_proc_macros(
+                    &workspace.client,
+                    workspace.paths,
+                    &self.ignored_proc_macros,
+                    ProcMacroLoadState::Ready,
+                    &|path| progress(path.to_string()),
+                );
+                (workspace.index, proc_macros)
+            })
+            .collect();
+        SharedProcMacroLoadResponse {
+            generation: self.generation,
+            workspaces,
+        }
+    }
+}
+
+impl BuildDataSnapshot {
+    fn prepare(self, config: &SharedAnalyzerConfig) -> PreparedBuildData {
+        let load_config = config.load.to_load_cargo_config();
+        let rebuild = self
+            .operation_keys
+            .as_ref()
+            .is_some_and(|(rebuild, _)| *rebuild);
+        let mut clients = self.proc_macro_clients;
+        let workspaces = self
+            .workspaces
+            .into_iter()
+            .map(|snapshot| {
+                let source_root_config = workspace_source_root_config(&snapshot.workspace);
+                let existing_client = (!rebuild).then_some(snapshot.proc_macro_client).flatten();
+                let (client_state, proc_macro_server) = match existing_client {
+                    Some(Ok((key, client))) => {
+                        (Some(Ok((key, client.clone()))), Some(Ok(client)))
+                    }
+                    Some(Err(error)) => (Some(Err(error.clone())), Some(Err(error))),
+                    None => match spawn_proc_macro_server(
+                        &snapshot.workspace,
+                        &config.cargo_config.extra_env,
+                        &load_config,
+                        &clients,
+                    ) {
+                        Some(Ok((key, client))) => {
+                            clients.push((key.clone(), client.clone()));
+                            (Some(Ok((key, client.clone()))), Some(Ok(client)))
+                        }
+                        Some(Err(error)) => (Some(Err(error.clone())), Some(Err(error))),
+                        None => (None, None),
+                    },
+                };
+                let (crate_graph, proc_macro_paths) = snapshot.workspace.to_crate_graph(
+                    &mut |path| {
+                        snapshot
+                            .files
+                            .file_id(&VfsPath::from(path.to_path_buf()))
+                            .map(|(file_id, _)| file_id)
+                    },
+                    &config.cargo_config.extra_env,
+                );
+                let proc_macro_state = metadata_proc_macro_state(config);
+                let proc_macros = collect_proc_macros(
+                    &proc_macro_server,
+                    proc_macro_paths.clone(),
+                    &config.load.key.ignored_proc_macros,
+                    proc_macro_state,
+                    &|_| {},
+                );
+                let proc_macros_loaded = proc_macro_state != ProcMacroLoadState::NotYetBuilt
+                    || proc_macro_paths.is_empty();
+                PreparedBuildDataWorkspace {
+                    index: snapshot.index,
+                    workspace: snapshot.workspace,
+                    files: snapshot.files,
+                    source_root_config,
+                    crate_graph,
+                    proc_macro_paths,
+                    proc_macros,
+                    proc_macros_loaded,
+                    build_data_loaded: snapshot.build_data_loaded,
+                    proc_macro_client: client_state,
+                }
+            })
+            .collect();
+        PreparedBuildData {
+            generation: self.generation,
+            workspaces,
+            operation_keys: self.operation_keys,
+        }
+    }
 }
 
 // Workspaces referring to the same proc-macro server executable (i.e. the same
 // sysroot) with an identical spawn environment share a single client, and thereby
 // a single set of server processes.
-fn spawn_proc_macro_server(
+fn metadata_proc_macro_state(config: &SharedAnalyzerConfig) -> ProcMacroLoadState {
+    match &config.load.key.proc_macro_server {
+        SharedAnalyzerProcMacroServerKey::None => ProcMacroLoadState::Disabled,
+        SharedAnalyzerProcMacroServerKey::Sysroot
+        | SharedAnalyzerProcMacroServerKey::Explicit(_) => ProcMacroLoadState::NotYetBuilt,
+    }
+}
+
+fn proc_macro_spawn_key(
     workspace: &ProjectWorkspace,
     extra_env: &FxHashMap<String, Option<String>>,
     load_config: &LoadCargoConfig,
-    clients: &[(ProcMacroSpawnKey, ProcMacroClient)],
-) -> Option<Result<(ProcMacroSpawnKey, ProcMacroClient), ProcMacroLoadingError>> {
+) -> Option<Result<ProcMacroSpawnKey, ProcMacroLoadingError>> {
     let path = match &load_config.with_proc_macro_server {
         ProcMacroServerChoice::Sysroot => match workspace.find_sysroot_proc_macro_srv()? {
             Ok(path) => path,
             Err(error) => return Some(Err(proc_macro_loading_error(error))),
         },
         ProcMacroServerChoice::Explicit(path) => path.clone(),
-        ProcMacroServerChoice::None => return Some(Err(ProcMacroLoadingError::Disabled)),
+        ProcMacroServerChoice::None => return None,
     };
 
     let env: FxHashMap<_, _> = match &workspace.kind {
         ProjectWorkspaceKind::Cargo { cargo, .. }
-        | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, ..)), .. } => cargo
+        | ProjectWorkspaceKind::DetachedFile {
+            cargo: Some((cargo, ..)),
+            ..
+        } => cargo
             .env()
             .into_iter()
             .map(|(k, v)| (k.clone(), Some(v.clone())))
@@ -1970,16 +3610,34 @@ fn spawn_proc_macro_server(
         _ => Default::default(),
     };
 
-    let key = (path, workspace.toolchain.clone(), env);
+    Some(Ok((path, workspace.toolchain.clone(), env)))
+}
+
+fn spawn_proc_macro_server(
+    workspace: &ProjectWorkspace,
+    extra_env: &FxHashMap<String, Option<String>>,
+    load_config: &LoadCargoConfig,
+    clients: &[(ProcMacroSpawnKey, ProcMacroClient)],
+) -> Option<Result<(ProcMacroSpawnKey, ProcMacroClient), ProcMacroLoadingError>> {
+    let key = match proc_macro_spawn_key(workspace, extra_env, load_config)? {
+        Ok(key) => key,
+        Err(error) => return Some(Err(error)),
+    };
+
     if let Some((_, client)) = clients.iter().find(|(k, _)| *k == key) {
         return Some(Ok((key, client.clone())));
     }
 
     let (path, toolchain, env) = &key;
     Some(
-        ProcMacroClient::spawn(path, env, toolchain.as_ref(), load_config.proc_macro_processes)
-            .map(|client| (key.clone(), client))
-            .map_err(proc_macro_loading_error),
+        ProcMacroClient::spawn(
+            path,
+            env,
+            toolchain.as_ref(),
+            load_config.proc_macro_processes,
+        )
+        .map(|client| (key.clone(), client))
+        .map_err(proc_macro_loading_error),
     )
 }
 
@@ -1989,13 +3647,17 @@ fn proc_macro_loading_error(error: impl ToString) -> ProcMacroLoadingError {
 
 struct SharedWorld {
     access: Arc<SharedWorldAccess>,
+    base_file_access: Arc<Mutex<()>>,
+    base_file_ids: Arc<SharedBaseFileIds>,
     host: AnalysisHost,
     loaded_workspaces: Vec<LoadedWorkspace>,
     workspace_indexes: BTreeMap<String, usize>,
     base_crates: Vec<ide::Crate>,
     base_max_source_root: Option<u32>,
     session_overlays: BTreeMap<u64, ActiveSessionOverlay>,
+    workspace_updates: BTreeMap<u64, WorkspaceUpdate>,
     input_generation: Arc<AtomicU64>,
+    workspace_generation: u64,
     applied_source_roots: Vec<SourceRoot>,
     applied_local_roots: rustc_hash::FxHashSet<SourceRootId>,
     applied_library_roots: rustc_hash::FxHashSet<SourceRootId>,
@@ -2004,16 +3666,35 @@ struct SharedWorld {
 }
 
 impl SharedWorld {
-    fn new() -> Self {
+    fn new(config: &SharedAnalyzerDatabaseConfigKey) -> Self {
+        let mut host = AnalysisHost::new(config.lru_parse_query_capacity);
+        if !config.lru_query_capacities.is_empty() {
+            host.update_lru_capacities(
+                &config
+                    .lru_query_capacities
+                    .iter()
+                    .map(|(query, capacity)| (query.clone(), *capacity))
+                    .collect(),
+            );
+        }
+        hir::db::set_expand_proc_attr_macros(
+            host.raw_database_mut(),
+            config.expand_proc_attr_macros,
+        );
+
         Self {
             access: Arc::new(SharedWorldAccess::default()),
-            host: AnalysisHost::with_database(RootDatabase::new(None)),
+            base_file_access: Arc::new(Mutex::new(())),
+            base_file_ids: Arc::new(SharedBaseFileIds::default()),
+            host,
             loaded_workspaces: Vec::new(),
             workspace_indexes: BTreeMap::new(),
             base_crates: Vec::new(),
             base_max_source_root: None,
             session_overlays: BTreeMap::new(),
+            workspace_updates: BTreeMap::new(),
             input_generation: Arc::new(AtomicU64::new(0)),
+            workspace_generation: 0,
             applied_source_roots: Vec::new(),
             applied_local_roots: rustc_hash::FxHashSet::default(),
             applied_library_roots: rustc_hash::FxHashSet::default(),
@@ -2026,6 +3707,34 @@ impl SharedWorld {
         self.workspace_indexes.get(load_key).copied()
     }
 
+    fn proc_macro_reload_keys(
+        &self,
+        load_keys: &[String],
+        config: &SharedAnalyzerConfig,
+    ) -> Vec<ProcMacroSpawnKey> {
+        let load_config = config.load.to_load_cargo_config();
+        let mut keys = Vec::new();
+        for load_key in load_keys {
+            let Some(&index) = self.workspace_indexes.get(load_key) else {
+                continue;
+            };
+            if let Some(Ok((key, _))) = self.loaded_workspaces[index].proc_macro_client.as_ref()
+                && !keys.iter().any(|old| old == key)
+            {
+                keys.push(key.clone());
+            }
+            if let Some(Ok(key)) = proc_macro_spawn_key(
+                &self.loaded_workspaces[index].workspace,
+                &config.cargo_config.extra_env,
+                &load_config,
+            ) && !keys.iter().any(|old| old == &key)
+            {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
     fn proc_macro_clients(
         &self,
         excluded_load_key: Option<&str>,
@@ -2035,51 +3744,395 @@ impl SharedWorld {
             .iter()
             .enumerate()
             .filter(|(index, _)| Some(*index) != excluded)
-            .filter_map(|(_, workspace)| workspace.proc_macro_client.clone())
+            .filter_map(|(_, workspace)| {
+                workspace.proc_macro_client.as_ref()?.as_ref().ok().cloned()
+            })
             .collect()
+    }
+
+    fn proc_macro_clients_for(
+        &self,
+        workspace_indexes: &[usize],
+    ) -> Vec<Option<anyhow::Result<ProcMacroClient>>> {
+        workspace_indexes
+            .iter()
+            .map(|&index| {
+                self.loaded_workspaces[index]
+                    .proc_macro_client
+                    .as_ref()
+                    .map(|result| match result {
+                        Ok((_, client)) => Ok(client.clone()),
+                        Err(error) => Err(anyhow::format_err!("{error}")),
+                    })
+            })
+            .collect()
+    }
+
+    fn build_data_snapshot(
+        &self,
+        workspace_indexes: &[usize],
+        workspaces: &[ProjectWorkspace],
+        build_scripts: &[anyhow::Result<WorkspaceBuildScripts>],
+        config: &SharedAnalyzerConfig,
+        expected_generation: u64,
+        scope: BuildDataScope,
+    ) -> anyhow::Result<Option<BuildDataSnapshot>> {
+        if self.workspace_generation != expected_generation {
+            return Ok(None);
+        }
+        if workspace_indexes.len() != workspaces.len() || workspaces.len() != build_scripts.len() {
+            anyhow::bail!("shared build-data response is inconsistent");
+        }
+
+        let mut updated_workspaces = BTreeMap::new();
+        for ((&index, workspace), build_scripts) in
+            workspace_indexes.iter().zip(workspaces).zip(build_scripts)
+        {
+            let mut workspace = workspace.clone();
+            workspace.set_build_scripts(build_scripts.as_ref().ok().cloned().unwrap_or_default());
+            updated_workspaces.insert(index, workspace);
+        }
+
+        let load_config = config.load.to_load_cargo_config();
+        let mut keys = match &scope {
+            BuildDataScope::Normal | BuildDataScope::Rebuild => Vec::new(),
+            BuildDataScope::Reload(keys) => keys.clone(),
+        };
+        match &scope {
+            BuildDataScope::Normal => {}
+            BuildDataScope::Reload(_) => {
+                for workspace in updated_workspaces.values() {
+                    if let Some(Ok(key)) = proc_macro_spawn_key(
+                        workspace,
+                        &config.cargo_config.extra_env,
+                        &load_config,
+                    ) && !keys.iter().any(|old| old == &key)
+                    {
+                        keys.push(key);
+                    }
+                }
+            }
+            BuildDataScope::Rebuild => {
+                for (&index, workspace) in workspace_indexes.iter().zip(workspaces) {
+                    if let Some(Ok((key, _))) =
+                        self.loaded_workspaces[index].proc_macro_client.as_ref()
+                        && !keys.iter().any(|old| old == key)
+                    {
+                        keys.push(key.clone());
+                    }
+                    for workspace in [&self.loaded_workspaces[index].workspace, workspace] {
+                        if let Some(Ok(key)) = proc_macro_spawn_key(
+                            workspace,
+                            &config.cargo_config.extra_env,
+                            &load_config,
+                        ) && !keys.iter().any(|old| old == &key)
+                        {
+                            keys.push(key);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut targets = workspace_indexes.to_vec();
+        if !keys.is_empty() {
+            for (index, workspace) in self.loaded_workspaces.iter().enumerate() {
+                if targets.contains(&index) {
+                    continue;
+                }
+                let shared = workspace
+                    .proc_macro_client
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .is_some_and(|(key, _)| keys.iter().any(|old| old == key))
+                    || proc_macro_spawn_key(
+                        &workspace.workspace,
+                        &config.cargo_config.extra_env,
+                        &load_config,
+                    )
+                    .and_then(Result::ok)
+                    .is_some_and(|key| keys.iter().any(|old| old == &key));
+                if shared {
+                    targets.push(index);
+                }
+            }
+        }
+        targets.sort_unstable();
+
+        let workspaces = targets
+            .into_iter()
+            .map(|index| {
+                let workspace = updated_workspaces.remove(&index);
+                BuildDataWorkspace {
+                    index,
+                    build_data_loaded: workspace.is_some()
+                        || self.loaded_workspaces[index].input.build_data_loaded,
+                    workspace: workspace
+                        .unwrap_or_else(|| self.loaded_workspaces[index].workspace.clone()),
+                    files: Arc::clone(&self.loaded_workspaces[index]._vfs),
+                    proc_macro_client: self.loaded_workspaces[index].proc_macro_client.clone(),
+                }
+            })
+            .collect();
+        let proc_macro_clients = match &scope {
+            BuildDataScope::Normal | BuildDataScope::Reload(_) => self.proc_macro_clients(None),
+            BuildDataScope::Rebuild => Vec::new(),
+        };
+        let operation_keys = match scope {
+            BuildDataScope::Normal => None,
+            BuildDataScope::Reload(_) => Some((false, keys)),
+            BuildDataScope::Rebuild => Some((true, keys)),
+        };
+        Ok(Some(BuildDataSnapshot {
+            generation: self.workspace_generation,
+            workspaces,
+            proc_macro_clients,
+            operation_keys,
+        }))
+    }
+
+    fn commit_build_data(&mut self, prepared: &mut PreparedBuildData) -> anyhow::Result<bool> {
+        if self.workspace_generation != prepared.generation
+            || prepared.workspaces.iter().any(|prepared| {
+                !Arc::ptr_eq(&self.loaded_workspaces[prepared.index]._vfs, &prepared.files)
+            })
+        {
+            return Ok(false);
+        }
+        let revision = self.host.raw_database().nonce_and_revision().1;
+        for prepared in prepared.workspaces.drain(..) {
+            let loaded = &mut self.loaded_workspaces[prepared.index];
+            loaded.workspace = prepared.workspace;
+            loaded.input.source_root_config = prepared.source_root_config;
+            loaded.input.source_roots = source_roots_for_files(
+                &loaded.input.source_root_config,
+                loaded
+                    ._vfs
+                    .iter()
+                    .filter(|(file_id, _)| loaded._vfs.exists(*file_id))
+                    .map(|(file_id, path)| (file_id, path.clone())),
+            );
+            loaded.source_root_parent_map =
+                loaded.input.source_root_config.source_root_parent_map();
+            loaded.input.crate_graph = prepared.crate_graph;
+            loaded.input.proc_macro_paths = prepared.proc_macro_paths;
+            loaded.input.proc_macros = prepared.proc_macros;
+            loaded.input.proc_macros_loaded = prepared.proc_macros_loaded;
+            loaded.input.build_data_loaded = prepared.build_data_loaded;
+            loaded.proc_macro_client = prepared.proc_macro_client;
+            loaded.summary.proc_macro_server = loaded
+                .proc_macro_client
+                .as_ref()
+                .is_some_and(|result| result.is_ok());
+        }
+
+        self.apply_staged_inputs(revision)?;
+        Ok(true)
+    }
+
+    fn proc_macro_indexes(
+        &self,
+        workspace_indexes: &[usize],
+        reload_keys: Option<&[ProcMacroSpawnKey]>,
+        config: Option<&SharedAnalyzerConfig>,
+    ) -> Vec<usize> {
+        let Some(keys) = reload_keys else {
+            return workspace_indexes.to_vec();
+        };
+        let mut indexes = self
+            .loaded_workspaces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, workspace)| {
+                let client_key = workspace
+                    .proc_macro_client
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .map(|(key, _)| key);
+                let workspace_key = config.and_then(|config| {
+                    let load_config = config.load.to_load_cargo_config();
+                    proc_macro_spawn_key(
+                        &workspace.workspace,
+                        &config.cargo_config.extra_env,
+                        &load_config,
+                    )
+                    .and_then(Result::ok)
+                });
+                (client_key.is_some_and(|key| keys.iter().any(|old| old == key))
+                    || workspace_key
+                        .as_ref()
+                        .is_some_and(|key| keys.iter().any(|old| old == key)))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for &index in workspace_indexes {
+            if !indexes.contains(&index) {
+                indexes.push(index);
+            }
+        }
+        indexes.sort_unstable();
+        indexes
+    }
+
+    fn build_data_pending(&self, workspace_indexes: &[usize]) -> bool {
+        workspace_indexes.iter().any(|&index| {
+            self.loaded_workspaces
+                .get(index)
+                .is_some_and(|workspace| !workspace.input.build_data_loaded)
+        })
+    }
+
+    fn proc_macros_pending(
+        &self,
+        workspace_indexes: &[usize],
+        reload_keys: Option<&[ProcMacroSpawnKey]>,
+        config: Option<&SharedAnalyzerConfig>,
+    ) -> bool {
+        self.proc_macro_indexes(workspace_indexes, reload_keys, config)
+            .into_iter()
+            .any(|index| {
+                let Some(workspace) = self.loaded_workspaces.get(index) else {
+                    return false;
+                };
+                workspace.input.build_data_loaded && !workspace.input.proc_macros_loaded
+            })
+    }
+
+    fn proc_macro_load_request(
+        &self,
+        workspace_indexes: &[usize],
+        ignored_proc_macros: &[(Box<str>, Vec<Box<str>>)],
+        reload_keys: Option<&[ProcMacroSpawnKey]>,
+        config: Option<&SharedAnalyzerConfig>,
+    ) -> Option<SharedProcMacroLoadRequest> {
+        let workspace_indexes = self.proc_macro_indexes(workspace_indexes, reload_keys, config);
+        let workspaces = workspace_indexes
+            .iter()
+            .filter_map(|&index| {
+                let workspace = self.loaded_workspaces.get(index)?;
+                let pending =
+                    workspace.input.build_data_loaded && !workspace.input.proc_macros_loaded;
+                pending.then(|| SharedProcMacroWorkspace {
+                    index,
+                    client: workspace.proc_macro_client.as_ref().map(|client| {
+                        client
+                            .as_ref()
+                            .map(|(_, client)| client.clone())
+                            .map_err(Clone::clone)
+                    }),
+                    paths: workspace.input.proc_macro_paths.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        (!workspaces.is_empty()).then(|| SharedProcMacroLoadRequest {
+            generation: self.workspace_generation,
+            workspaces,
+            ignored_proc_macros: ignored_proc_macros.to_vec(),
+        })
+    }
+
+    fn commit_proc_macro_load(
+        &mut self,
+        response: SharedProcMacroLoadResponse,
+    ) -> anyhow::Result<bool> {
+        if response.generation != self.workspace_generation {
+            return Ok(false);
+        }
+        if response.workspaces.is_empty() {
+            return Ok(true);
+        }
+        let revision = self.host.raw_database().nonce_and_revision().1;
+        for (index, proc_macros) in response.workspaces {
+            let Some(workspace) = self.loaded_workspaces.get_mut(index) else {
+                return Ok(false);
+            };
+            workspace.input.proc_macros = proc_macros;
+            workspace.input.proc_macros_loaded = true;
+        }
+
+        self.apply_staged_inputs(revision)?;
+        Ok(true)
+    }
+
+    fn apply_staged_inputs(&mut self, revision: Revision) -> anyhow::Result<()> {
+        self.apply_base_inputs(Vec::new());
+        self.recone_session_overlays()?;
+        if self.host.raw_database().nonce_and_revision().1 != revision {
+            self.input_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     fn access(&self) -> Arc<SharedWorldAccess> {
         Arc::clone(&self.access)
     }
 
-    fn prepare_workspace_load(
+    fn base_file_access(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.base_file_access)
+    }
+
+    fn workspace_generation(&self) -> u64 {
+        self.workspace_generation
+    }
+
+    fn load_workspace(
         source: SharedAnalyzerWorkspaceLoadSource,
         config: &SharedAnalyzerConfig,
-        proc_macro_clients: &[(ProcMacroSpawnKey, ProcMacroClient)],
-    ) -> anyhow::Result<PreparedWorkspaceLoad> {
+        progress: &(dyn Fn(String) + Sync),
+    ) -> anyhow::Result<(String, ProjectWorkspace)> {
         match source {
             SharedAnalyzerWorkspaceLoadSource::Project(project) => {
                 let load_key = shared_project_key(&project);
                 let workspace = match project {
                     crate::config::LinkedProject::ProjectManifest(manifest) => {
-                        ProjectWorkspace::load(manifest, &config.cargo_config, &|_| {})?
+                        ProjectWorkspace::load(manifest, &config.cargo_config, progress)?
                     }
                     crate::config::LinkedProject::InlineProjectJson(project) => {
-                        ProjectWorkspace::load_inline(project, &config.cargo_config, &|_| {})
+                        ProjectWorkspace::load_inline(project, &config.cargo_config, progress)
                     }
                 };
-                Self::prepare_loaded_workspace(load_key, workspace, config, proc_macro_clients)
+                Ok((load_key, workspace))
             }
             SharedAnalyzerWorkspaceLoadSource::DetachedFile(file) => {
                 let load_key = shared_detached_file_key(&file);
-                let workspace = ProjectWorkspace::load_detached_files(
-                    vec![file],
-                    &config.cargo_config,
-                )
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow::format_err!("detached file did not produce a workspace"))??;
-                Self::prepare_loaded_workspace(load_key, workspace, config, proc_macro_clients)
+                let workspace =
+                    ProjectWorkspace::load_detached_files(vec![file], &config.cargo_config)
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            anyhow::format_err!("detached file did not produce a workspace")
+                        })??;
+                Ok((load_key, workspace))
             }
         }
     }
 
-    fn prepare_loaded_workspace(
-        load_key: String,
-        mut workspace: ProjectWorkspace,
+    fn prepare_workspace_load(
+        source: SharedAnalyzerWorkspaceLoadSource,
         config: &SharedAnalyzerConfig,
         proc_macro_clients: &[(ProcMacroSpawnKey, ProcMacroClient)],
+        base_file_ids: &SharedBaseFileIds,
+        progress: &(dyn Fn(String) + Sync),
+    ) -> anyhow::Result<PreparedWorkspaceLoad> {
+        let (load_key, workspace) = Self::load_workspace(source, config, progress)?;
+        let mut proc_macro_clients = proc_macro_clients.to_vec();
+        Self::prepare_loaded_workspace(
+            load_key,
+            workspace,
+            config,
+            &mut proc_macro_clients,
+            metadata_proc_macro_state(config),
+            base_file_ids,
+        )
+    }
+
+    fn prepare_loaded_workspace(
+        load_key: String,
+        workspace: ProjectWorkspace,
+        config: &SharedAnalyzerConfig,
+        proc_macro_clients: &mut Vec<(ProcMacroSpawnKey, ProcMacroClient)>,
+        proc_macro_state: ProcMacroLoadState,
+        base_file_ids: &SharedBaseFileIds,
     ) -> anyhow::Result<PreparedWorkspaceLoad> {
         let manifest_path = workspace
             .manifest()
@@ -2087,40 +4140,52 @@ impl SharedWorld {
             .unwrap_or_else(|| workspace.workspace_root().to_string());
         let summary_root = workspace.workspace_root().to_string();
         let packages = workspace.n_packages();
-        if config.load.key.load_out_dirs_from_check {
-            let build_scripts = workspace.run_build_scripts(&config.cargo_config, &|_| {})?;
-            workspace.set_build_scripts(build_scripts);
-        }
         let load_config = config.load.to_load_cargo_config();
-        let (proc_macro_spawn, proc_macro_server) = match spawn_proc_macro_server(
-            &workspace,
-            &config.cargo_config.extra_env,
-            &load_config,
-            proc_macro_clients,
-        ) {
-            Some(Ok((key, client))) => (Some(key), Some(Ok(client))),
-            Some(Err(error)) => (None, Some(Err(error))),
-            None => (None, None),
-        };
+        let (proc_macro_spawn, proc_macro_server) =
+            if proc_macro_state != ProcMacroLoadState::Disabled {
+                match spawn_proc_macro_server(
+                    &workspace,
+                    &config.cargo_config.extra_env,
+                    &load_config,
+                    proc_macro_clients,
+                ) {
+                    Some(Ok((key, client))) => {
+                        if !proc_macro_clients
+                            .iter()
+                            .any(|(existing, _)| existing == &key)
+                        {
+                            proc_macro_clients.push((key.clone(), client.clone()));
+                        }
+                        (Some(Ok(key)), Some(Ok(client)))
+                    }
+                    Some(Err(error)) => (Some(Err(error.clone())), Some(Err(error))),
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
+            };
         let session_workspace = workspace.clone();
         let loaded = load_workspace_change(
             workspace,
             &config.cargo_config.extra_env,
             &load_config,
+            &config.load.key.ignored_proc_macros,
             proc_macro_server,
-            |_| allocate_shared_file_id(),
+            proc_macro_state,
+            |_, path| base_file_ids.resolve(path),
         )?;
         let files = loaded.vfs.iter().count();
         let line_endings = loaded
             .file_texts
             .iter()
             .map(|(file_id, text)| {
-                let (_, line_endings) =
-                    crate::line_index::LineEndings::normalize(text.clone());
+                let (_, line_endings) = crate::line_index::LineEndings::normalize(text.clone());
                 (*file_id, line_endings)
             })
             .collect();
-        let proc_macro_server = loaded.proc_macro_server.is_some();
+        let proc_macro_server = loaded.proc_macro_server.as_ref().is_some_and(Result::is_ok);
+        let proc_macros_loaded = proc_macro_state != ProcMacroLoadState::NotYetBuilt
+            || loaded.proc_macro_paths.is_empty();
 
         Ok(PreparedWorkspaceLoad {
             root_key: load_key,
@@ -2135,51 +4200,107 @@ impl SharedWorld {
             loaded,
             line_endings,
             proc_macro_spawn,
+            proc_macros_loaded,
+            build_data_loaded: !config.load.key.load_out_dirs_from_check,
         })
     }
 
-    fn commit_workspace(
+    fn invalidate_proc_macro_groups(
         &mut self,
-        loaded: PreparedWorkspaceLoad,
-        reload: bool,
-    ) -> anyhow::Result<usize> {
+        workspace_indexes: &[usize],
+        reload_keys: &[ProcMacroSpawnKey],
+        config: &SharedAnalyzerConfig,
+    ) {
+        let load_config = config.load.to_load_cargo_config();
+        let proc_macro_state = metadata_proc_macro_state(config);
+        for (index, workspace) in self.loaded_workspaces.iter_mut().enumerate() {
+            if workspace_indexes.contains(&index) {
+                continue;
+            }
+            let shared = workspace
+                .proc_macro_client
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .is_some_and(|(key, _)| reload_keys.iter().any(|old| old == key))
+                || proc_macro_spawn_key(
+                    &workspace.workspace,
+                    &config.cargo_config.extra_env,
+                    &load_config,
+                )
+                .and_then(Result::ok)
+                .is_some_and(|key| reload_keys.iter().any(|old| old == &key));
+            if !shared {
+                continue;
+            }
+            workspace.input.proc_macros = collect_proc_macros(
+                &None,
+                workspace.input.proc_macro_paths.clone(),
+                &config.load.key.ignored_proc_macros,
+                proc_macro_state,
+                &|_| {},
+            );
+            workspace.input.proc_macros_loaded = proc_macro_state
+                != ProcMacroLoadState::NotYetBuilt
+                || workspace.input.proc_macro_paths.is_empty();
+            workspace.proc_macro_client = None;
+            workspace.summary.proc_macro_server = false;
+        }
+    }
+
+    fn commit_workspace_batch(
+        &mut self,
+        loaded: Vec<PreparedWorkspaceLoad>,
+        reload_keys: &[ProcMacroSpawnKey],
+        config: &SharedAnalyzerConfig,
+    ) -> anyhow::Result<Vec<usize>> {
         let revision = self.host.raw_database().nonce_and_revision().1;
-        let result = self.commit_workspace_inner(loaded, reload);
+        let mut indexes = Vec::with_capacity(loaded.len());
+        let mut file_texts = Vec::new();
+        for loaded in loaded {
+            if let Some(&index) = self.workspace_indexes.get(&loaded.root_key) {
+                let old_files = Arc::clone(&self.loaded_workspaces[index]._vfs);
+                let old_line_endings = Arc::clone(&self.loaded_workspaces[index].line_endings);
+                let (workspace, texts) = self.remap_workspace_load(loaded);
+                let mut workspace = workspace;
+                self.preserve_workspace_files(&mut workspace, &old_files, &old_line_endings);
+                self.loaded_workspaces[index] = workspace;
+                file_texts.extend(texts);
+                indexes.push(index);
+            } else {
+                let root_key = loaded.root_key.clone();
+                let (workspace, texts) = self.remap_workspace_load(loaded);
+                let index = self.loaded_workspaces.len();
+                self.workspace_indexes.insert(root_key, index);
+                self.loaded_workspaces.push(workspace);
+                file_texts.extend(texts);
+                indexes.push(index);
+            }
+        }
+
+        self.invalidate_proc_macro_groups(&indexes, reload_keys, config);
+        self.host.raw_database_mut().enable_proc_attr_macros();
+        self.apply_base_inputs(file_texts);
+        self.recone_session_overlays()?;
         if self.host.raw_database().nonce_and_revision().1 != revision {
             self.input_generation.fetch_add(1, Ordering::SeqCst);
+            self.workspace_generation = self.workspace_generation.wrapping_add(1);
+        }
+        Ok(indexes)
+    }
+
+    fn commit_workspace(&mut self, loaded: PreparedWorkspaceLoad) -> usize {
+        let revision = self.host.raw_database().nonce_and_revision().1;
+        let result = self.commit_workspace_inner(loaded);
+        if self.host.raw_database().nonce_and_revision().1 != revision {
+            self.input_generation.fetch_add(1, Ordering::SeqCst);
+            self.workspace_generation = self.workspace_generation.wrapping_add(1);
         }
         result
     }
 
-    fn commit_workspace_inner(
-        &mut self,
-        loaded: PreparedWorkspaceLoad,
-        reload: bool,
-    ) -> anyhow::Result<usize> {
+    fn commit_workspace_inner(&mut self, loaded: PreparedWorkspaceLoad) -> usize {
         if let Some(&index) = self.workspace_indexes.get(&loaded.root_key) {
-            if !reload {
-                return Ok(index);
-            }
-
-            let (workspace, file_texts) = self.remap_workspace_load(loaded);
-            let removed_files = self.loaded_workspaces[index]
-                ._vfs
-                .iter()
-                .map(|(file_id, _)| file_id)
-                .collect::<Vec<_>>();
-            self.loaded_workspaces[index] = workspace;
-            let (source_roots, mut change) = self.base_input_change(file_texts);
-            for file_id in removed_files {
-                change.change_file(file_id, None);
-            }
-
-            self.host.raw_database_mut().enable_proc_attr_macros();
-            self.apply_source_roots(source_roots);
-            self.host.apply_change(change);
-            self.refresh_base_inputs();
-            let removed_overlay_files = self.recone_session_overlays()?;
-            self.rebuild_overlay_inputs(removed_overlay_files)?;
-            return Ok(index);
+            return index;
         }
 
         let root_key = loaded.root_key.clone();
@@ -2187,13 +4308,10 @@ impl SharedWorld {
         let index = self.loaded_workspaces.len();
         self.workspace_indexes.insert(root_key, index);
         self.loaded_workspaces.push(workspace);
-        let (source_roots, change) = self.base_input_change(file_texts);
 
         self.host.raw_database_mut().enable_proc_attr_macros();
-        self.apply_source_roots(source_roots);
-        self.host.apply_change(change);
-        self.refresh_base_inputs();
-        Ok(index)
+        self.apply_base_inputs(file_texts);
+        index
     }
 
     fn remap_workspace_load(
@@ -2211,18 +4329,60 @@ impl SharedWorld {
                 workspace: loaded.workspace,
                 input: LoadedWorkspaceInput {
                     source_roots: loaded.loaded.source_roots,
+                    source_root_config: loaded.loaded.source_root_config,
                     crate_graph: loaded.loaded.crate_graph,
+                    proc_macro_paths: loaded.loaded.proc_macro_paths,
                     proc_macros: loaded.loaded.proc_macros,
+                    proc_macros_loaded: loaded.proc_macros_loaded,
+                    build_data_loaded: loaded.build_data_loaded,
                 },
                 _vfs: Arc::new(files),
                 line_endings,
                 source_root_parent_map,
-                proc_macro_client: loaded
-                    .proc_macro_spawn
-                    .zip(loaded.loaded.proc_macro_server),
+                proc_macro_client: match (loaded.proc_macro_spawn, loaded.loaded.proc_macro_server)
+                {
+                    (Some(Ok(key)), Some(Ok(client))) => Some(Ok((key, client))),
+                    (Some(Err(error)), _) | (_, Some(Err(error))) => Some(Err(error)),
+                    _ => None,
+                },
             },
             file_texts,
         )
+    }
+
+    fn preserve_workspace_files(
+        &self,
+        workspace: &mut LoadedWorkspace,
+        old_files: &LoadedWorkspaceFiles,
+        old_line_endings: &BTreeMap<FileId, crate::line_index::LineEndings>,
+    ) {
+        let files = Arc::make_mut(&mut workspace._vfs);
+        for (file_id, path) in old_files.iter() {
+            if files.file_id(path).is_none() {
+                files.insert(file_id, path.clone(), old_files.exists(file_id));
+            }
+        }
+
+        let line_endings = Arc::make_mut(&mut workspace.line_endings);
+        for (&file_id, endings) in old_line_endings {
+            line_endings.entry(file_id).or_insert_with(|| *endings);
+        }
+
+        workspace.input.source_roots = source_roots_for_files(
+            &workspace.input.source_root_config,
+            files
+                .iter()
+                .filter(|(file_id, _)| files.exists(*file_id))
+                .map(|(file_id, path)| (file_id, path.clone())),
+        );
+        workspace.summary.files = files.files_by_id.len();
+    }
+
+    fn apply_base_inputs(&mut self, file_texts: Vec<(FileId, String)>) {
+        let (source_roots, change) = self.base_input_change(file_texts);
+        self.apply_source_roots(source_roots);
+        self.host.apply_change(change);
+        self.refresh_base_inputs();
     }
 
     fn base_input_change(
@@ -2343,20 +4503,62 @@ impl SharedWorld {
             self.applied_local_roots = local_roots;
         }
         if self.applied_library_roots != library_roots {
-            LibraryRoots::get(db).set_roots(db).to(library_roots.clone());
+            LibraryRoots::get(db)
+                .set_roots(db)
+                .to(library_roots.clone());
             self.applied_library_roots = library_roots;
         }
     }
 
-    fn register_session(&mut self) -> (u64, Arc<AtomicU64>, Arc<SharedWorldAccess>) {
+    fn register_session(
+        &mut self,
+        workspace_indexes: &[usize],
+    ) -> (
+        u64,
+        Arc<AtomicU64>,
+        Arc<SharedWorldAccess>,
+        crossbeam_channel::Receiver<()>,
+        Arc<AtomicBool>,
+    ) {
         let id = self.next_session_id;
         self.next_session_id += 1;
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let pending = Arc::new(AtomicBool::new(false));
         self.session_overlays
             .insert(id, ActiveSessionOverlay::default());
-        (id, Arc::clone(&self.input_generation), self.access())
+        self.workspace_updates.insert(
+            id,
+            WorkspaceUpdate {
+                workspace_indexes: workspace_indexes.to_vec(),
+                pending: Arc::clone(&pending),
+                sender,
+            },
+        );
+        (
+            id,
+            Arc::clone(&self.input_generation),
+            self.access(),
+            receiver,
+            pending,
+        )
+    }
+
+    fn notify_workspace_updates(&self, session_id: u64, workspace_indexes: &[usize]) {
+        for (&id, update) in &self.workspace_updates {
+            if id != session_id
+                && update
+                    .workspace_indexes
+                    .iter()
+                    .any(|index| workspace_indexes.contains(index))
+                && !update.pending.swap(true, Ordering::SeqCst)
+            {
+                _ = update.sender.try_send(());
+            }
+        }
     }
 
     fn unregister_session(&mut self, session_id: u64) -> bool {
+        self.workspace_updates.remove(&session_id);
         let old_files = self
             .session_overlays
             .remove(&session_id)
@@ -2371,13 +4573,6 @@ impl SharedWorld {
             return false;
         }
         true
-    }
-
-    fn workspaces(&self, view: &WorkspaceView) -> Vec<ProjectWorkspace> {
-        view.workspace_indexes()
-            .filter_map(|index| self.loaded_workspaces.get(index))
-            .map(|workspace| workspace.workspace.clone())
-            .collect()
     }
 
     fn workspace_summaries(&self, view: &WorkspaceView) -> Vec<WorkspaceSummary> {
@@ -2419,11 +4614,7 @@ impl SharedWorld {
         }
     }
 
-    fn session_file_mappings(
-        &self,
-        session_id: u64,
-        workspaces: &[usize],
-    ) -> SharedFileMappings {
+    fn session_file_mappings(&self, session_id: u64, workspaces: &[usize]) -> SharedFileMappings {
         let workspaces = self
             .loaded_workspaces_in(workspaces)
             .map(|workspace| Arc::clone(&workspace._vfs))
@@ -2934,16 +5125,17 @@ impl SharedWorld {
             };
             for dependency in &krate.data(db).dependencies {
                 if let Some(to) = base_builders.get(&dependency.crate_id).copied() {
-                    graph.add_dep(
-                        from,
-                        DependencyBuilder::with_prelude(
-                            dependency.name.clone(),
-                            to,
-                            dependency.is_prelude(),
-                            dependency.is_sysroot(),
-                        ),
-                    )
-                    .map_err(|error| anyhow::format_err!("{error:?}"))?;
+                    graph
+                        .add_dep(
+                            from,
+                            DependencyBuilder::with_prelude(
+                                dependency.name.clone(),
+                                to,
+                                dependency.is_prelude(),
+                                dependency.is_sysroot(),
+                            ),
+                        )
+                        .map_err(|error| anyhow::format_err!("{error:?}"))?;
                 }
             }
         }
@@ -2955,16 +5147,17 @@ impl SharedWorld {
                     .or_else(|| base_builders.get(&dependency.crate_id))
                     .copied();
                 if let Some(to) = to {
-                    graph.add_dep(
-                        *from,
-                        DependencyBuilder::with_prelude(
-                            dependency.name.clone(),
-                            to,
-                            dependency.is_prelude(),
-                            dependency.is_sysroot(),
-                        ),
-                    )
-                    .map_err(|error| anyhow::format_err!("{error:?}"))?;
+                    graph
+                        .add_dep(
+                            *from,
+                            DependencyBuilder::with_prelude(
+                                dependency.name.clone(),
+                                to,
+                                dependency.is_prelude(),
+                                dependency.is_sysroot(),
+                            ),
+                        )
+                        .map_err(|error| anyhow::format_err!("{error:?}"))?;
                 }
             }
         }
@@ -3014,9 +5207,7 @@ impl SharedWorld {
         let overlay_base_crates = overlay
             .map(|overlay| overlay.crates.keys().copied().collect::<BTreeSet<_>>())
             .unwrap_or_default();
-        let view_workspaces = self
-            .loaded_workspaces_in(workspaces)
-            .collect::<Vec<_>>();
+        let view_workspaces = self.loaded_workspaces_in(workspaces).collect::<Vec<_>>();
         let mut visible_files = rustc_hash::FxHashSet::default();
 
         for krate in &self.base_crates {
@@ -3080,12 +5271,6 @@ impl SharedWorld {
             .count()
     }
 
-}
-
-impl Default for SharedWorld {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 #[derive(Clone, Debug)]

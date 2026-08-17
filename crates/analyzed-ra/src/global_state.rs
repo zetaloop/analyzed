@@ -60,16 +60,15 @@ impl GlobalState {
         sender: crossbeam_channel::Sender<lsp_server::Message>,
         config: crate::config::Config,
     ) -> Self {
-        let registry = crate::shared_analyzer::shared_analyzer_registry();
-        let provider = crate::shared_analyzer::SharedAnalyzerProvider::new(
-            move |key, config, reload_path| registry.register(key, config, reload_path),
-        );
-        let (key, shared_config) = crate::shared_analyzer::shared_analyzer_context_from_config(&config)
-            .expect("global state config must describe a shared analyzer context");
-        let session = provider
-            .resolve(key, shared_config)
+        let (key, shared_config) =
+            crate::shared_analyzer::shared_analyzer_context_from_config(&config)
+                .expect("global state config must describe a shared analyzer context");
+        let session = crate::shared_analyzer::shared_analyzer_registry()
+            .register(key, shared_config, None, false, false, None, &|_| {})
             .expect("shared analyzer context must resolve");
-        Self::new_with_shared(sender, config, provider, session.runtime(), Vec::new())
+        let state = Self::new_with_shared(sender, config, session.runtime(), Vec::new());
+        state.listen_workspace_updates();
+        state
     }
 
     pub(crate) fn process_changes(&mut self) -> (bool, Option<Duration>) {
@@ -149,7 +148,9 @@ impl GlobalStateSnapshot {
     }
 
     pub(crate) fn file_id_to_url(&self, id: FileId) -> Uri {
-        self.shared.file_id_to_url(id).expect("shared analyzer file id must have a url")
+        self.shared
+            .file_id_to_url(id)
+            .expect("shared analyzer file id must have a url")
     }
 
     pub(crate) fn vfs_path_to_file_id(&self, vfs_path: &VfsPath) -> anyhow::Result<Option<FileId>> {

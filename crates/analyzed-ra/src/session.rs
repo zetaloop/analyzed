@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeSet,
-    env, fs,
+    fs,
     panic::AssertUnwindSafe,
     sync::Once,
     time::{Duration, Instant},
@@ -10,19 +10,15 @@ use crossbeam_channel::{Receiver, Sender};
 use ide::FileId;
 use ide_db::{FxHashMap, base_db::SourceRootId};
 use lsp_server::{Connection, Message};
-use lsp_types::{Notification as _, Uri};
-use paths::Utf8PathBuf;
+use lsp_types::Uri;
 use triomphe::Arc;
-use vfs::{AbsPathBuf, ChangeKind, VfsPath};
+use vfs::{ChangeKind, VfsPath};
 
 use crate::{
-    shared_analyzer::{
-        SharedAnalyzerProvider, SharedAnalyzerRuntime, SharedBaseFileChange, patch_path_prefix,
-    },
-    config::{Config, ConfigChange, ConfigErrors},
-    from_json, server_capabilities,
+    config::{Config, ConfigChange},
     global_state::FetchWorkspaceRequest,
     line_index::LineEndings,
+    shared_analyzer::{SharedAnalyzerRuntime, SharedBaseFileChange},
 };
 
 pub(crate) struct Session {
@@ -41,50 +37,28 @@ impl Session {
     pub(crate) fn new(
         sender: Sender<Message>,
         config: crate::config::Config,
-        provider: SharedAnalyzerProvider,
         shared: SharedAnalyzerRuntime,
         workspaces: Vec<project_model::ProjectWorkspace>,
     ) -> Self {
-        Self {
-            state: crate::global_state::GlobalState::new_with_shared(
-                sender,
-                config,
-                provider,
-                shared,
-                workspaces,
-            ),
-        }
+        let state =
+            crate::global_state::GlobalState::new_with_shared(sender, config, shared, workspaces);
+        state.listen_workspace_updates();
+        Self { state }
     }
 
     pub(crate) fn run_shared(self, receiver: Receiver<Message>) -> anyhow::Result<()> {
-        run_shared_state(self.state, receiver)
+        let _active = ActiveSession(self.state.shared.clone());
+        self.state.run(receiver)
     }
 }
 
-pub(crate) fn run_shared_lsp_session(
-    connection: Connection,
-    provider: SharedAnalyzerProvider,
-) -> anyhow::Result<()> {
-    let (initialize_id, initialize_params) = connection.initialize_start()?;
-    tracing::info!("InitializeParams: {}", initialize_params);
-    let config = config_from_initialize_params(&connection, &initialize_params)?;
-    let initialize_result = lsp_types::InitializeResult {
-        capabilities: server_capabilities(&config),
-        server_info: Some(lsp_types::ServerInfo {
-            name: String::from("rust-analyzer"),
-            version: Some(crate::RUST_ANALYZER_VERSION.to_owned()),
-        }),
-    };
-
-    connection.initialize_finish(initialize_id, serde_json::to_value(initialize_result)?)?;
-
-    run_shared_lsp_session_with_config(config, connection, provider)
+pub(crate) fn run_shared_lsp_session(connection: Connection) -> anyhow::Result<()> {
+    crate::session::run_session(connection, crate::session::IoThreads::External, None)
 }
 
 pub(crate) fn run_shared_lsp_session_with_config(
     mut config: Config,
     connection: Connection,
-    provider: SharedAnalyzerProvider,
 ) -> anyhow::Result<()> {
     if config.discover_workspace_config().is_none()
         && !config.has_linked_projects()
@@ -96,70 +70,30 @@ pub(crate) fn run_shared_lsp_session_with_config(
     initialize_rayon();
     let (key, shared_config) =
         crate::shared_analyzer::shared_analyzer_context_from_config(&config)?;
-    let session = provider.resolve(key, shared_config)?;
+    let session = crate::shared_analyzer::shared_analyzer_registry().register(
+        key,
+        shared_config,
+        None,
+        false,
+        false,
+        None,
+        &|_| {},
+    )?;
     let shared = session.runtime();
     let workspaces = Vec::new();
     let Connection { sender, receiver } = connection;
-    Session::new(sender, config, provider, shared, workspaces)
-        .run_shared(receiver)
-}
-
-fn run_shared_state(
-    mut state: crate::global_state::GlobalState,
-    inbox: Receiver<Message>,
-) -> anyhow::Result<()> {
-    let _active = ActiveSession(state.shared.clone());
-    if state.config.did_save_text_document_dynamic_registration() {
-        let additional_patterns = state
-            .config
-            .discover_workspace_config()
-            .map(|cfg| cfg.files_to_watch.clone().into_iter())
-            .into_iter()
-            .flatten()
-            .map(|file| format!("**/{file}"));
-        state.register_did_save_capability(additional_patterns);
-    }
-
-    if state.config.discover_workspace_config().is_none() {
-        state.fetch_workspaces_queue.request_op(
-            "startup".to_owned(),
-            FetchWorkspaceRequest { path: None, force_crate_graph_reload: false },
-        );
-        if let Some((cause, FetchWorkspaceRequest { path, force_crate_graph_reload })) =
-            state.fetch_workspaces_queue.should_start_op()
-        {
-            state.fetch_workspaces(cause, path, force_crate_graph_reload);
-        }
-    }
-    state.update_status_or_notify();
-
-    while let Ok(event) = state.next_event(&inbox) {
-        let Some(event) = event else {
-            anyhow::bail!("client exited without proper shutdown sequence");
-        };
-        if matches!(
-            &event,
-            super::Event::Lsp(lsp_server::Message::Notification(lsp_server::Notification {
-                method,
-                ..
-            }))
-            if method == lsp_types::ExitNotification::METHOD.as_str()
-        ) {
-            return Ok(());
-        }
-        state.shared.set_busy(true);
-        state.handle_event(event);
-        let idle = state.is_quiescent()
-            && state.task_pool.handle.is_empty()
-            && state.fmt_pool.handle.is_empty();
-        state.shared.set_busy(!idle);
-    }
-
-    anyhow::bail!("A receiver has been dropped, something panicked!")
+    Session::new(sender, config, shared, workspaces).run_shared(receiver)
 }
 
 impl crate::global_state::GlobalState {
     pub(crate) fn process_shared_changes(&mut self) -> (bool, Option<Duration>) {
+        if !self.reload_pending
+            && !self.proc_macro_clients_failed
+            && !self.shared.reload_registered()
+            && !self.shared.rebuild_registered()
+        {
+            self.proc_macro_clients = self.shared.proc_macro_clients();
+        }
         let shared = self.shared.clone();
         let generation_changed = shared.config_generation_changed();
         let mut modified_ratoml_files = Vec::new();
@@ -178,7 +112,12 @@ impl crate::global_state::GlobalState {
             let additional_files = self
                 .config
                 .discover_workspace_config()
-                .map(|cfg| cfg.files_to_watch.iter().map(String::as_str).collect::<Vec<_>>())
+                .map(|cfg| {
+                    cfg.files_to_watch
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
             let (vfs, line_endings_map) = &mut *guard;
 
@@ -198,9 +137,7 @@ impl crate::global_state::GlobalState {
                     vfs::Change::Delete => None,
                 };
 
-                if let Some(("rust-analyzer", Some("toml"))) =
-                    vfs_path.name_and_extension()
-                {
+                if let Some(("rust-analyzer", Some("toml"))) = vfs_path.name_and_extension() {
                     modified_ratoml_files.push((
                         file_kind,
                         crate::shared_analyzer::normalize_vfs_path(&vfs_path),
@@ -320,14 +257,15 @@ impl crate::global_state::GlobalState {
                 path.push("rust-analyzer.toml");
                 Some(path)
             })();
-            let user_config_vfs_path =
-                user_config_path.as_ref().map(|path| VfsPath::from(path.clone()));
+            let user_config_vfs_path = user_config_path
+                .as_ref()
+                .map(|path| VfsPath::from(path.clone()));
             let user_config_text = user_config_vfs_path
                 .as_ref()
                 .and_then(|path| {
-                    self.mem_docs.get(path).and_then(|doc| {
-                        std::str::from_utf8(&doc.data).ok().map(ToOwned::to_owned)
-                    })
+                    self.mem_docs
+                        .get(path)
+                        .and_then(|doc| std::str::from_utf8(&doc.data).ok().map(ToOwned::to_owned))
                 })
                 .or_else(|| {
                     user_config_path
@@ -341,14 +279,7 @@ impl crate::global_state::GlobalState {
                 user_config_text,
                 shared_source_root_parent_map,
             );
-            let (config, errors, should_update) = self.config.apply_change(config_change);
-            self.config_errors = (!errors.is_empty()).then_some(errors);
-
-            if should_update {
-                self.update_configuration(config);
-            } else {
-                self.config = Arc::new(config);
-            }
+            self.apply_config_change(config_change);
             changed = true;
         }
         if changed && !matches!(&workspace_structure_change, Some((.., true))) {
@@ -362,10 +293,9 @@ impl crate::global_state::GlobalState {
                 .filter_map(|path| shared.vfs_path_to_file_id(path).ok().flatten())
                 .collect::<Vec<_>>();
             if !modified_rust_files.is_empty() {
-                _ = self
-                    .deferred_task_queue
-                    .sender
-                    .send(crate::main_loop::DeferredTask::CheckProcMacroSources(modified_rust_files));
+                _ = self.deferred_task_queue.sender.send(
+                    crate::main_loop::DeferredTask::CheckProcMacroSources(modified_rust_files),
+                );
             }
         }
 
@@ -384,15 +314,21 @@ impl crate::global_state::GlobalState {
             path.push("rust-analyzer.toml");
             Some(path)
         })();
-        let user_config_vfs_path = user_config_path.as_ref().map(|path| VfsPath::from(path.clone()));
+        let user_config_vfs_path = user_config_path
+            .as_ref()
+            .map(|path| VfsPath::from(path.clone()));
         let user_config_text = user_config_vfs_path
             .as_ref()
             .and_then(|path| {
-                self.mem_docs.get(path).and_then(|doc| {
-                    std::str::from_utf8(&doc.data).ok().map(ToOwned::to_owned)
-                })
+                self.mem_docs
+                    .get(path)
+                    .and_then(|doc| std::str::from_utf8(&doc.data).ok().map(ToOwned::to_owned))
             })
-            .or_else(|| user_config_path.as_ref().and_then(|path| fs::read_to_string(path).ok()));
+            .or_else(|| {
+                user_config_path
+                    .as_ref()
+                    .and_then(|path| fs::read_to_string(path).ok())
+            });
         let shared_source_root_parent_map = Arc::new(shared.source_root_parent_map());
         let config_change = self.config_change_from_ratoml(
             Vec::new(),
@@ -400,6 +336,10 @@ impl crate::global_state::GlobalState {
             user_config_text,
             shared_source_root_parent_map,
         );
+        self.apply_config_change(config_change);
+    }
+
+    fn apply_config_change(&mut self, config_change: ConfigChange) {
         let (config, errors, should_update) = self.config.apply_change(config_change);
         self.config_errors = (!errors.is_empty()).then_some(errors);
 
@@ -440,7 +380,12 @@ impl crate::global_state::GlobalState {
             .into_iter()
             .map(|(path, source_root_id, is_library, text)| {
                 let path = crate::shared_analyzer::normalize_vfs_path(&path);
-                (path, source_root_id, is_library, Some(Arc::<str>::from(text)))
+                (
+                    path,
+                    source_root_id,
+                    is_library,
+                    Some(Arc::<str>::from(text)),
+                )
             })
             .collect::<Vec<_>>();
         let mut user_config_changed = false;
@@ -453,17 +398,14 @@ impl crate::global_state::GlobalState {
                 user_config_changed = true;
             }
 
-            let Some((source_root_id, is_library)) =
-                self.shared.source_root_for_path(&vfs_path)
+            let Some((source_root_id, is_library)) = self.shared.source_root_for_path(&vfs_path)
             else {
                 continue;
             };
             ratoml_files.push((vfs_path, source_root_id, is_library, text));
         }
 
-        if !user_config_changed
-            && let Some(text) = user_config_text
-        {
+        if !user_config_changed && let Some(text) = user_config_text {
             change.change_user_config(Some(Arc::<str>::from(text)));
         }
 
@@ -499,10 +441,7 @@ impl crate::global_state::GlobalState {
         change
     }
 
-    pub(crate) fn base_url_to_file_id(
-        &self,
-        url: &Uri,
-    ) -> anyhow::Result<Option<FileId>> {
+    pub(crate) fn base_url_to_file_id(&self, url: &Uri) -> anyhow::Result<Option<FileId>> {
         self.shared.base_url_to_file_id(url)
     }
 
@@ -576,7 +515,12 @@ impl crate::global_state::GlobalState {
     pub(crate) fn mark_idle_gc(&mut self) {}
 
     pub(crate) fn handle_event(&mut self, event: super::Event) {
-        self._handle_event(event)
+        self.shared.set_busy(true);
+        self._handle_event(event);
+        let idle = self.is_quiescent()
+            && self.task_pool.handle.is_empty()
+            && self.fmt_pool.handle.is_empty();
+        self.shared.set_busy(!idle);
     }
 
     pub(crate) fn handle_task(
@@ -601,6 +545,37 @@ impl crate::global_state::GlobalState {
                 );
                 None
             }
+            super::Task::FetchedProcMacros(progress) => {
+                self.handle_shared_proc_macro_progress(progress)
+            }
+            super::Task::SharedReloadReady(operation) => {
+                self.handle_shared_reload_ready(operation);
+                None
+            }
+            super::Task::SharedRebuildReady(operation) => {
+                self.handle_shared_rebuild_ready(operation);
+                None
+            }
+            super::Task::WorkspaceUpdated(runtime) => {
+                if self.shared.is_same_session(&runtime) && self.shared.workspace_update_pending() {
+                    self.fetch_workspaces_queue.request_op(
+                        "shared workspace updated".to_owned(),
+                        FetchWorkspaceRequest {
+                            path: None,
+                            force_crate_graph_reload: false,
+                        },
+                    );
+                }
+                None
+            }
+            super::Task::SharedBuildDataReady(cause, operation) => {
+                self.handle_shared_build_data_ready(cause, operation);
+                None
+            }
+            super::Task::SharedProcMacrosReady(cause, operation) => {
+                self.handle_shared_proc_macros_ready(cause, operation);
+                None
+            }
             super::Task::RetryDeferred(task) => {
                 self.deferred_task_queue.sender.send(task).unwrap();
                 None
@@ -619,10 +594,8 @@ impl crate::global_state::GlobalState {
 
     pub(crate) fn update_diagnostics(&mut self) {
         let generation = self.diagnostics.next_generation();
-        let subscriptions: std::sync::Arc<[FileId]> = self
-            .workspace_file_ids()
-            .into_iter()
-            .collect();
+        let subscriptions: std::sync::Arc<[FileId]> =
+            self.workspace_file_ids().into_iter().collect();
         self.spawn_native_diagnostics(generation, subscriptions);
     }
 
@@ -673,6 +646,21 @@ pub(crate) fn prime_caches(
     + std::panic::UnwindSafe
     + 'static,
 ) -> impl FnOnce(Sender<super::Task>) + Send + std::panic::UnwindSafe + 'static {
+    pending_analysis(
+        analysis,
+        super::Task::PrimeCaches(super::PrimeCachesProgress::End { cancelled: true }),
+        f,
+    )
+}
+
+fn pending_analysis(
+    analysis: AssertUnwindSafe<crate::shared_analyzer::SharedAnalyzerPendingAnalysis>,
+    retry: super::Task,
+    f: impl FnOnce(AssertUnwindSafe<ide::Analysis>, Sender<super::Task>)
+    + Send
+    + std::panic::UnwindSafe
+    + 'static,
+) -> impl FnOnce(Sender<super::Task>) + Send + std::panic::UnwindSafe + 'static {
     move |sender| {
         let (analysis, snapshot) = analysis.0.activate_snapshot();
         let (pending, tasks) = crossbeam_channel::unbounded();
@@ -680,11 +668,7 @@ pub(crate) fn prime_caches(
             f(AssertUnwindSafe(analysis), pending)
         }));
         if snapshot.replayable() {
-            sender
-                .send(super::Task::PrimeCaches(super::PrimeCachesProgress::End {
-                    cancelled: true,
-                }))
-                .unwrap();
+            sender.send(retry).unwrap();
         } else if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         } else {
@@ -754,26 +738,13 @@ pub(crate) fn check_proc_macro_sources(
     + std::panic::UnwindSafe
     + 'static,
 ) -> impl FnOnce(Sender<super::Task>) + Send + std::panic::UnwindSafe + 'static {
-    move |sender| {
-        let (analysis, snapshot) = analysis.0.activate_snapshot();
-        let (pending, tasks) = crossbeam_channel::unbounded();
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            f(AssertUnwindSafe(analysis), pending)
-        }));
-        if snapshot.replayable() {
-            sender
-                .send(super::Task::RetryDeferred(
-                    super::DeferredTask::CheckProcMacroSources(modified_rust_files),
-                ))
-                .unwrap();
-        } else if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        } else {
-            for task in tasks {
-                sender.send(task).unwrap();
-            }
-        }
-    }
+    pending_analysis(
+        analysis,
+        super::Task::RetryDeferred(super::DeferredTask::CheckProcMacroSources(
+            modified_rust_files,
+        )),
+        f,
+    )
 }
 
 pub(crate) fn fetch_native_diagnostics(
@@ -841,100 +812,13 @@ impl TryFrom<super::Task> for UpstreamTask {
     }
 }
 
-fn diagnostic_key(
-    diagnostic: &lsp_types::Diagnostic,
-) -> (lsp_types::Range, Option<String>) {
+fn diagnostic_key(diagnostic: &lsp_types::Diagnostic) -> (lsp_types::Range, Option<String>) {
     let code = diagnostic.code.as_ref().map(|code| match code {
         lsp_types::Code::Int(code) => code.to_string(),
         lsp_types::Code::String(code) => code.clone(),
     });
 
     (diagnostic.range, code)
-}
-
-fn config_from_initialize_params(
-    connection: &Connection,
-    initialize_params: &serde_json::Value,
-) -> anyhow::Result<Config> {
-    let lsp_types::InitializeParams {
-        #[expect(deprecated, reason = "compatibility with old clients")]
-        root_uri,
-        mut capabilities,
-        workspace_folders_initialize_params,
-        initialization_options,
-        client_info,
-        ..
-    } = from_json::<lsp_types::InitializeParams>("InitializeParams", initialize_params)?;
-
-    if let Some(value) = initialize_params.pointer("/capabilities/workspace/diagnostics")
-        && let Ok(diagnostics) =
-            from_json::<lsp_types::DiagnosticWorkspaceClientCapabilities>(
-                "DiagnosticWorkspaceClientCapabilities",
-                value,
-            )
-    {
-        capabilities.workspace.get_or_insert_default().diagnostics.get_or_insert(diagnostics);
-    }
-
-    let root_path = match root_uri
-        .and_then(|it| it.to_file_path().ok())
-        .map(patch_path_prefix)
-        .and_then(|it| Utf8PathBuf::from_path_buf(it).ok())
-        .and_then(|it| AbsPathBuf::try_from(it).ok())
-    {
-        Some(it) => it,
-        None => AbsPathBuf::assert_utf8(env::current_dir()?),
-    };
-
-    if let Some(client_info) = &client_info {
-        tracing::info!(
-            "Client '{}' {}",
-            client_info.name,
-            client_info.version.as_deref().unwrap_or_default()
-        );
-    }
-
-    let workspace_roots = workspace_folders_initialize_params
-        .workspace_folders
-        .and_then(|workspaces| match workspaces {
-            lsp_types::WorkspaceFolders::WorkspaceFolderList(workspace_folders) => {
-                Some(workspace_folders)
-            }
-            lsp_types::WorkspaceFolders::Null => None,
-        })
-        .map(|workspaces| {
-            workspaces
-                .into_iter()
-                .filter_map(|it| it.uri.to_file_path().ok())
-                .map(patch_path_prefix)
-                .filter_map(|it| Utf8PathBuf::from_path_buf(it).ok())
-                .filter_map(|it| AbsPathBuf::try_from(it).ok())
-                .collect::<Vec<_>>()
-        })
-        .filter(|workspaces| !workspaces.is_empty())
-        .unwrap_or_else(|| vec![root_path.clone()]);
-    let mut config = Config::new(root_path, capabilities, workspace_roots, client_info);
-
-    if let Some(json) = initialization_options {
-        let mut change = ConfigChange::default();
-        change.change_client_config(json);
-
-        let errors: ConfigErrors;
-        (config, errors, _) = config.apply_change(change);
-
-        if !errors.is_empty() {
-            let notification = lsp_server::Notification::new(
-                lsp_types::ShowMessageNotification::METHOD.into(),
-                lsp_types::ShowMessageParams {
-                    kind: lsp_types::MessageType::Warning,
-                    message: errors.to_string(),
-                },
-            );
-            connection.sender.send(lsp_server::Message::Notification(notification))?;
-        }
-    }
-
-    Ok(config)
 }
 
 fn initialize_rayon() {

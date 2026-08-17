@@ -847,6 +847,65 @@ pub fn extract_match_arm(
     commit(source, editor)
 }
 
+pub struct MatchArm<'a> {
+    pub pattern: &'a str,
+    pub expression: &'a str,
+}
+
+pub fn append_match_arms(
+    source: &mut String,
+    scope: Scope<'_>,
+    items: &[MatchArm<'_>],
+) -> Result<(), Box<dyn Error>> {
+    let Scope::MatchArm {
+        function,
+        type_name,
+        variant_name,
+    } = scope
+    else {
+        return Err("match-arm append requires a match-arm scope".into());
+    };
+    let (editor, root) = open(source)?;
+    let function_node: ast::Fn = named(&root, function)?;
+    let anchor = one(
+        arms(&function_node, type_name, variant_name),
+        &format!("`{type_name}::{variant_name}` arm in `{function}`"),
+    )?;
+    let list = anchor
+        .syntax()
+        .parent()
+        .and_then(ast::MatchArmList::cast)
+        .ok_or_else(|| format!("`{type_name}::{variant_name}` is not in a match arm list"))?;
+    let close = list
+        .r_curly_token()
+        .ok_or_else(|| format!("match arm list in `{function}` has no closing brace"))?;
+    let trailing = close
+        .prev_sibling_or_token()
+        .filter(|element| element.kind() == SyntaxKind::WHITESPACE);
+    let position = trailing.clone().unwrap_or_else(|| close.clone().into());
+    let level = IndentLevel::from_node(anchor.syntax());
+    let mut elements = Vec::with_capacity(items.len() * 2 + 1);
+    for item in items {
+        elements.extend([
+            make::tokens::whitespace(&format!("\n{level}")).into(),
+            make::match_arm(
+                make::path_pat(make::path_from_text(item.pattern)),
+                None,
+                expr_node(item.expression)?,
+            )
+            .syntax()
+            .clone()
+            .into(),
+        ]);
+    }
+    if trailing.is_none() {
+        let level = IndentLevel::from_node(list.syntax());
+        elements.push(make::tokens::whitespace(&format!("\n{level}")).into());
+    }
+    editor.insert_all(Position::before(position), elements);
+    commit(source, editor)
+}
+
 pub fn extract(
     source: &mut String,
     function: &str,

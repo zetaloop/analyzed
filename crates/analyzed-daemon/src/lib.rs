@@ -13,13 +13,13 @@ use std::{
 
 use analyzed_ipc::{
     BackendKey, BackendSnapshot, CargoConfigKey, DaemonRequest, DaemonResponse, DaemonSnapshot,
-    Hello, IpcStream, LspSession, ProcMacroServerKey, RuntimePaths, SharedWorldKey,
-    SharedWorldLoadKey, StartupLock, Stop, WorkspaceSnapshot, WorkspaceViewKey, accept_client,
-    bind_listener, read_json_line, write_json_line,
+    DatabaseConfigKey, Hello, IpcStream, LspSession, ProcMacroServerKey, RuntimePaths,
+    SharedWorldKey, SharedWorldLoadKey, StartupLock, Stop, WorkspaceSnapshot, WorkspaceViewKey,
+    accept_client, bind_listener, read_json_line, write_json_line,
 };
 use crossbeam_channel::unbounded;
 use lsp_server::{Connection, Message};
-use ra_ap_rust_analyzer::{SharedAnalyzerProvider, shared_analyzer_registry};
+use ra_ap_rust_analyzer::shared_analyzer_registry;
 use serde::Serialize;
 
 pub fn version() -> String {
@@ -360,11 +360,7 @@ fn handle_lsp_session(
     _session_id: usize,
 ) -> anyhow::Result<()> {
     let (connection, threads) = lsp_stream_connection(stream)?;
-    let registry = shared_analyzer_registry();
-    let provider = SharedAnalyzerProvider::new(move |key, shared_config, reload_path| {
-        registry.register(key, shared_config, reload_path)
-    });
-    let result = ra_ap_rust_analyzer::run_shared_rust_analyzer_lsp_session(connection, provider);
+    let result = ra_ap_rust_analyzer::run_shared_rust_analyzer_lsp_session(connection);
     let join_result = threads.join();
 
     match (result, join_result) {
@@ -458,12 +454,23 @@ fn backend_key_from_shared(key: ra_ap_rust_analyzer::SharedAnalyzerBackendKey) -
     BackendKey {
         shared_world: SharedWorldKey {
             cargo: cargo_config_key_from_shared(key.shared_world.cargo),
+            database: database_config_key_from_shared(key.shared_world.database),
             load: load_key_from_shared(key.shared_world.load),
         },
         workspace_view: WorkspaceViewKey {
             projects: key.workspace_view.projects,
             excluded_paths: key.workspace_view.excluded_paths,
         },
+    }
+}
+
+fn database_config_key_from_shared(
+    key: ra_ap_rust_analyzer::SharedAnalyzerDatabaseConfigKey,
+) -> DatabaseConfigKey {
+    DatabaseConfigKey {
+        lru_parse_query_capacity: key.lru_parse_query_capacity,
+        lru_query_capacities: key.lru_query_capacities.into_iter().collect(),
+        expand_proc_attr_macros: key.expand_proc_attr_macros,
     }
 }
 
@@ -503,6 +510,7 @@ fn load_key_from_shared(key: ra_ap_rust_analyzer::SharedAnalyzerLoadKey) -> Shar
                 ProcMacroServerKey::Explicit(path)
             }
         },
+        ignored_proc_macros: key.ignored_proc_macros,
         proc_macro_processes: key.proc_macro_processes,
     }
 }

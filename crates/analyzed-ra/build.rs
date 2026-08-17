@@ -57,14 +57,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let generated_src = generated.join("src");
     patch_config_source(&generated_src.join("config.rs"))?;
-    patch_diagnostics_source(&generated_src.join("diagnostics.rs"))?;
     patch_discover_source(&generated_src.join("discover.rs"))?;
+    patch_diagnostics_source(&generated_src.join("diagnostics.rs"))?;
     patch_global_state_source(&generated_src.join("global_state.rs"))?;
     patch_main_loop_source(&generated_src.join("main_loop.rs"))?;
+    patch_op_queue_source(&generated_src.join("op_queue.rs"))?;
     patch_reload_source(&generated_src.join("reload.rs"))?;
+    patch_session_source(&generated_src.join("session.rs"))?;
+    patch_task_pool_source(&generated_src.join("task_pool.rs"))?;
     patch_flycheck_to_proto_source(&generated_src.join("diagnostics/flycheck_to_proto.rs"))?;
     patch_dispatch_source(&generated_src.join("handlers/dispatch.rs"))?;
     patch_notification_source(&generated_src.join("handlers/notification.rs"))?;
+    patch_request_source(&generated_src.join("handlers/request.rs"))?;
     patch_driver_source(&generated_src.join("bin/main.rs"))?;
     write_root_module(
         &generated_src.join("root.rs"),
@@ -252,15 +256,12 @@ pub mod driver;
 
 pub use shared_analyzer::{{
     RUST_ANALYZER_VERSION,
-    RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary, SharedAnalyzerBackendKey,
-    SharedAnalyzerCargoConfigKey, SharedAnalyzerConfig,
+    SharedAnalyzerBackendKey, SharedAnalyzerCargoConfigKey, SharedAnalyzerDatabaseConfigKey,
     SharedAnalyzerBackendSnapshot, SharedAnalyzerLoadKey,
-    SharedAnalyzerProcMacroServerKey, SharedAnalyzerProvider, SharedAnalyzerRegistry,
-    SharedAnalyzerSession, SharedAnalyzerWorldKey,
-    SharedAnalyzerViewKey, WorkspaceSummary,
+    SharedAnalyzerProcMacroServerKey, SharedAnalyzerRegistry,
+    SharedAnalyzerWorldKey, SharedAnalyzerViewKey, WorkspaceSummary,
     run_shared_rust_analyzer_lsp_session, run_shared_rust_analyzer_lsp_session_with_config,
-    rust_analyzer_lsp_boundary,
-    rust_analyzer_private_boundary, shared_analyzer_registry,
+    shared_analyzer_registry,
 }};
 "#,
         shared_analyzer.to_string_lossy().into_owned(),
@@ -342,11 +343,39 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
     build_support::append::<ast::Struct>(
         &mut source,
         "FetchWorkspaceResponse",
-        &[build_support::Field {
-            vis: Some("pub(crate)"),
-            name: "shared",
-            ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
-        }],
+        &[
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "shared",
+                ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "reload_id",
+                ty: "Option<u64>",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "adopted",
+                ty: "bool",
+            },
+        ],
+    )?;
+    build_support::append::<ast::Struct>(
+        &mut source,
+        "FetchBuildDataResponse",
+        &[
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "rebuild_id",
+                ty: "Option<u64>",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "reload",
+                ty: "bool",
+            },
+        ],
     )?;
     build_support::add_attr::<ast::Struct>(
         &mut source,
@@ -359,13 +388,98 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         &[
             build_support::Field {
                 vis: Some("pub(crate)"),
-                name: "provider",
-                ty: "crate::shared_analyzer::SharedAnalyzerProvider",
+                name: "shared",
+                ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
             },
             build_support::Field {
                 vis: Some("pub(crate)"),
-                name: "shared",
-                ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
+                name: "reload_workspace",
+                ty: "bool",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "rebuild_proc_macros",
+                ty: "bool",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "rebuild_queued",
+                ty: "bool",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "rebuilding_proc_macros",
+                ty: "Option<u64>",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "proc_macro_rebuild_id",
+                ty: "u64",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "rebuild_response_current",
+                ty: "Option<u64>",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "build_data_response_current",
+                ty: "bool",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "build_data_adoption",
+                ty: "bool",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "build_data_rebuild_id",
+                ty: "Option<u64>",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "build_data_reload",
+                ty: "bool",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "build_data_generation",
+                ty: "u64",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "build_data_operation",
+                ty: "Option<crate::shared_analyzer::SharedAnalyzerOperationToken>",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "proc_macro_operation",
+                ty: "Option<crate::shared_analyzer::SharedAnalyzerOperationToken>",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "reload_pending",
+                ty: "bool",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "proc_macro_clients_failed",
+                ty: "bool",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "workspace_reload_id",
+                ty: "u64",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "handled_workspace_reload",
+                ty: "Option<u64>",
+            },
+            build_support::Field {
+                vis: Some("pub(crate)"),
+                name: "workspace_adoption",
+                ty: "Option<Arc<Vec<ProjectWorkspace>>>",
             },
         ],
     )?;
@@ -397,10 +511,6 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         "new_with_shared",
         &[
             build_support::Param {
-                name: "provider",
-                ty: "crate::shared_analyzer::SharedAnalyzerProvider",
-            },
-            build_support::Param {
                 name: "shared",
                 ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
             },
@@ -416,12 +526,80 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         "GlobalState",
         &[
             build_support::FieldInit {
-                name: "provider",
+                name: "shared",
                 value: None,
             },
             build_support::FieldInit {
-                name: "shared",
-                value: None,
+                name: "reload_workspace",
+                value: Some("false"),
+            },
+            build_support::FieldInit {
+                name: "rebuild_proc_macros",
+                value: Some("false"),
+            },
+            build_support::FieldInit {
+                name: "rebuild_queued",
+                value: Some("false"),
+            },
+            build_support::FieldInit {
+                name: "rebuilding_proc_macros",
+                value: Some("None"),
+            },
+            build_support::FieldInit {
+                name: "proc_macro_rebuild_id",
+                value: Some("0"),
+            },
+            build_support::FieldInit {
+                name: "rebuild_response_current",
+                value: Some("None"),
+            },
+            build_support::FieldInit {
+                name: "build_data_response_current",
+                value: Some("false"),
+            },
+            build_support::FieldInit {
+                name: "build_data_adoption",
+                value: Some("false"),
+            },
+            build_support::FieldInit {
+                name: "build_data_rebuild_id",
+                value: Some("None"),
+            },
+            build_support::FieldInit {
+                name: "build_data_reload",
+                value: Some("false"),
+            },
+            build_support::FieldInit {
+                name: "build_data_generation",
+                value: Some("0"),
+            },
+            build_support::FieldInit {
+                name: "build_data_operation",
+                value: Some("None"),
+            },
+            build_support::FieldInit {
+                name: "proc_macro_operation",
+                value: Some("None"),
+            },
+            build_support::FieldInit {
+                name: "reload_pending",
+                value: Some("false"),
+            },
+            build_support::FieldInit {
+                name: "proc_macro_clients_failed",
+                value: Some("false"),
+            },
+            build_support::FieldInit {
+                name: "workspace_reload_id",
+                value: Some("0"),
+            },
+            build_support::FieldInit {
+                name: "handled_workspace_reload",
+                value: Some("None"),
+            },
+            build_support::FieldInit {
+                name: "workspace_adoption",
+                value: Some("None"),
             },
         ],
     )?;
@@ -432,7 +610,6 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         "workspaces",
         "Arc::new(workspaces)",
     )?;
-
     build_support::set_record_field(
         &mut source,
         "snapshot",
@@ -520,7 +697,7 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::rename::<ast::Fn>(&mut source, "main_loop", "_main_loop")?;
     build_support::add_attr::<ast::Fn>(&mut source, "_main_loop", "#[allow(dead_code)]")?;
     build_support::set_visibility::<ast::Fn>(&mut source, "_main_loop", "pub(crate)")?;
-    build_support::add_attr::<ast::Fn>(&mut source, "run", "#[allow(dead_code)]")?;
+    build_support::set_visibility::<ast::Fn>(&mut source, "run", "pub(crate)")?;
     build_support::set_visibility::<ast::Enum>(&mut source, "Event", "pub(crate)")?;
     build_support::append::<ast::Enum>(
         &mut source,
@@ -529,6 +706,36 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
             build_support::Variant {
                 name: "FetchedWorkspace",
                 tuple_fields: &["FetchWorkspaceResponse"],
+            },
+            build_support::Variant {
+                name: "FetchedProcMacros",
+                tuple_fields: &["crate::shared_analyzer::SharedProcMacroProgress"],
+            },
+            build_support::Variant {
+                name: "SharedReloadReady",
+                tuple_fields: &["crate::shared_analyzer::SharedAnalyzerOperationToken"],
+            },
+            build_support::Variant {
+                name: "SharedRebuildReady",
+                tuple_fields: &["crate::shared_analyzer::SharedAnalyzerOperationToken"],
+            },
+            build_support::Variant {
+                name: "SharedBuildDataReady",
+                tuple_fields: &[
+                    "String",
+                    "crate::shared_analyzer::SharedAnalyzerOperationToken",
+                ],
+            },
+            build_support::Variant {
+                name: "SharedProcMacrosReady",
+                tuple_fields: &[
+                    "String",
+                    "crate::shared_analyzer::SharedAnalyzerOperationToken",
+                ],
+            },
+            build_support::Variant {
+                name: "WorkspaceUpdated",
+                tuple_fields: &["crate::shared_analyzer::SharedAnalyzerRuntime"],
             },
             build_support::Variant {
                 name: "RetryDeferred",
@@ -859,11 +1066,37 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
         &mut source,
         "_handle_task",
         "FetchWorkspaceResponse",
-        &[build_support::FieldInit {
-            name: "shared",
-            value: Some("self.shared.clone()"),
-        }],
+        &[
+            build_support::FieldInit {
+                name: "shared",
+                value: Some("self.shared.clone()"),
+            },
+            build_support::FieldInit {
+                name: "reload_id",
+                value: Some("None"),
+            },
+            build_support::FieldInit {
+                name: "adopted",
+                value: Some("false"),
+            },
+        ],
     )?;
+    build_support::append_record_fields(
+        &mut source,
+        "_handle_task",
+        "FetchBuildDataResponse",
+        &[
+            build_support::FieldInit {
+                name: "rebuild_id",
+                value: Some("self.build_data_rebuild_id"),
+            },
+            build_support::FieldInit {
+                name: "reload",
+                value: Some("self.build_data_reload"),
+            },
+        ],
+    )?;
+
     build_support::rename_path_root(&mut source, "_handle_task", "Task", "UpstreamTask")?;
     build_support::add_use(&mut source, None, "self::session::UpstreamTask")?;
 
@@ -871,6 +1104,40 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::mount_module(&mut source, Some("pub(crate)"), "session", &session)?;
 
     fs::write(main_loop_rs, source)?;
+    Ok(())
+}
+
+fn patch_session_source(session_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(session_rs)?;
+    build_support::append::<ast::Enum>(
+        &mut source,
+        "IoThreads",
+        &[build_support::Variant {
+            name: "External",
+            tuple_fields: &[],
+        }],
+    )?;
+    build_support::append_match_arms(
+        &mut source,
+        build_support::Scope::MatchArm {
+            function: "join",
+            type_name: "IoThreads",
+            variant_name: "Stdio",
+        },
+        &[build_support::MatchArm {
+            pattern: "IoThreads::External",
+            expression: "Ok(())",
+        }],
+    )?;
+
+    fs::write(session_rs, source)?;
+    Ok(())
+}
+
+fn patch_op_queue_source(op_queue_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(op_queue_rs)?;
+    build_support::set_visibility::<ast::RecordField>(&mut source, "last_op_result", "pub(crate)")?;
+    fs::write(op_queue_rs, source)?;
     Ok(())
 }
 
@@ -886,17 +1153,57 @@ fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
     ] {
         let replacement = format!("_{name}");
         build_support::rename::<ast::Fn>(&mut source, name, &replacement)?;
+    }
+    for name in [
+        "fetch_workspaces",
+        "fetch_proc_macros",
+        "recreate_crate_graph",
+    ] {
+        let replacement = format!("_{name}");
         build_support::add_attr::<ast::Fn>(&mut source, &replacement, "#[allow(dead_code)]")?;
     }
 
     build_support::set_visibility::<ast::Fn>(&mut source, "reload_flycheck", "pub(crate)")?;
 
     build_support::add_rest_pattern(&mut source, "switch_workspaces", "FetchWorkspaceResponse")?;
+    build_support::add_rest_pattern(&mut source, "switch_workspaces", "FetchBuildDataResponse")?;
     build_support::redirect_call(
         &mut source,
         build_support::Scope::Function("switch_workspaces"),
         "recreate_crate_graph",
         "recreate_crate_graph_from_shared",
+    )?;
+    build_support::rename::<ast::Fn>(&mut source, "switch_workspaces", "_switch_workspaces")?;
+    build_support::extract(
+        &mut source,
+        "_switch_workspaces",
+        |function| {
+            let branch = build_support::one(
+                build_support::ifs_calling(function, "expand_proc_macros"),
+                "proc-macro client branch",
+            )?;
+            build_support::stmt(&branch)
+        },
+        build_support::Method {
+            name: "set_proc_macro_clients",
+            receiver: Some("&mut self"),
+            params: &[build_support::Param {
+                name: "same_workspaces",
+                ty: "bool",
+            }],
+            args: &["same_workspaces"],
+            return_ty: None,
+        },
+    )?;
+    build_support::rename::<ast::Fn>(
+        &mut source,
+        "set_proc_macro_clients",
+        "_set_proc_macro_clients",
+    )?;
+    build_support::add_attr::<ast::Fn>(
+        &mut source,
+        "_set_proc_macro_clients",
+        "#[allow(dead_code)]",
     )?;
 
     fs::write(reload_rs, source)?;
@@ -936,11 +1243,28 @@ fn patch_dispatch_source(dispatch_rs: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn patch_request_source(request_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(request_rs)?;
+
+    for name in ["handle_workspace_reload", "handle_proc_macros_rebuild"] {
+        let replacement = format!("_{name}");
+        build_support::rename::<ast::Fn>(&mut source, name, &replacement)?;
+        build_support::add_attr::<ast::Fn>(&mut source, &replacement, "#[allow(dead_code)]")?;
+        build_support::add_use(
+            &mut source,
+            Some("pub(crate)"),
+            &format!("crate::shared_reload::{name}"),
+        )?;
+    }
+
+    fs::write(request_rs, source)?;
+    Ok(())
+}
+
 fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(flycheck_to_proto_rs)?;
 
     build_support::rename::<ast::Fn>(&mut source, "location", "_location")?;
-    build_support::add_attr::<ast::Fn>(&mut source, "_location", "#[allow(dead_code)]")?;
     build_support::add_use(&mut source, None, "self::flycheck_location::location")?;
     let flycheck_location = owned_source_path("diagnostics/flycheck_location.rs");
     build_support::mount_module(&mut source, None, "flycheck_location", &flycheck_location)?;
@@ -1080,6 +1404,17 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
     )?;
 
     fs::write(notification_rs, source)?;
+    Ok(())
+}
+
+fn patch_task_pool_source(task_pool_rs: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(task_pool_rs)?;
+    build_support::set_visibility::<ast::RecordField>(
+        &mut source,
+        "TaskPool::sender",
+        "pub(crate)",
+    )?;
+    fs::write(task_pool_rs, source)?;
     Ok(())
 }
 

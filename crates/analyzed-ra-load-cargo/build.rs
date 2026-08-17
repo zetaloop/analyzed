@@ -27,7 +27,16 @@ fn patch_load_cargo_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
 
     let workspace_load = owned_source_path("workspace_load.rs");
     build_support::mount_module(&mut source, None, "workspace_load", &workspace_load)?;
-    for name in ["ProcMacroLoad", "WorkspaceLoad", "load_workspace_change"] {
+    for name in [
+        "ProcMacroLoad",
+        "ProcMacroLoadState",
+        "WorkspaceLoad",
+        "collect_proc_macros",
+        "load_workspace_change",
+        "source_root_for_path",
+        "source_roots_for_files",
+        "workspace_source_root_config",
+    ] {
         build_support::add_use(&mut source, Some("pub"), &format!("workspace_load::{name}"))?;
     }
     build_support::add_use(

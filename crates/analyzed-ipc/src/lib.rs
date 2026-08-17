@@ -262,7 +262,15 @@ pub struct BackendKey {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SharedWorldKey {
     pub cargo: CargoConfigKey,
+    pub database: DatabaseConfigKey,
     pub load: SharedWorldLoadKey,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DatabaseConfigKey {
+    pub lru_parse_query_capacity: Option<u16>,
+    pub lru_query_capacities: Vec<(Box<str>, u16)>,
+    pub expand_proc_attr_macros: bool,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -290,6 +298,7 @@ pub struct CargoConfigKey {
 pub struct SharedWorldLoadKey {
     pub load_out_dirs_from_check: bool,
     pub proc_macro_server: ProcMacroServerKey,
+    pub ignored_proc_macros: Vec<(Box<str>, Vec<Box<str>>)>,
     pub proc_macro_processes: u16,
 }
 
