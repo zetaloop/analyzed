@@ -12,10 +12,10 @@ use std::{
 };
 
 use analyzed_ipc::{
-    AnalysisConfigKey, BackendKey, BackendSnapshot, CargoConfigKey, DaemonRequest, DaemonResponse,
-    DaemonSnapshot, Hello, IpcStream, LspSession, ProcMacroServerKey, RuntimePaths,
-    SharedWorldConfigKey, SharedWorldKey, SharedWorldLoadKey, StartupLock, Stop, WorkspaceSnapshot,
-    WorkspaceViewKey, accept_client, bind_listener, read_json_line, write_json_line,
+    BackendKey, BackendSnapshot, CargoConfigKey, DaemonRequest, DaemonResponse, DaemonSnapshot,
+    Hello, IpcStream, LspSession, ProcMacroServerKey, RuntimePaths, SharedWorldKey,
+    SharedWorldLoadKey, StartupLock, Stop, WorkspaceSnapshot, WorkspaceViewKey, accept_client,
+    bind_listener, read_json_line, write_json_line,
 };
 use crossbeam_channel::unbounded;
 use lsp_server::{Connection, Message};
@@ -279,19 +279,17 @@ impl ServiceState {
             .into_iter()
             .map(backend_snapshot_from_shared)
             .collect::<Vec<_>>();
-        let workspace_loads = registry
-            .workspace_loads()
-            .into_iter()
-            .map(workspace_snapshot_from_shared)
-            .collect::<Vec<_>>();
+        let workspaces = backend_sessions
+            .iter()
+            .map(|backend| backend.workspace_loads.len())
+            .sum();
 
         DaemonSnapshot {
             pid: self.pid,
             started_at_unix_seconds: self.started_at_unix_seconds,
             client_sessions: self.client_sessions.load(Ordering::SeqCst),
             backend_sessions,
-            workspaces: workspace_loads.len(),
-            workspace_loads,
+            workspaces,
         }
     }
 }
@@ -459,21 +457,12 @@ fn workspace_snapshot_from_shared(
 fn backend_key_from_shared(key: ra_ap_rust_analyzer::SharedAnalyzerBackendKey) -> BackendKey {
     BackendKey {
         shared_world: SharedWorldKey {
-            rust_analyzer_version: key.shared_world.rust_analyzer_version,
-            toolchain: key.shared_world.toolchain,
-            sysroot: key.shared_world.sysroot,
-            cargo_target: key.shared_world.cargo_target,
-            config: SharedWorldConfigKey {
-                cargo: cargo_config_key_from_shared(key.shared_world.config.cargo),
-            },
+            cargo: cargo_config_key_from_shared(key.shared_world.cargo),
             load: load_key_from_shared(key.shared_world.load),
         },
         workspace_view: WorkspaceViewKey {
-            workspace_roots: key.workspace_view.workspace_roots,
-            analysis: AnalysisConfigKey {
-                initialization_options: key.workspace_view.analysis.initialization_options,
-                workspace_configuration: key.workspace_view.analysis.workspace_configuration,
-            },
+            projects: key.workspace_view.projects,
+            excluded_paths: key.workspace_view.excluded_paths,
         },
     }
 }
@@ -514,8 +503,6 @@ fn load_key_from_shared(key: ra_ap_rust_analyzer::SharedAnalyzerLoadKey) -> Shar
                 ProcMacroServerKey::Explicit(path)
             }
         },
-        prefill_caches: key.prefill_caches,
-        num_worker_threads: key.num_worker_threads,
         proc_macro_processes: key.proc_macro_processes,
     }
 }

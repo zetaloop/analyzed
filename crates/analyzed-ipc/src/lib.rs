@@ -261,17 +261,8 @@ pub struct BackendKey {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SharedWorldKey {
-    pub rust_analyzer_version: String,
-    pub toolchain: Option<String>,
-    pub sysroot: Option<String>,
-    pub cargo_target: Option<String>,
-    pub config: SharedWorldConfigKey,
-    pub load: SharedWorldLoadKey,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct SharedWorldConfigKey {
     pub cargo: CargoConfigKey,
+    pub load: SharedWorldLoadKey,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -299,8 +290,6 @@ pub struct CargoConfigKey {
 pub struct SharedWorldLoadKey {
     pub load_out_dirs_from_check: bool,
     pub proc_macro_server: ProcMacroServerKey,
-    pub prefill_caches: bool,
-    pub num_worker_threads: u16,
     pub proc_macro_processes: u16,
 }
 
@@ -313,14 +302,8 @@ pub enum ProcMacroServerKey {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct WorkspaceViewKey {
-    pub workspace_roots: Vec<String>,
-    pub analysis: AnalysisConfigKey,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct AnalysisConfigKey {
-    pub initialization_options: Option<String>,
-    pub workspace_configuration: Option<String>,
+    pub projects: Vec<String>,
+    pub excluded_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -348,7 +331,6 @@ pub struct DaemonSnapshot {
     pub client_sessions: usize,
     pub backend_sessions: Vec<BackendSnapshot>,
     pub workspaces: usize,
-    pub workspace_loads: Vec<WorkspaceSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

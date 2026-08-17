@@ -153,7 +153,7 @@ pub fn shared_analyzer_registry() -> Arc<SharedAnalyzerRegistry> {
     Arc::clone(REGISTRY.get_or_init(|| Arc::new(SharedAnalyzerRegistry::new())))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct SharedAnalyzerBackendSnapshot {
     pub key: SharedAnalyzerBackendKey,
     pub client_sessions: usize,
@@ -637,13 +637,6 @@ impl SharedAnalyzerRegistry {
             .collect()
     }
 
-    pub fn workspace_loads(&self) -> Vec<WorkspaceSummary> {
-        self.backend_snapshots()
-            .into_iter()
-            .flat_map(|snapshot| snapshot.workspace_loads)
-            .collect()
-    }
-
     pub(crate) fn request_gc(&self) {
         self.gc.request();
     }
@@ -812,28 +805,19 @@ impl SharedAnalyzerGcCoordinator {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SharedAnalyzerBackendKey {
     pub shared_world: SharedAnalyzerWorldKey,
     pub workspace_view: SharedAnalyzerViewKey,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SharedAnalyzerWorldKey {
-    pub rust_analyzer_version: String,
-    pub toolchain: Option<String>,
-    pub sysroot: Option<String>,
-    pub cargo_target: Option<String>,
-    pub config: SharedAnalyzerWorldConfigKey,
+    pub cargo: SharedAnalyzerCargoConfigKey,
     pub load: SharedAnalyzerLoadKey,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct SharedAnalyzerWorldConfigKey {
-    pub cargo: SharedAnalyzerCargoConfigKey,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SharedAnalyzerCargoConfigKey {
     pub all_targets: bool,
     pub features: String,
@@ -854,28 +838,24 @@ pub struct SharedAnalyzerCargoConfigKey {
     pub metadata_extra_args: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SharedAnalyzerLoadKey {
     pub load_out_dirs_from_check: bool,
     pub proc_macro_server: SharedAnalyzerProcMacroServerKey,
-    pub prefill_caches: bool,
-    pub num_worker_threads: u16,
     pub proc_macro_processes: u16,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SharedAnalyzerProcMacroServerKey {
     None,
     Sysroot,
     Explicit(String),
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SharedAnalyzerViewKey {
-    pub workspace_roots: Vec<String>,
     pub projects: Vec<String>,
     pub excluded_paths: Vec<String>,
-    pub analysis: SharedAnalyzerAnalysisKey,
 }
 
 #[derive(Clone)]
@@ -884,22 +864,9 @@ enum SharedAnalyzerWorkspaceLoadSource {
     DetachedFile(ManifestPath),
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct SharedAnalyzerAnalysisKey {
-    pub initialization_options: Option<String>,
-    pub workspace_configuration: Option<String>,
-}
-
 pub(crate) fn shared_analyzer_context_from_config(
     config: &crate::config::Config,
 ) -> anyhow::Result<(SharedAnalyzerBackendKey, Arc<SharedAnalyzerConfig>)> {
-    let mut workspace_roots = config
-        .workspace_roots()
-        .iter()
-        .map(|root| path_key(&VfsPath::from(root.clone())))
-        .collect::<Vec<_>>();
-    workspace_roots.sort();
-    workspace_roots.dedup();
     let mut excluded_paths = config
         .excluded()
         .map(|path| path_key(&VfsPath::from(path)))
@@ -920,36 +887,20 @@ pub(crate) fn shared_analyzer_context_from_config(
     project_keys.dedup();
     let cargo_config = config.cargo(None);
     let load = shared_load_config_from_config(config)?;
-    let analysis = SharedAnalyzerAnalysisKey {
-        initialization_options: None,
-        workspace_configuration: None,
-    };
     let backend_key = SharedAnalyzerBackendKey {
         shared_world: SharedAnalyzerWorldKey {
-            rust_analyzer_version: RUST_ANALYZER_COMMIT_HASH.to_owned(),
-            toolchain: env::var("RUSTUP_TOOLCHAIN").ok(),
-            sysroot: env::var("RUST_SRC_PATH").ok(),
-            cargo_target: cargo_config
-                .target
-                .clone()
-                .or_else(|| env::var("CARGO_BUILD_TARGET").ok()),
-            config: SharedAnalyzerWorldConfigKey {
-                cargo: cargo_config_key(&cargo_config),
-            },
+            cargo: cargo_config_key(&cargo_config),
             load: load.key.clone(),
         },
         workspace_view: SharedAnalyzerViewKey {
-            workspace_roots: workspace_roots.clone(),
             projects: project_keys,
             excluded_paths: excluded_paths.clone(),
-            analysis,
         },
     };
 
     Ok((
         backend_key,
         Arc::new(SharedAnalyzerConfig {
-            workspace_roots,
             excluded_paths,
             projects,
             detached_files,
@@ -960,7 +911,6 @@ pub(crate) fn shared_analyzer_context_from_config(
 }
 
 pub struct SharedAnalyzerConfig {
-    workspace_roots: Vec<String>,
     excluded_paths: Vec<String>,
     projects: Vec<crate::config::LinkedProject>,
     detached_files: Vec<ManifestPath>,
@@ -969,10 +919,6 @@ pub struct SharedAnalyzerConfig {
 }
 
 impl SharedAnalyzerConfig {
-    pub fn workspace_roots(&self) -> &[String] {
-        &self.workspace_roots
-    }
-
     pub fn excluded_paths(&self) -> &[String] {
         &self.excluded_paths
     }
@@ -1000,6 +946,8 @@ fn shared_detached_file_key(file: &ManifestPath) -> String {
 #[derive(Clone)]
 pub(crate) struct SharedLoadConfig {
     key: SharedAnalyzerLoadKey,
+    prefill_caches: bool,
+    num_worker_threads: usize,
 }
 
 impl SharedLoadConfig {
@@ -1013,8 +961,8 @@ impl SharedLoadConfig {
                     ProcMacroServerChoice::Explicit(AbsPathBuf::assert_utf8(PathBuf::from(path)))
                 }
             },
-            prefill_caches: self.key.prefill_caches,
-            num_worker_threads: self.key.num_worker_threads as usize,
+            prefill_caches: self.prefill_caches,
+            num_worker_threads: self.num_worker_threads,
             proc_macro_processes: self.key.proc_macro_processes as usize,
         }
     }
@@ -1034,10 +982,10 @@ fn shared_load_config_from_config(
             } else {
                 SharedAnalyzerProcMacroServerKey::None
             },
-            prefill_caches: config.prefill_caches(),
-            num_worker_threads: u16::try_from(config.prime_caches_num_threads())?,
             proc_macro_processes: u16::try_from(config.proc_macro_num_processes())?,
         },
+        prefill_caches: config.prefill_caches(),
+        num_worker_threads: config.prime_caches_num_threads(),
     })
 }
 
@@ -1100,7 +1048,7 @@ pub(crate) fn patch_path_prefix(path: PathBuf) -> PathBuf {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct WorkspaceSummary {
     pub root: String,
     pub manifest: String,

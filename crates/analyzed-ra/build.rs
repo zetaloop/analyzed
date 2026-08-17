@@ -265,7 +265,7 @@ pub use shared_analyzer::{{
     SharedAnalyzerCargoConfigKey, SharedAnalyzerConfig,
     SharedAnalyzerBackendSnapshot, SharedAnalyzerLoadKey,
     SharedAnalyzerProcMacroServerKey, SharedAnalyzerProvider, SharedAnalyzerRegistry,
-    SharedAnalyzerSession, SharedAnalyzerWorldConfigKey, SharedAnalyzerWorldKey,
+    SharedAnalyzerSession, SharedAnalyzerWorldKey,
     SharedAnalyzerViewKey, WorkspaceSummary,
     run_shared_rust_analyzer_lsp_session, run_shared_rust_analyzer_lsp_session_with_config,
     rust_analyzer_lsp_boundary,
