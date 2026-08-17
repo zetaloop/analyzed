@@ -29,13 +29,12 @@
 	use serde::Serialize;
 	use vfs::{AbsPathBuf, Vfs, VfsPath};
 
-pub const RUST_ANALYZER_CRATE_VERSION: &str = env!("ANALYZED_RA_CRATE_VERSION");
-pub const RUST_ANALYZER_RELEASE_VERSION: &str = env!("ANALYZED_RA_RELEASE_VERSION");
-pub const RUST_ANALYZER_COMMIT_HASH: &str = env!("ANALYZED_RA_COMMIT_HASH");
 pub static RUST_ANALYZER_VERSION: LazyLock<String> = LazyLock::new(|| {
+    let commit = env!("ANALYZED_RA_COMMIT_HASH");
     format!(
-        "{RUST_ANALYZER_RELEASE_VERSION} {}",
-        &RUST_ANALYZER_COMMIT_HASH[..8]
+        "{} {}",
+        env!("ANALYZED_RA_RELEASE_VERSION"),
+        &commit[..8]
     )
 });
 

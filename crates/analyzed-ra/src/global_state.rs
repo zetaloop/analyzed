@@ -112,10 +112,6 @@ impl GlobalState {
 }
 
 impl GlobalStateSnapshot {
-    pub(crate) fn flycheck_handles(&self) -> triomphe::Arc<[crate::flycheck::FlycheckHandle]> {
-        self.flycheck.clone()
-    }
-
     pub(crate) fn replay(&self) -> SnapshotReplay {
         let token = self.shared.snapshot_token(&self.analysis);
         let config = self.config.clone();

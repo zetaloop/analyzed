@@ -6,17 +6,7 @@ use rustc_hash::FxHashSet;
 use crate::{Analysis, AnalysisHost};
 
 pub(crate) struct AnalysisGuard {
-    _guard: Box<dyn Guard>,
-}
-
-trait Guard: Any + Send + Sync + RefUnwindSafe {
-    fn as_any(&self) -> &dyn Any;
-}
-
-impl<T: Any + Send + Sync + RefUnwindSafe> Guard for T {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+    _guard: Box<dyn Any + Send + Sync + RefUnwindSafe>,
 }
 
 impl fmt::Debug for AnalysisGuard {
@@ -37,7 +27,8 @@ impl Analysis {
     }
 
     pub fn guard<T: Any>(&self) -> Option<&T> {
-        self.guard.as_ref()?._guard.as_ref().as_any().downcast_ref()
+        let guard: &dyn Any = self.guard.as_ref()?._guard.as_ref();
+        guard.downcast_ref()
     }
 }
 

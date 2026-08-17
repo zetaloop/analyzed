@@ -73,10 +73,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let slow_tests = generated.join("tests/slow-tests");
     patch_slow_tests(&slow_tests)?;
     write_slow_tests_wrapper(&slow_tests)?;
-    println!(
-        "cargo:rustc-env=ANALYZED_RA_CRATE_VERSION={}",
-        package.version
-    );
     println!("cargo:rustc-env=ANALYZED_RA_RELEASE_VERSION={}", release);
     println!("cargo:rustc-env=ANALYZED_RA_COMMIT_HASH={revision}");
     println!("cargo:rerun-if-env-changed=GITHUB_TOKEN");
@@ -232,7 +228,6 @@ fn github_get(agent: &ureq::Agent, path: &str) -> Result<serde_json::Value, Box<
 fn write_root_module(root_rs: &Path, lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     let shared_analyzer = owned_source_path("shared_analyzer.rs");
     let shared_global_state = owned_source_path("global_state.rs");
-    let shared_main_loop = owned_source_path("main_loop.rs");
     let shared_reload = owned_source_path("reload.rs");
     let shared_notification = owned_source_path("handlers/notification.rs");
     let upstream_root = fs::read_to_string(lib_rs)?;
@@ -243,9 +238,6 @@ pub mod shared_analyzer;
 
 #[path = {:?}]
 pub(crate) mod shared_global_state;
-
-#[path = {:?}]
-pub(crate) mod shared_main_loop;
 
 #[path = {:?}]
 pub(crate) mod shared_reload;
@@ -259,7 +251,6 @@ pub(crate) mod shared_notification;
 pub mod driver;
 
 pub use shared_analyzer::{{
-    RUST_ANALYZER_COMMIT_HASH, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_RELEASE_VERSION,
     RUST_ANALYZER_VERSION,
     RustAnalyzerLspBoundary, RustAnalyzerPrivateBoundary, SharedAnalyzerBackendKey,
     SharedAnalyzerCargoConfigKey, SharedAnalyzerConfig,
@@ -274,7 +265,6 @@ pub use shared_analyzer::{{
 "#,
         shared_analyzer.to_string_lossy().into_owned(),
         shared_global_state.to_string_lossy().into_owned(),
-        shared_main_loop.to_string_lossy().into_owned(),
         shared_reload.to_string_lossy().into_owned(),
         shared_notification.to_string_lossy().into_owned(),
         lib_rs
@@ -285,7 +275,6 @@ pub use shared_analyzer::{{
     fs::write(root_rs, source)?;
     println!("cargo:rerun-if-changed={}", shared_analyzer.display());
     println!("cargo:rerun-if-changed={}", shared_global_state.display());
-    println!("cargo:rerun-if-changed={}", shared_main_loop.display());
     println!("cargo:rerun-if-changed={}", shared_reload.display());
     println!("cargo:rerun-if-changed={}", shared_notification.display());
 
@@ -521,10 +510,11 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
 
 fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(main_loop_rs)?;
-    build_support::add_use(
+    build_support::add_use_alias(
         &mut source,
         Some("pub"),
-        "crate::shared_main_loop::main_loop",
+        "crate::shared_analyzer::run_shared_rust_analyzer_lsp_session_with_config",
+        "main_loop",
     )?;
 
     build_support::rename::<ast::Fn>(&mut source, "main_loop", "_main_loop")?;

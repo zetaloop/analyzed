@@ -3,7 +3,6 @@ use super::*;
 pub type ProcMacroLoad = (CrateBuilderId, ProcMacroLoadResult);
 
 pub struct WorkspaceLoad {
-    pub change: ChangeWithProcMacros,
     pub crate_graph: CrateGraphBuilder,
     pub proc_macros: Vec<ProcMacroLoad>,
     pub source_roots: Vec<SourceRoot>,
@@ -54,7 +53,7 @@ pub fn load_workspace_change(
         version: 0,
     });
 
-    let (change, file_texts, source_roots) = crate_graph_change(
+    let (_, file_texts, source_roots) = crate_graph_change(
         crate_graph.clone(),
         proc_macros.iter().cloned().collect(),
         project_folders.source_root_config,
@@ -65,7 +64,6 @@ pub fn load_workspace_change(
     );
 
     Ok(WorkspaceLoad {
-        change,
         crate_graph,
         proc_macros,
         source_roots,

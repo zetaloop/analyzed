@@ -216,7 +216,7 @@ where
 
 impl FlycheckSelectionWorld {
     fn new(snapshot: GlobalStateSnapshot) -> (Self, FlycheckSelection) {
-        let flycheck = snapshot.flycheck_handles();
+        let flycheck = snapshot.flycheck.clone();
         let restarts = Rc::new(RefCell::new(Vec::new()));
         let handles = flycheck
             .iter()
