@@ -1,7 +1,7 @@
 	use std::{
 	    collections::{BTreeMap, BTreeSet, btree_map::Entry},
 	    env,
-	    path::{Path, PathBuf},
+	    path::PathBuf,
 	    sync::{
 	        Arc, Condvar, LazyLock, Mutex, OnceLock, Weak,
 	        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -1117,16 +1117,6 @@ pub struct SharedAnalyzerSession {
 }
 
 impl SharedAnalyzerSession {
-    pub fn new(world: Arc<Mutex<SharedWorld>>, view: WorkspaceView) -> Self {
-        let runtime = SharedAnalyzerRuntime::new(Arc::clone(&world), &view);
-
-        Self {
-            world,
-            view,
-            runtime,
-        }
-    }
-
     fn new_registered(
         world: Arc<Mutex<SharedWorld>>,
         view: WorkspaceView,
@@ -1165,14 +1155,13 @@ impl SharedAnalyzerSession {
 
 #[derive(Clone)]
 pub struct SharedAnalyzerRuntime {
-    world: Arc<Mutex<SharedWorld>>,
     session: Arc<SharedAnalyzerRuntimeSession>,
 }
 
 struct SharedAnalyzerRuntimeSession {
     world: Arc<Mutex<SharedWorld>>,
     access: Arc<SharedWorldAccess>,
-    gc: Option<Arc<SharedAnalyzerGcCoordinator>>,
+    gc: Arc<SharedAnalyzerGcCoordinator>,
     id: u64,
     active: AtomicBool,
     busy: AtomicBool,
@@ -1184,7 +1173,7 @@ struct SharedAnalyzerRuntimeSession {
     line_endings: Mutex<SharedLineEndings>,
     file_mappings: Mutex<SharedFileMappings>,
     analysis_cache: Mutex<SharedAnalysisCache>,
-    registry_lease: Option<SharedAnalyzerRegistryLease>,
+    registry_lease: SharedAnalyzerRegistryLease,
 }
 
 #[derive(Clone)]
@@ -1197,7 +1186,7 @@ pub(crate) struct SharedAnalyzerSnapshotToken {
 
 struct SharedAnalyzerAnalysisGuard {
     _world: SharedAnalyzerReadPermit,
-    _gc: Option<SharedAnalyzerReadPermit>,
+    _gc: SharedAnalyzerReadPermit,
     snapshot: SharedAnalyzerSnapshotToken,
 }
 
@@ -1265,20 +1254,16 @@ impl Drop for SharedAnalyzerRuntimeSession {
             let _write = self.access.write(Some(self.id));
             if let Ok(mut world) = self.world.lock()
                 && world.unregister_session(self.id)
-                    && let Some(gc) = &self.gc
-                {
-                    gc.changed();
-                }
+            {
+                self.gc.changed();
+            }
         }
-        if let Some(lease) = &self.registry_lease
-            && let Some(registry) = lease.registry.upgrade()
-        {
-            registry.unregister(&lease.key);
+        if let Some(registry) = self.registry_lease.registry.upgrade() {
+            registry.unregister(&self.registry_lease.key);
         }
         self.access.unregister_session(self.id);
-        if let Some(gc) = &self.gc {
-            gc.unregister_session(self.busy.load(Ordering::SeqCst));
-        }
+        self.gc
+            .unregister_session(self.busy.load(Ordering::SeqCst));
     }
 }
 
@@ -1291,16 +1276,6 @@ impl std::fmt::Debug for SharedAnalyzerRuntime {
 }
 
 impl SharedAnalyzerRuntime {
-    fn new(world: Arc<Mutex<SharedWorld>>, view: &WorkspaceView) -> Self {
-        Self::new_with_registry(
-            world,
-            view.workspace_indexes().collect(),
-            view.excluded_paths().to_vec(),
-            None,
-            None,
-        )
-    }
-
     fn new_registered(
         world: Arc<Mutex<SharedWorld>>,
         view: &WorkspaceView,
@@ -1308,25 +1283,9 @@ impl SharedAnalyzerRuntime {
         gc: Arc<SharedAnalyzerGcCoordinator>,
         key: SharedAnalyzerBackendKey,
     ) -> Self {
-        Self::new_with_registry(
-            world,
-            view.workspace_indexes().collect(),
-            view.excluded_paths().to_vec(),
-            Some(SharedAnalyzerRegistryLease { registry, key }),
-            Some(gc),
-        )
-    }
-
-    fn new_with_registry(
-        world: Arc<Mutex<SharedWorld>>,
-        workspace_indexes: Vec<usize>,
-        excluded_paths: Vec<String>,
-        registry_lease: Option<SharedAnalyzerRegistryLease>,
-        gc: Option<Arc<SharedAnalyzerGcCoordinator>>,
-    ) -> Self {
-        if let Some(gc) = &gc {
-            gc.register_session();
-        }
+        gc.register_session();
+        let workspace_indexes = view.workspace_indexes().collect();
+        let excluded_paths = view.excluded_paths().to_vec();
         let (id, input_generation, access) = world
             .lock()
             .expect("shared world mutex poisoned")
@@ -1337,7 +1296,7 @@ impl SharedAnalyzerRuntime {
             gc,
             id,
             active: AtomicBool::new(true),
-            busy: AtomicBool::new(registry_lease.is_some()),
+            busy: AtomicBool::new(true),
             input_generation,
             overlay_generation: AtomicU64::new(0),
             config_generation_seen: AtomicU64::new(u64::MAX),
@@ -1346,10 +1305,10 @@ impl SharedAnalyzerRuntime {
             line_endings: Mutex::new(SharedLineEndings::default()),
             file_mappings: Mutex::new(SharedFileMappings::default()),
             analysis_cache: Mutex::new(SharedAnalysisCache::default()),
-            registry_lease,
+            registry_lease: SharedAnalyzerRegistryLease { registry, key },
         });
 
-        let runtime = Self { world, session };
+        let runtime = Self { session };
         runtime.refresh_session_cache_from_world();
         runtime
     }
@@ -1364,11 +1323,8 @@ impl SharedAnalyzerRuntime {
     }
 
     pub(crate) fn set_busy(&self, busy: bool) {
-        let Some(gc) = &self.session.gc else {
-            return;
-        };
         if self.session.busy.swap(busy, Ordering::SeqCst) != busy {
-            gc.set_session_busy(busy);
+            self.session.gc.set_session_busy(busy);
         }
     }
 
@@ -1386,6 +1342,7 @@ impl SharedAnalyzerRuntime {
 
     fn refresh_session_cache_from_world(&self) {
         let world = self
+            .session
             .world
             .lock()
             .expect("shared world mutex poisoned");
@@ -1422,7 +1379,11 @@ impl SharedAnalyzerRuntime {
             overlay_generation: self.session.overlay_generation.load(Ordering::SeqCst),
             foreign_epoch,
         };
-        let world = self.world.lock().expect("shared world mutex poisoned");
+        let world = self
+            .session
+            .world
+            .lock()
+            .expect("shared world mutex poisoned");
         let generation = snapshot.base_generation;
         let mut cache = self
             .session
@@ -1444,11 +1405,7 @@ impl SharedAnalyzerRuntime {
     }
 
     pub(crate) fn analysis(&self) -> Analysis {
-        let gc = self
-            .session
-            .gc
-            .as_ref()
-            .map(SharedAnalyzerGcCoordinator::read);
+        let gc = self.session.gc.read();
         let read = self.session.access.read(self.session_id());
         let (analysis, snapshot) = self.analysis_snapshot(read.foreign_epoch());
         analysis.with_guard(SharedAnalyzerAnalysisGuard {
@@ -1540,6 +1497,7 @@ impl SharedAnalyzerRuntime {
         &self,
     ) -> Vec<(VfsPath, SourceRootId, bool, String)> {
         let world = self
+            .session
             .world
             .lock()
             .expect("shared world mutex poisoned");
@@ -1577,14 +1535,16 @@ impl SharedAnalyzerRuntime {
     }
 
     pub(crate) fn source_root_parent_map(&self) -> FxHashMap<SourceRootId, SourceRootId> {
-        self.world
+        self.session
+            .world
             .lock()
             .expect("shared world mutex poisoned")
             .source_root_parent_map(self.workspace_indexes())
     }
 
     pub(crate) fn source_root_for_path(&self, path: &VfsPath) -> Option<(SourceRootId, bool)> {
-        self.world
+        self.session
+            .world
             .lock()
             .expect("shared world mutex poisoned")
             .source_root_for_path(self.workspace_indexes(), path)
@@ -1600,14 +1560,14 @@ impl SharedAnalyzerRuntime {
 
         let _write = self.session.access.write(Some(self.session_id()));
         let mut world = self
+            .session
             .world
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
         let changed = world.apply_base_file_changes(self.workspace_indexes(), files);
-        if changed
-            && let Some(gc) = &self.session.gc {
-                gc.changed();
-            }
+        if changed {
+            self.session.gc.changed();
+        }
         self.refresh_session_cache(&world);
         Ok(())
     }
@@ -1619,6 +1579,7 @@ impl SharedAnalyzerRuntime {
         let _read = self.session.access.read(self.session_id());
         {
             let world = self
+                .session
                 .world
                 .lock()
                 .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
@@ -1628,13 +1589,15 @@ impl SharedAnalyzerRuntime {
             }
         }
         let _write = self.session.access.write_overlay(self.session_id(), || {
-            self.world
+            self.session
+                .world
                 .lock()
                 .expect("shared world mutex poisoned")
                 .host
                 .trigger_cancellation();
         });
         let mut world = self
+            .session
             .world
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
@@ -1644,9 +1607,7 @@ impl SharedAnalyzerRuntime {
             self.session
                 .overlay_generation
                 .fetch_add(1, Ordering::SeqCst);
-            if let Some(gc) = &self.session.gc {
-                gc.changed();
-            }
+            self.session.gc.changed();
             self.session
                 .analysis_cache
                 .lock()
@@ -1662,6 +1623,7 @@ impl SharedAnalyzerRuntime {
         files: &[(VfsPath, String, crate::line_index::LineEndings)],
     ) -> anyhow::Result<bool> {
         let world = self
+            .session
             .world
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
@@ -1693,6 +1655,7 @@ impl SharedAnalyzerRuntime {
         files: Vec<(VfsPath, String, crate::line_index::LineEndings)>,
     ) -> anyhow::Result<Vec<(VfsPath, VfsPath, String, crate::line_index::LineEndings)>> {
         let world = self
+            .session
             .world
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
@@ -1862,163 +1825,6 @@ fn common_path_prefix_len(left: &str, right: &str) -> usize {
     }
 
     last_separator
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct PackageInstanceKey {
-    pub root_file: String,
-    pub edition: String,
-    pub origin: String,
-    pub display_name: String,
-    pub version: String,
-    pub cfg_options: String,
-    pub env: String,
-    pub is_proc_macro: bool,
-    pub proc_macro_cwd: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct PackageInstance {
-    key: PackageInstanceKey,
-    crates: Vec<ide::Crate>,
-}
-
-impl PackageInstance {
-    fn new(key: PackageInstanceKey) -> Self {
-        Self {
-            key,
-            crates: Vec::new(),
-        }
-    }
-
-    fn push_crate(&mut self, krate: ide::Crate) {
-        if !self.crates.contains(&krate) {
-            self.crates.push(krate);
-        }
-    }
-
-    pub fn key(&self) -> &PackageInstanceKey {
-        &self.key
-    }
-
-    pub fn crates(&self) -> &[ide::Crate] {
-        &self.crates
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct SessionOverlay {
-    files: Vec<SessionOverlayFile>,
-    crates: Vec<SessionOverlayCrate>,
-}
-
-impl SessionOverlay {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn files(&self) -> &[SessionOverlayFile] {
-        &self.files
-    }
-
-    pub fn crates(&self) -> &[SessionOverlayCrate] {
-        &self.crates
-    }
-
-    pub fn push_file(&mut self, file: SessionOverlayFile) {
-        if !self.files.iter().any(|it| it.base_file == file.base_file) {
-            self.files.push(file);
-        }
-    }
-
-    pub fn push_crate(&mut self, krate: SessionOverlayCrate) {
-        if !self.crates.iter().any(|it| it.base_crate == krate.base_crate) {
-            self.crates.push(krate);
-        }
-    }
-
-    pub fn materialize_files(&mut self) {
-        for file in &mut self.files {
-            if file.session_file.is_none() {
-                file.session_file = Some(allocate_shared_file_id());
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct SessionOverlayFile {
-    base_file: FileId,
-    session_file: Option<FileId>,
-    path: VfsPath,
-}
-
-impl SessionOverlayFile {
-    pub fn new(base_file: FileId, session_file: FileId, path: VfsPath) -> Self {
-        Self {
-            base_file,
-            session_file: Some(session_file),
-            path,
-        }
-    }
-
-    pub fn pending(base_file: FileId, path: VfsPath) -> Self {
-        Self {
-            base_file,
-            session_file: None,
-            path,
-        }
-    }
-
-    pub fn base_file(&self) -> FileId {
-        self.base_file
-    }
-
-    pub fn session_file(&self) -> Option<FileId> {
-        self.session_file
-    }
-
-    pub fn path(&self) -> &VfsPath {
-        &self.path
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct SessionOverlayCrate {
-    base_crate: ide::Crate,
-    session_crate: Option<ide::Crate>,
-}
-
-impl SessionOverlayCrate {
-    pub fn new(base_crate: ide::Crate, session_crate: ide::Crate) -> Self {
-        Self {
-            base_crate,
-            session_crate: Some(session_crate),
-        }
-    }
-
-    pub fn pending(base_crate: ide::Crate) -> Self {
-        Self {
-            base_crate,
-            session_crate: None,
-        }
-    }
-
-    pub fn shared(krate: ide::Crate) -> Self {
-        Self::new(krate, krate)
-    }
-
-    pub fn base_crate(&self) -> ide::Crate {
-        self.base_crate
-    }
-
-    pub fn session_crate(&self) -> Option<ide::Crate> {
-        self.session_crate
-    }
-
-    pub fn is_shared(&self) -> bool {
-        self.session_crate == Some(self.base_crate)
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2234,12 +2040,11 @@ fn proc_macro_loading_error(error: impl ToString) -> ProcMacroLoadingError {
     ProcMacroLoadingError::ProcMacroSrvError(error.to_string().into_boxed_str())
 }
 
-pub struct SharedWorld {
+struct SharedWorld {
     access: Arc<SharedWorldAccess>,
     host: AnalysisHost,
     loaded_workspaces: Vec<LoadedWorkspace>,
     workspace_indexes: BTreeMap<String, usize>,
-    package_instances: BTreeMap<PackageInstanceKey, PackageInstance>,
     base_crates: Vec<ide::Crate>,
     base_max_source_root: Option<u32>,
     session_overlays: BTreeMap<u64, ActiveSessionOverlay>,
@@ -2252,13 +2057,12 @@ pub struct SharedWorld {
 }
 
 impl SharedWorld {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             access: Arc::new(SharedWorldAccess::default()),
             host: AnalysisHost::with_database(RootDatabase::new(None)),
             loaded_workspaces: Vec::new(),
             workspace_indexes: BTreeMap::new(),
-            package_instances: BTreeMap::new(),
             base_crates: Vec::new(),
             base_max_source_root: None,
             session_overlays: BTreeMap::new(),
@@ -2428,7 +2232,6 @@ impl SharedWorld {
             self.refresh_base_inputs();
             let removed_overlay_files = self.recone_session_overlays()?;
             self.rebuild_overlay_inputs(removed_overlay_files)?;
-            self.refresh_package_instances()?;
             return Ok(index);
         }
 
@@ -2443,7 +2246,6 @@ impl SharedWorld {
         self.apply_source_roots(source_roots);
         self.host.apply_change(change);
         self.refresh_base_inputs();
-        self.refresh_package_instances()?;
         Ok(index)
     }
 
@@ -2624,11 +2426,7 @@ impl SharedWorld {
         true
     }
 
-    pub fn workspace_summary(&self, index: usize) -> Option<&WorkspaceSummary> {
-        self.loaded_workspaces.get(index).map(LoadedWorkspace::summary)
-    }
-
-    pub fn workspaces(&self, view: &WorkspaceView) -> Vec<ProjectWorkspace> {
+    fn workspaces(&self, view: &WorkspaceView) -> Vec<ProjectWorkspace> {
         view.workspace_indexes()
             .filter_map(|index| self.loaded_workspaces.get(index))
             .map(|workspace| workspace.workspace.clone())
@@ -2649,31 +2447,6 @@ impl SharedWorld {
         workspaces
             .iter()
             .filter_map(|&index| self.loaded_workspaces.get(index))
-    }
-
-    pub fn workspace_file(&self, path: impl AsRef<Path>) -> anyhow::Result<(FileId, VfsPath)> {
-        self.workspace_file_in(0..self.loaded_workspaces.len(), path)
-    }
-
-    fn workspace_file_in(
-        &self,
-        workspaces: impl IntoIterator<Item = usize>,
-        path: impl AsRef<Path>,
-    ) -> anyhow::Result<(FileId, VfsPath)> {
-        let path = VfsPath::from(AbsPathBuf::assert_utf8(std::fs::canonicalize(path)?));
-
-        for workspace in workspaces {
-            let Some(workspace) = self.loaded_workspaces.get(workspace) else {
-                continue;
-            };
-            for (file_id, vfs_path) in workspace._vfs.iter() {
-                if *vfs_path == path {
-                    return Ok((file_id, vfs_path.clone()));
-                }
-            }
-        }
-
-        anyhow::bail!("workspace file is not loaded: {path}")
     }
 
     fn session_line_endings(
@@ -3349,77 +3122,17 @@ impl SharedWorld {
             .source_root_id(self.host.raw_database()))
     }
 
-    pub fn crate_root_file(&self, krate: ide::Crate) -> anyhow::Result<(FileId, VfsPath)> {
-        let db = self.host.raw_database();
-        let file_id = krate.data(db).root_file_id;
-        let path = path_for_file(db, file_id)?;
-
-        Ok((file_id, VfsPath::new_real_path(path)))
-    }
-
-    pub fn package_instances(&self) -> impl Iterator<Item = &PackageInstance> {
-        self.package_instances.values()
-    }
-
-    pub fn active_overlay_sessions(&self) -> usize {
+    fn active_overlay_sessions(&self) -> usize {
         self.session_overlays.len()
     }
 
-    pub fn overlay_files(&self) -> usize {
+    fn overlay_files(&self) -> usize {
         self.session_overlays
             .values()
             .flat_map(ActiveSessionOverlay::file_ids)
             .count()
     }
 
-    pub fn crates_for_file(&self, file_id: FileId) -> anyhow::Result<Vec<ide::Crate>> {
-        Ok(self.host.analysis().crates_for(file_id)?)
-    }
-
-    pub fn shared_dependencies(&self, krate: ide::Crate) -> anyhow::Result<Vec<ide::Crate>> {
-        let db = self.host.raw_database();
-        let mut dependencies = Vec::new();
-
-        for dependency in &krate.data(db).dependencies {
-            dependencies.push(self.interned_crate(dependency.crate_id)?);
-        }
-
-        Ok(dependencies)
-    }
-
-    fn interned_crate(&self, krate: ide::Crate) -> anyhow::Result<ide::Crate> {
-        let db = self.host.raw_database();
-        let key = package_instance_key(db, krate)?;
-        let package = self
-            .package_instances
-            .get(&key)
-            .ok_or_else(|| anyhow::format_err!("package instance is not interned: {:?}", key))?;
-
-        if package.crates().contains(&krate) {
-            Ok(krate)
-        } else {
-            anyhow::bail!("crate is not interned in package instance: {:?}", key)
-        }
-    }
-
-    fn refresh_package_instances(&mut self) -> anyhow::Result<()> {
-        let db = self.host.raw_database();
-        self.package_instances.clear();
-
-        for krate in self.base_crates.iter().copied() {
-            let key = package_instance_key(db, krate)?;
-            match self.package_instances.entry(key.clone()) {
-                Entry::Occupied(mut entry) => entry.get_mut().push_crate(krate),
-                Entry::Vacant(entry) => {
-                    let mut package = PackageInstance::new(key);
-                    package.push_crate(krate);
-                    entry.insert(package);
-                }
-            }
-        }
-
-        Ok(())
-    }
 }
 
 impl Default for SharedWorld {
@@ -3429,94 +3142,24 @@ impl Default for SharedWorld {
 }
 
 #[derive(Clone, Debug)]
-pub struct WorkspaceView {
+struct WorkspaceView {
     workspaces: Vec<usize>,
     excluded_paths: Vec<String>,
 }
 
 impl WorkspaceView {
-    pub fn new(workspaces: Vec<usize>, excluded_paths: Vec<String>) -> Self {
+    fn new(workspaces: Vec<usize>, excluded_paths: Vec<String>) -> Self {
         Self {
             workspaces,
             excluded_paths,
         }
     }
 
-    pub fn push_workspace(&mut self, workspace: usize) {
-        self.workspaces.push(workspace);
-    }
-
-    pub fn workspace_indexes(&self) -> impl Iterator<Item = usize> + '_ {
+    fn workspace_indexes(&self) -> impl Iterator<Item = usize> + '_ {
         self.workspaces.iter().copied()
     }
 
-    pub fn excluded_paths(&self) -> &[String] {
+    fn excluded_paths(&self) -> &[String] {
         &self.excluded_paths
     }
-
-    pub fn workspace_summaries<'a>(
-        &'a self,
-        world: &'a SharedWorld,
-    ) -> impl Iterator<Item = &'a WorkspaceSummary> {
-        self.workspaces
-            .iter()
-            .filter_map(|index| world.workspace_summary(*index))
-    }
-
-    pub fn workspace_file(
-        &self,
-        world: &SharedWorld,
-        path: impl AsRef<Path>,
-    ) -> anyhow::Result<(FileId, VfsPath)> {
-        world.workspace_file_in(self.workspaces.iter().copied(), path)
-    }
-
-    pub fn overlay_cone(
-        &self,
-        world: &SharedWorld,
-        path: impl AsRef<Path>,
-    ) -> anyhow::Result<SessionOverlay> {
-        let (base_file, vfs_path) = self.workspace_file(world, path)?;
-        let mut overlay = SessionOverlay::new();
-        overlay.push_file(SessionOverlayFile::pending(base_file, vfs_path));
-
-        for krate in world.crates_for_file(base_file)? {
-            overlay.push_crate(SessionOverlayCrate::pending(krate));
-            let (root_file, root_path) = world.crate_root_file(krate)?;
-            overlay.push_file(SessionOverlayFile::pending(root_file, root_path));
-
-            for dependency in world.shared_dependencies(krate)? {
-                overlay.push_crate(SessionOverlayCrate::shared(dependency));
-            }
-        }
-
-        overlay.materialize_files();
-
-        Ok(overlay)
-    }
-}
-
-fn path_for_file(db: &RootDatabase, file_id: FileId) -> anyhow::Result<String> {
-    let root = db.file_source_root(file_id).source_root_id(db);
-    db.source_root(root)
-        .source_root(db)
-        .path_for_file(&file_id)
-        .map(ToString::to_string)
-        .ok_or_else(|| anyhow::format_err!("file path is unavailable for {file_id:?}"))
-}
-
-fn package_instance_key(db: &RootDatabase, krate: ide::Crate) -> anyhow::Result<PackageInstanceKey> {
-    let data = krate.data(db);
-
-    Ok(PackageInstanceKey {
-        root_file: path_for_file(db, data.root_file_id)?,
-        edition: format!("{:?}", data.edition),
-        origin: format!("{:?}", data.origin),
-        display_name: format!("{:?}", krate.extra_data(db).display_name),
-        version: format!("{:?}", krate.extra_data(db).version),
-        cfg_options: format!("{:?}", krate.cfg_options(db)),
-        env: format!("{:?}", krate.env(db)),
-        is_proc_macro: data.is_proc_macro,
-        proc_macro_cwd: format!("{:?}", data.proc_macro_cwd),
-    })
 }
