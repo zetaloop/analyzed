@@ -12,11 +12,10 @@ use std::{
 };
 
 use analyzed_ipc::{
-    AnalysisConfigKey, BackendKey, BackendSnapshot, CargoConfigKey, ClientInfo, DaemonRequest,
-    DaemonResponse, DaemonSnapshot, Hello, IpcStream, LspSession, ProcMacroServerKey,
-    ProtocolError, RuntimePaths, SharedWorldConfigKey, SharedWorldKey, SharedWorldLoadKey,
-    StartupLock, Stop, WorkspaceSnapshot, WorkspaceViewKey, accept_client, bind_listener,
-    read_json_line, write_json_line,
+    AnalysisConfigKey, BackendKey, BackendSnapshot, CargoConfigKey, DaemonRequest, DaemonResponse,
+    DaemonSnapshot, Hello, IpcStream, LspSession, ProcMacroServerKey, RuntimePaths,
+    SharedWorldConfigKey, SharedWorldKey, SharedWorldLoadKey, StartupLock, Stop, WorkspaceSnapshot,
+    WorkspaceViewKey, accept_client, bind_listener, read_json_line, write_json_line,
 };
 use crossbeam_channel::unbounded;
 use lsp_server::{Connection, Message};
@@ -303,13 +302,9 @@ fn handle_client(
     session_id: usize,
 ) -> analyzed_ipc::Result<()> {
     let request: DaemonRequest = read_json_line(&mut stream)?;
-    if let Some(error) = validate_client(request.client_info()) {
-        write_json_line(&mut stream, &DaemonResponse::Error(error))?;
-        return Ok(());
-    }
 
     match request {
-        DaemonRequest::Hello(_) => {
+        DaemonRequest::Hello => {
             write_json_line(
                 &mut stream,
                 &DaemonResponse::Hello(Hello::with_state(
@@ -318,7 +313,7 @@ fn handle_client(
                 )),
             )?;
         }
-        DaemonRequest::Lsp(_) => {
+        DaemonRequest::Lsp => {
             write_json_line(
                 &mut stream,
                 &DaemonResponse::Lsp(LspSession {
@@ -330,7 +325,7 @@ fn handle_client(
                 analyzed_ipc::IpcError::Protocol(format!("lsp session failed: {error}"))
             })?;
         }
-        DaemonRequest::Stop(_) => {
+        DaemonRequest::Stop => {
             write_json_line(
                 &mut stream,
                 &DaemonResponse::Stop(Stop {
@@ -523,14 +518,4 @@ fn load_key_from_shared(key: ra_ap_rust_analyzer::SharedAnalyzerLoadKey) -> Shar
         num_worker_threads: key.num_worker_threads,
         proc_macro_processes: key.proc_macro_processes,
     }
-}
-
-fn validate_client(client: &ClientInfo) -> Option<ProtocolError> {
-    (client.protocol_version != analyzed_ipc::PROTOCOL_VERSION).then(|| ProtocolError {
-        message: format!(
-            "unsupported protocol version {}, expected {}",
-            client.protocol_version,
-            analyzed_ipc::PROTOCOL_VERSION
-        ),
-    })
 }

@@ -50,8 +50,6 @@ use windows_sys::Win32::{
     },
 };
 
-pub const PROTOCOL_VERSION: u32 = 1;
-
 pub type Result<T> = std::result::Result<T, IpcError>;
 
 #[cfg(unix)]
@@ -234,45 +232,24 @@ impl RuntimePaths {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ClientInfo {
-    pub protocol_version: u32,
-    pub client_version: String,
-}
-
-impl ClientInfo {
-    pub fn current() -> Self {
-        Self {
-            protocol_version: PROTOCOL_VERSION,
-            client_version: env!("CARGO_PKG_VERSION").to_owned(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum DaemonRequest {
-    Hello(ClientInfo),
-    Lsp(ClientInfo),
-    Stop(ClientInfo),
+    Hello,
+    Lsp,
+    Stop,
 }
 
 impl DaemonRequest {
     pub fn hello() -> Self {
-        Self::Hello(ClientInfo::current())
+        Self::Hello
     }
 
     pub fn stop() -> Self {
-        Self::Stop(ClientInfo::current())
+        Self::Stop
     }
 
     pub fn lsp() -> Self {
-        Self::Lsp(ClientInfo::current())
-    }
-
-    pub fn client_info(&self) -> &ClientInfo {
-        match self {
-            Self::Hello(client) | Self::Lsp(client) | Self::Stop(client) => client,
-        }
+        Self::Lsp
     }
 }
 
@@ -378,7 +355,6 @@ pub struct DaemonSnapshot {
 pub struct Hello {
     pub ok: bool,
     pub pid: u32,
-    pub protocol_version: u32,
     pub daemon_version: String,
     pub rust_analyzer_version: String,
     pub capabilities: Vec<String>,
@@ -390,7 +366,6 @@ impl Hello {
         Self {
             ok: true,
             pid: state.pid,
-            protocol_version: PROTOCOL_VERSION,
             daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
             rust_analyzer_version,
             capabilities: vec!["lsp".to_owned()],
@@ -412,17 +387,11 @@ pub struct LspSession {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProtocolError {
-    pub message: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum DaemonResponse {
     Hello(Hello),
     Lsp(LspSession),
     Stop(Stop),
-    Error(ProtocolError),
 }
 
 #[cfg(unix)]
@@ -473,7 +442,6 @@ impl Drop for StartupLock {
 pub fn connect_hello(paths: &RuntimePaths) -> Result<Hello> {
     match request(paths, &DaemonRequest::hello())? {
         DaemonResponse::Hello(hello) => Ok(hello),
-        DaemonResponse::Error(error) => Err(IpcError::Protocol(error.message)),
         response => Err(IpcError::Protocol(format!(
             "unexpected daemon response: {response:?}"
         ))),
@@ -483,7 +451,6 @@ pub fn connect_hello(paths: &RuntimePaths) -> Result<Hello> {
 pub fn request_stop(paths: &RuntimePaths) -> Result<Stop> {
     match request(paths, &DaemonRequest::stop())? {
         DaemonResponse::Stop(stop) => Ok(stop),
-        DaemonResponse::Error(error) => Err(IpcError::Protocol(error.message)),
         response => Err(IpcError::Protocol(format!(
             "unexpected daemon response: {response:?}"
         ))),
@@ -500,7 +467,6 @@ pub fn connect_lsp_session(paths: &RuntimePaths) -> Result<IpcStream> {
             "daemon rejected lsp session for pid {}",
             session.pid
         ))),
-        DaemonResponse::Error(error) => Err(IpcError::Protocol(error.message)),
         response => Err(IpcError::Protocol(format!(
             "unexpected daemon response: {response:?}"
         ))),
