@@ -1276,6 +1276,49 @@ fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box
 fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error>> {
     let mut source = fs::read_to_string(notification_rs)?;
 
+    build_support::extract(
+        &mut source,
+        "handle_did_close_text_document",
+        |function| {
+            let branch = build_support::one(
+                build_support::ifs_referencing(function, "vfs"),
+                "native diagnostics cleanup branch",
+            )?;
+            build_support::stmt(&branch)
+        },
+        build_support::Method {
+            name: "clear_native_diagnostics_for_closed_file",
+            receiver: None,
+            params: &[
+                build_support::Param {
+                    name: "state",
+                    ty: "&mut GlobalState",
+                },
+                build_support::Param {
+                    name: "path",
+                    ty: "VfsPath",
+                },
+            ],
+            args: &["state", "path.clone()"],
+            return_ty: None,
+        },
+    )?;
+    build_support::rename::<ast::Fn>(
+        &mut source,
+        "clear_native_diagnostics_for_closed_file",
+        "_clear_native_diagnostics_for_closed_file",
+    )?;
+    build_support::add_attr::<ast::Fn>(
+        &mut source,
+        "_clear_native_diagnostics_for_closed_file",
+        "#[allow(dead_code)]",
+    )?;
+    build_support::add_use(
+        &mut source,
+        Some("pub(crate)"),
+        "crate::shared_notification::clear_native_diagnostics_for_closed_file",
+    )?;
+
     build_support::redirect_call(
         &mut source,
         build_support::Scope::IfLet {
@@ -1391,11 +1434,6 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
         &mut source,
         "handle_did_save_text_document",
         "_handle_did_save_text_document",
-    )?;
-    build_support::add_attr::<ast::Fn>(
-        &mut source,
-        "_handle_did_save_text_document",
-        "#[allow(dead_code)]",
     )?;
     build_support::add_use(
         &mut source,

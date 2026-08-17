@@ -21,8 +21,8 @@ use ide_db::{
 };
 use load_cargo::{
     LoadCargoConfig, ProcMacroLoad, ProcMacroLoadState, ProcMacroServerChoice, SourceRootConfig,
-    WorkspaceLoad, collect_proc_macros, load_workspace_change, source_roots_for_files,
-    workspace_source_root_config,
+    WorkspaceLoad, collect_proc_macros, load_workspace_change, source_root_for_path,
+    source_roots_for_files, workspace_source_root_config,
 };
 use lsp_types::Uri;
 use proc_macro_api::ProcMacroClient;
@@ -2910,7 +2910,10 @@ impl SharedAnalyzerRuntime {
         }
 
         if let Some(overlay) = world.session_overlays.get(&self.session_id()) {
-            for file in overlay.files_by_path.values() {
+            for key in overlay.open_files.keys() {
+                let Some(file) = overlay.files_by_path.get(key) else {
+                    continue;
+                };
                 if file.display_path.name_and_extension() == Some(("rust-analyzer", Some("toml"))) {
                     files.push((
                         file.display_path.clone(),
@@ -2949,13 +2952,22 @@ impl SharedAnalyzerRuntime {
             return Ok(());
         }
 
+        let base_file_access = self
+            .session
+            .world
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?
+            .base_file_access();
+        let _base_files = base_file_access
+            .lock()
+            .map_err(|error| anyhow::format_err!("shared base-file mutex is poisoned: {error}"))?;
         let _write = self.session.access.write(Some(self.session_id()));
         let mut world = self
             .session
             .world
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
-        let changed = world.apply_base_file_changes(self.workspace_indexes(), files);
+        let changed = world.apply_base_file_changes(self.workspace_indexes(), files)?;
         if changed {
             self.session.gc.changed();
         }
@@ -2965,20 +2977,63 @@ impl SharedAnalyzerRuntime {
 
     pub(crate) fn sync_open_files(
         &self,
-        files: Vec<(VfsPath, VfsPath, String, crate::line_index::LineEndings)>,
+        files: Vec<(VfsPath, String, crate::line_index::LineEndings)>,
+        force_rebuild: bool,
     ) -> anyhow::Result<SharedOverlaySync> {
         let _read = self.session.access.read(self.session_id());
-        {
+        let files = {
             let world = self
                 .session
                 .world
                 .lock()
                 .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
-            if !world.session_overlay_changed(self.session_id(), self.workspace_indexes(), &files) {
+            let overlay_needed = world
+                .session_overlays
+                .get(&self.session_id())
+                .is_some_and(|overlay| !overlay.files_by_path.is_empty())
+                || files.iter().any(|(path, text, line_endings)| {
+                    let source_path = normalize_vfs_path(path);
+                    let Some(base_file) = world
+                        .base_file(self.workspace_indexes(), &source_path)
+                        .filter(|&file_id| {
+                            world.base_file_exists(self.workspace_indexes(), file_id)
+                        })
+                    else {
+                        return world
+                            .source_root_for_path(self.workspace_indexes(), &source_path)
+                            .is_some();
+                    };
+                    let db = world.host.raw_database();
+                    db.file_text(base_file).text(db).as_ref() != text.as_str()
+                        || world.base_line_endings(self.workspace_indexes(), base_file)
+                            != Some(*line_endings)
+                });
+            if !overlay_needed {
                 self.refresh_session_cache(&world);
                 return Ok(SharedOverlaySync::default());
             }
-        }
+            if !force_rebuild
+                && world.can_update_session_overlay(
+                    self.session_id(),
+                    self.workspace_indexes(),
+                    &files,
+                ) {
+                PreparedSessionOverlay::Update(files)
+            } else {
+                let files =
+                    world.prepare_session_overlay_files(self.workspace_indexes(), files)?;
+                if !force_rebuild
+                    && !world.session_overlay_changed(
+                        self.session_id(),
+                        self.workspace_indexes(),
+                        &files,
+                    ) {
+                    self.refresh_session_cache(&world);
+                    return Ok(SharedOverlaySync::default());
+                }
+                PreparedSessionOverlay::Rebuild(files)
+            }
+        };
         let _write = self.session.access.write_overlay(self.session_id(), || {
             self.session
                 .world
@@ -2992,8 +3047,19 @@ impl SharedAnalyzerRuntime {
             .world
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
-        let sync =
-            world.sync_session_overlay(self.session_id(), self.workspace_indexes(), files)?;
+        let sync = match files {
+            PreparedSessionOverlay::Update(files) => {
+                world.update_session_overlay(self.session_id(), files)
+            }
+            PreparedSessionOverlay::Rebuild(files) => {
+                world.sync_session_overlay(
+                    self.session_id(),
+                    self.workspace_indexes(),
+                    files,
+                    force_rebuild,
+                )?
+            }
+        };
         if sync.changed {
             self.session
                 .overlay_generation
@@ -3009,49 +3075,6 @@ impl SharedAnalyzerRuntime {
         Ok(sync)
     }
 
-    pub(crate) fn overlay_needed(
-        &self,
-        files: &[(VfsPath, String, crate::line_index::LineEndings)],
-    ) -> anyhow::Result<bool> {
-        let world = self
-            .session
-            .world
-            .lock()
-            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
-        if world
-            .session_overlays
-            .get(&self.session_id())
-            .is_some_and(|overlay| !overlay.files_by_path.is_empty())
-        {
-            return Ok(true);
-        }
-
-        let db = world.host.raw_database();
-        for (path, text, _) in files {
-            let Some(base_file) = world
-                .base_file(self.workspace_indexes(), &normalize_vfs_path(path))
-            else {
-                continue;
-            };
-            if db.file_text(base_file).text(db).as_ref() != text.as_str() {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
-    }
-
-    pub(crate) fn prepare_overlay_files(
-        &self,
-        files: Vec<(VfsPath, String, crate::line_index::LineEndings)>,
-    ) -> anyhow::Result<Vec<(VfsPath, VfsPath, String, crate::line_index::LineEndings)>> {
-        let world = self
-            .session
-            .world
-            .lock()
-            .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
-        world.prepare_session_overlay_files(self.workspace_indexes(), files)
-    }
 }
 
 pub(crate) fn normalize_vfs_path(path: &VfsPath) -> VfsPath {
@@ -3127,14 +3150,19 @@ fn allocate_shared_file_id() -> FileId {
 
 #[derive(Clone, Default)]
 struct SharedLineEndings {
-    workspaces: Vec<Arc<BTreeMap<FileId, crate::line_index::LineEndings>>>,
+    workspaces: Vec<(
+        Arc<LoadedWorkspaceFiles>,
+        Arc<BTreeMap<FileId, crate::line_index::LineEndings>>,
+    )>,
     overlay: BTreeMap<FileId, crate::line_index::LineEndings>,
 }
 
 impl SharedLineEndings {
     fn get(&self, file_id: FileId) -> Option<crate::line_index::LineEndings> {
-        for line_endings in &self.workspaces {
-            if let Some(line_endings) = line_endings.get(&file_id) {
+        for (files, line_endings) in &self.workspaces {
+            if files.exists(file_id)
+                && let Some(line_endings) = line_endings.get(&file_id)
+            {
                 return Some(*line_endings);
             }
         }
@@ -3181,11 +3209,16 @@ impl SharedFileMappings {
             return Some(true);
         }
 
-        self.workspaces.iter().find_map(|workspace| {
-            workspace
-                .contains_file(file_id)
-                .then(|| workspace.exists(file_id))
-        })
+        let mut found = false;
+        for workspace in &self.workspaces {
+            if workspace.contains_file(file_id) {
+                found = true;
+                if workspace.exists(file_id) {
+                    return Some(true);
+                }
+            }
+        }
+        found.then_some(false)
     }
 }
 
@@ -3228,8 +3261,9 @@ pub(crate) struct SharedOverlaySync {
 
 pub(crate) struct SharedBaseFileChange {
     pub(crate) path: VfsPath,
-    pub(crate) text: String,
-    pub(crate) line_endings: crate::line_index::LineEndings,
+    pub(crate) text: Option<String>,
+    pub(crate) exists: bool,
+    pub(crate) line_endings: Option<crate::line_index::LineEndings>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3264,8 +3298,22 @@ impl ActiveSessionOverlay {
 
 #[derive(Clone, Debug)]
 struct OpenOverlayFile {
-    overlay_file: FileId,
     text: String,
+}
+
+struct PreparedOverlayFile {
+    base_file: Option<FileId>,
+    base_source_root: SourceRootId,
+    path: VfsPath,
+    display_path: VfsPath,
+    text: String,
+    line_endings: crate::line_index::LineEndings,
+    is_open: bool,
+}
+
+enum PreparedSessionOverlay {
+    Update(Vec<(VfsPath, String, crate::line_index::LineEndings)>),
+    Rebuild(Vec<PreparedOverlayFile>),
 }
 
 #[derive(Clone, Debug)]
@@ -3341,6 +3389,12 @@ impl LoadedWorkspaceFiles {
         self.file_ids_by_path.insert(path_key(&path), file_id);
         self.files_by_id
             .insert(file_id, LoadedWorkspaceFile { path, exists });
+    }
+
+    fn set_exists(&mut self, file_id: FileId, exists: bool) {
+        if let Some(file) = self.files_by_id.get_mut(&file_id) {
+            file.exists = exists;
+        }
     }
 
     fn file_id(&self, path: &VfsPath) -> Option<(FileId, ())> {
@@ -4422,38 +4476,117 @@ impl SharedWorld {
         &mut self,
         workspaces: &[usize],
         files: Vec<SharedBaseFileChange>,
-    ) -> bool {
+    ) -> anyhow::Result<bool> {
         let revision = self.host.raw_database().nonce_and_revision().1;
         let mut change = ChangeWithProcMacros::default();
         let mut applied = false;
         let mut line_endings_changed = false;
+        let mut source_roots_changed = false;
+        let mut affected_workspaces = Vec::new();
 
         for file in files {
-            let Some(file_id) = self
-                .base_file(workspaces, &normalize_vfs_path(&file.path))
-            else {
+            let path = &file.path;
+            let normalized_path = normalize_vfs_path(path);
+            let file_key = path_key(&normalized_path);
+            let file_id = self
+                .loaded_workspaces
+                .iter()
+                .find_map(|workspace| workspace._vfs.file_id(&normalized_path))
+                .map(|(file_id, _)| file_id);
+            let mut workspace_indexes = self
+                .loaded_workspaces
+                .iter()
+                .enumerate()
+                .filter_map(|(index, workspace)| {
+                    let classified =
+                        source_root_for_path(&workspace.input.source_root_config, path).is_some()
+                            || source_root_for_path(
+                                &workspace.input.source_root_config,
+                                &normalized_path,
+                            )
+                            .is_some();
+                    let workspace_root = path_key(&VfsPath::from(
+                        workspace.workspace.workspace_root().to_path_buf(),
+                    ));
+                    let in_view_root = workspaces.contains(&index)
+                        && common_path_prefix_len(&file_key, &workspace_root)
+                            == workspace_root.len();
+                    (workspace._vfs.file_id(&normalized_path).is_some()
+                        || classified
+                        || in_view_root)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if workspace_indexes.is_empty() {
                 continue;
-            };
-            for workspace in &mut self.loaded_workspaces {
-                if workspace._vfs.contains_file(file_id) {
+            }
+            let file_id = file_id.unwrap_or_else(|| self.base_file_ids.resolve(&normalized_path));
+
+            for index in workspace_indexes.drain(..) {
+                let workspace = &mut self.loaded_workspaces[index];
+                let files = Arc::make_mut(&mut workspace._vfs);
+                if !files.contains_file(file_id) {
+                    files.insert(file_id, path.clone(), file.exists);
+                } else {
+                    files.set_exists(file_id, file.exists);
+                }
+                if let Some(line_endings) = file.line_endings {
                     line_endings_changed |= Arc::make_mut(&mut workspace.line_endings)
-                        .insert(file_id, file.line_endings)
-                        != Some(file.line_endings);
+                        .insert(file_id, line_endings)
+                        != Some(line_endings);
+                }
+                if !affected_workspaces.contains(&index) {
+                    affected_workspaces.push(index);
                 }
             }
-            change.change_file(file_id, Some(file.text));
+            change.change_file(file_id, file.text);
             applied = true;
         }
 
+        for index in affected_workspaces {
+            let workspace = &mut self.loaded_workspaces[index];
+            let roots = source_roots_for_files(
+                &workspace.input.source_root_config,
+                workspace
+                    ._vfs
+                    .iter()
+                    .filter(|(file_id, _)| workspace._vfs.exists(*file_id))
+                    .map(|(file_id, path)| (file_id, path.clone())),
+            );
+            if workspace.input.source_roots != roots {
+                workspace.input.source_roots = roots;
+                workspace.source_root_parent_map =
+                    workspace.input.source_root_config.source_root_parent_map();
+                source_roots_changed = true;
+            }
+        }
+
+        if source_roots_changed {
+            let roots = self
+                .loaded_workspaces
+                .iter()
+                .flat_map(|workspace| workspace.input.source_roots.iter().cloned())
+                .collect::<Vec<_>>();
+            self.apply_source_roots(roots.clone());
+            change.set_roots(roots);
+            applied = true;
+        }
         if applied {
             self.host.apply_change(change);
         }
-        let changed = line_endings_changed
-            || self.host.raw_database().nonce_and_revision().1 != revision;
+        let changed =
+            line_endings_changed || self.host.raw_database().nonce_and_revision().1 != revision;
         if changed {
+            if self
+                .session_overlays
+                .values()
+                .any(|overlay| !overlay.files_by_path.is_empty())
+            {
+                self.recone_session_overlays()?;
+            }
             self.input_generation.fetch_add(1, Ordering::SeqCst);
         }
-        changed
+        Ok(changed)
     }
 
     fn apply_source_roots(&mut self, roots: Vec<SourceRoot>) {
@@ -4598,14 +4731,22 @@ impl SharedWorld {
     ) -> SharedLineEndings {
         let workspaces = self
             .loaded_workspaces_in(workspaces)
-            .map(|workspace| Arc::clone(&workspace.line_endings))
+            .map(|workspace| {
+                (
+                    Arc::clone(&workspace._vfs),
+                    Arc::clone(&workspace.line_endings),
+                )
+            })
             .collect();
         let mut overlay_line_endings = BTreeMap::new();
 
         if let Some(session_overlay) = self.session_overlays.get(&session_id) {
-            overlay_line_endings.extend(session_overlay.files_by_path.values().map(|file| {
-                (file.overlay_file, file.line_endings)
-            }));
+            overlay_line_endings.extend(
+                session_overlay
+                    .files_by_path
+                    .values()
+                    .map(|file| (file.overlay_file, file.line_endings)),
+            );
         }
 
         SharedLineEndings {
@@ -4660,18 +4801,40 @@ impl SharedWorld {
         workspaces: &[usize],
         path: &VfsPath,
     ) -> Option<(SourceRootId, bool)> {
-        let path = normalize_vfs_path(path);
-        if let Some(file_id) = self.base_file(workspaces, &path) {
+        let source_path = path;
+        let normalized_path = normalize_vfs_path(path);
+        if let Some(file_id) = self
+            .base_file(workspaces, &normalized_path)
+            .filter(|&file_id| self.base_file_exists(workspaces, file_id))
+        {
             let db = self.host.raw_database();
             let source_root_id = db.file_source_root(file_id).source_root_id(db);
             let source_root = db.source_root(source_root_id).source_root(db);
             return Some((source_root_id, source_root.is_library));
         }
 
-        let path = path_key(&path);
+        let path = path_key(&normalized_path);
         let mut best = None::<(usize, SourceRootId, bool)>;
         for workspace in self.loaded_workspaces_in(workspaces) {
+            let Some(is_library) = source_root_for_path(
+                &workspace.input.source_root_config,
+                source_path,
+            )
+            .or_else(|| {
+                source_root_for_path(&workspace.input.source_root_config, &normalized_path)
+            }) else {
+                continue;
+            };
             for (file_id, file_path) in workspace._vfs.iter() {
+                if !workspace._vfs.exists(file_id) {
+                    continue;
+                }
+                let db = self.host.raw_database();
+                let source_root_id = db.file_source_root(file_id).source_root_id(db);
+                let source_root = db.source_root(source_root_id).source_root(db);
+                if source_root.is_library != is_library {
+                    continue;
+                }
                 let len = common_path_prefix_len(&path, &path_key(file_path));
                 if len == 0 {
                     continue;
@@ -4682,9 +4845,6 @@ impl SharedWorld {
                     None => true,
                 };
                 if replace {
-                    let db = self.host.raw_database();
-                    let source_root_id = db.file_source_root(file_id).source_root_id(db);
-                    let source_root = db.source_root(source_root_id).source_root(db);
                     best = Some((len, source_root_id, source_root.is_library));
                 }
             }
@@ -4693,120 +4853,149 @@ impl SharedWorld {
         best.map(|(_, source_root_id, is_library)| (source_root_id, is_library))
     }
 
+    fn can_update_session_overlay(
+        &self,
+        session_id: u64,
+        workspaces: &[usize],
+        files: &[(VfsPath, String, crate::line_index::LineEndings)],
+    ) -> bool {
+        let Some(overlay) = self.session_overlays.get(&session_id) else {
+            return false;
+        };
+        overlay.workspaces == workspaces
+            && overlay.open_files.len() == files.len()
+            && !overlay.open_files.is_empty()
+            && files.iter().all(|(path, _, _)| {
+                overlay
+                    .open_files
+                    .contains_key(&path_key(&normalize_vfs_path(path)))
+            })
+    }
+
+    fn update_session_overlay(
+        &mut self,
+        session_id: u64,
+        files: Vec<(VfsPath, String, crate::line_index::LineEndings)>,
+    ) -> SharedOverlaySync {
+        let overlay = self
+            .session_overlays
+            .get_mut(&session_id)
+            .expect("shared analyzer session overlay must exist");
+        let mut change = ChangeWithProcMacros::default();
+        let mut changed = false;
+        for (path, text, line_endings) in files {
+            let key = path_key(&normalize_vfs_path(&path));
+            let open = overlay
+                .open_files
+                .get_mut(&key)
+                .expect("shared analyzer open overlay file must exist");
+            let file = overlay
+                .files_by_path
+                .get_mut(&key)
+                .expect("shared analyzer overlay file must exist");
+            if file.text != text {
+                open.text.clone_from(&text);
+                file.text = text.clone();
+                change.change_file(file.overlay_file, Some(text));
+                changed = true;
+            }
+            if file.line_endings != line_endings {
+                file.line_endings = line_endings;
+                changed = true;
+            }
+        }
+        if changed {
+            self.host.apply_change(change);
+        }
+        SharedOverlaySync {
+            changed,
+            removed_files: Vec::new(),
+        }
+    }
+
     fn session_overlay_changed(
         &self,
         session_id: u64,
         workspaces: &[usize],
-        files: &[(VfsPath, VfsPath, String, crate::line_index::LineEndings)],
+        files: &[PreparedOverlayFile],
     ) -> bool {
+        let db = self.host.raw_database();
+        let overlay_needed = files.iter().filter(|file| file.is_open).any(|file| {
+            file.base_file.is_none_or(|base_file| {
+                db.file_text(base_file).text(db).as_ref() != file.text.as_str()
+                    || self.base_line_endings(workspaces, base_file) != Some(file.line_endings)
+            })
+        });
         let old_overlay = self.session_overlays.get(&session_id);
-        let mut open_files = 0;
-        for (path, _, text, _) in files {
-            let Some(base_file) = self.base_file(workspaces, &normalize_vfs_path(path)) else {
-                continue;
-            };
-            let db = self.host.raw_database();
-            if db.file_text(base_file).text(db).as_ref() == text.as_str() {
-                continue;
-            }
-            open_files += 1;
-            let key = path_key(path);
-            if !old_overlay
-                .and_then(|overlay| overlay.open_files.get(&key))
-                .is_some_and(|old| old.text == *text)
-            {
-                return true;
-            }
+        if !overlay_needed {
+            return old_overlay.is_some_and(|overlay| !overlay.files_by_path.is_empty());
         }
 
-        old_overlay.is_some_and(|overlay| overlay.open_files.len() != open_files)
+        let expected_open_files = files.iter().filter(|file| file.is_open).count();
+        let Some(old_overlay) = old_overlay else {
+            return true;
+        };
+        if old_overlay.files_by_path.len() != files.len()
+            || old_overlay.open_files.len() != expected_open_files
+        {
+            return true;
+        }
+
+        files.iter().any(|file| {
+            let key = path_key(&file.path);
+            let active_changed = old_overlay.files_by_path.get(&key).is_none_or(|active| {
+                active.text != file.text
+                    || active.line_endings != file.line_endings
+                    || active.path != file.path
+                    || active.display_path != file.display_path
+                    || active.base_source_root != file.base_source_root
+            });
+            let open_changed = if file.is_open {
+                old_overlay
+                    .open_files
+                    .get(&key)
+                    .is_none_or(|open| open.text != file.text)
+            } else {
+                old_overlay.open_files.contains_key(&key)
+            };
+            active_changed || open_changed
+        })
     }
 
-    pub(crate) fn sync_session_overlay(
+    fn sync_session_overlay(
         &mut self,
         session_id: u64,
         workspaces: &[usize],
-        files: Vec<(
-            VfsPath,
-            VfsPath,
-            String,
-            crate::line_index::LineEndings,
-        )>,
+        files: Vec<PreparedOverlayFile>,
+        force_rebuild: bool,
     ) -> anyhow::Result<SharedOverlaySync> {
-        let open_files = files
-            .into_iter()
-            .filter_map(|(path, display_path, text, line_endings)| {
-                let key = path_key(&path);
-                self.base_file(workspaces, &normalize_vfs_path(&path))
-                    .and_then(|base_file| {
-                        let db = self.host.raw_database();
-                        let base_text = db.file_text(base_file).text(db);
-                        if base_text.as_ref() == text.as_str() {
-                            return None;
-                        }
-                        Some(
-                        (
-                            key,
-                            (path, display_path, base_file, text, line_endings),
-                        )
-                        )
-                    })
+        if !force_rebuild && !self.session_overlay_changed(session_id, workspaces, &files) {
+            return Ok(SharedOverlaySync::default());
+        }
+
+        let db = self.host.raw_database();
+        let overlay_needed = files.iter().filter(|file| file.is_open).any(|file| {
+            file.base_file.is_none_or(|base_file| {
+                db.file_text(base_file).text(db).as_ref() != file.text.as_str()
+                    || self.base_line_endings(workspaces, base_file) != Some(file.line_endings)
             })
-            .collect::<BTreeMap<_, _>>();
+        });
+        let files = if overlay_needed {
+            files
+                .into_iter()
+                .map(|file| (path_key(&file.path), file))
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
 
-        let old_overlay = self.session_overlays.remove(&session_id).unwrap_or_default();
-        let same_open_files = old_overlay.open_files.len() == open_files.len()
-            && open_files
-                .iter()
-                .all(|(key, (_, _, _, text, _))| {
-                    old_overlay
-                        .open_files
-                        .get(key)
-                        .is_some_and(|old| old.text == *text)
-            });
-        if same_open_files {
-            self.session_overlays.insert(session_id, old_overlay);
-            return Ok(SharedOverlaySync {
-                changed: false,
-                removed_files: Vec::new(),
-            });
-        }
-
-        let same_file_set = old_overlay.open_files.len() == open_files.len()
-            && open_files
-                .keys()
-                .all(|key| old_overlay.open_files.contains_key(key));
-        if same_file_set {
-            let mut overlay = old_overlay;
-            let mut change = ChangeWithProcMacros::default();
-            for (key, (_, _, _, text, line_endings)) in open_files {
-                let open = overlay
-                    .open_files
-                    .get_mut(&key)
-                    .expect("overlay file set was checked");
-                if open.text == text {
-                    continue;
-                }
-                open.text = text.clone();
-                let file = overlay
-                    .files_by_path
-                    .get_mut(&key)
-                    .expect("overlay file set was checked");
-                file.text = text.clone();
-                file.line_endings = line_endings;
-                change.change_file(open.overlay_file, Some(text));
-            }
-            self.session_overlays.insert(session_id, overlay);
-            self.host.apply_change(change);
-            return Ok(SharedOverlaySync {
-                changed: true,
-                removed_files: Vec::new(),
-            });
-        }
-
-        let kept_keys = open_files.keys().cloned().collect::<BTreeSet<_>>();
+        let old_overlay = self
+            .session_overlays
+            .remove(&session_id)
+            .unwrap_or_default();
+        let kept_keys = files.keys().cloned().collect::<BTreeSet<_>>();
         let removed_file_ids = old_overlay
-            .open_files
+            .files_by_path
             .iter()
             .filter_map(|(key, file)| (!kept_keys.contains(key)).then_some(file.overlay_file))
             .collect::<Vec<_>>();
@@ -4815,40 +5004,36 @@ impl SharedWorld {
             ..ActiveSessionOverlay::default()
         };
 
-        for (key, (path, display_path, base_file, text, line_endings)) in open_files {
-            let overlay_file = old_overlay
-                .open_files
-                .get(&key)
+        for (key, file) in files {
+            let old_file = old_overlay.files_by_path.get(&key);
+            let overlay_file = old_file
                 .map(|file| file.overlay_file)
-            .unwrap_or_else(|| self.allocate_overlay_file_id());
-            if old_overlay
-                .open_files
-                .get(&key)
-                .is_some_and(|old| old.text != text)
-            {
+                .unwrap_or_else(|| self.allocate_overlay_file_id());
+            if old_file.is_some_and(|old| old.text != file.text) {
                 self.applied_overlay_files.remove(&overlay_file);
             }
-            overlay.open_files.insert(
-                key.clone(),
-                OpenOverlayFile {
-                    overlay_file,
-                    text: text.clone(),
-                },
-            );
+            if file.is_open {
+                overlay.open_files.insert(
+                    key.clone(),
+                    OpenOverlayFile {
+                        text: file.text.clone(),
+                    },
+                );
+            }
             overlay.path_by_file.insert(overlay_file, key.clone());
             overlay.files_by_path.insert(
                 key,
                 ActiveOverlayFile {
                     overlay_file,
-                    base_source_root: self.source_root_for_file(base_file)?,
-                    path,
-                    display_path,
-                    text,
-                    line_endings,
+                    base_source_root: file.base_source_root,
+                    path: file.path,
+                    display_path: file.display_path,
+                    text: file.text,
+                    line_endings: file.line_endings,
                 },
             );
-            self.populate_overlay_crates(&mut overlay, base_file)?;
         }
+        self.populate_overlay_crates(&mut overlay)?;
 
         self.session_overlays.insert(session_id, overlay);
         self.rebuild_overlay_inputs(removed_file_ids.clone())?;
@@ -4859,11 +5044,11 @@ impl SharedWorld {
         })
     }
 
-    pub(crate) fn prepare_session_overlay_files(
+    fn prepare_session_overlay_files(
         &self,
         workspaces: &[usize],
         files: Vec<(VfsPath, String, crate::line_index::LineEndings)>,
-    ) -> anyhow::Result<Vec<(VfsPath, VfsPath, String, crate::line_index::LineEndings)>> {
+    ) -> anyhow::Result<Vec<PreparedOverlayFile>> {
         let open_files = files
             .into_iter()
             .map(|(path, text, line_endings)| {
@@ -4871,49 +5056,106 @@ impl SharedWorld {
                 (path_key(&source_path), (path, text, line_endings))
             })
             .collect::<BTreeMap<_, _>>();
-        let mut required_files = BTreeMap::<String, VfsPath>::new();
+        let mut required_files =
+            BTreeMap::<String, (Option<FileId>, SourceRootId, VfsPath)>::new();
         let db = self.host.raw_database();
+        let analysis = self.host.analysis();
+        let view_workspaces = self.loaded_workspaces_in(workspaces).collect::<Vec<_>>();
 
         for (path, _, _) in open_files.values() {
             let source_path = normalize_vfs_path(path);
-            let Some(base_file) = self.base_file(workspaces, &source_path) else {
-                continue;
-            };
-
-            for krate in self.host.analysis().crates_for(base_file)? {
-                let root_file = krate.data(db).root_file_id;
-                let source_root_id = self.source_root_for_file(root_file)?;
-                let source_root = db.source_root(source_root_id).source_root(db);
-
-                for file_id in source_root.iter() {
-                    let Some(path) = source_root.path_for_file(&file_id).cloned() else {
+            let base_file = self
+                .base_file(workspaces, &source_path)
+                .filter(|&file_id| self.base_file_exists(workspaces, file_id));
+            let base_source_root = match base_file {
+                Some(base_file) => self.source_root_for_file(base_file)?,
+                None => {
+                    let Some((source_root, _)) =
+                        self.source_root_for_path(workspaces, &source_path)
+                    else {
                         continue;
                     };
-                    required_files.entry(path_key(&path)).or_insert(path);
+                    source_root
+                }
+            };
+            required_files.entry(path_key(&source_path)).or_insert((
+                base_file,
+                base_source_root,
+                source_path,
+            ));
+
+            let seed_crates = match base_file {
+                Some(base_file) => analysis.crates_for(base_file)?,
+                None => self
+                    .base_crates
+                    .iter()
+                    .copied()
+                    .filter(|krate| {
+                        self.source_root_for_file(krate.data(db).root_file_id).ok()
+                            == Some(base_source_root)
+                    })
+                    .collect(),
+            };
+            for krate in seed_crates {
+                for krate in analysis.transitive_rev_deps(krate)? {
+                    let root_file = krate.data(db).root_file_id;
+                    if !view_workspaces
+                        .iter()
+                        .any(|workspace| workspace._vfs.contains_file(root_file))
+                    {
+                        continue;
+                    }
+                    let source_root_id = self.source_root_for_file(root_file)?;
+                    let source_root = db.source_root(source_root_id).source_root(db);
+
+                    for file_id in source_root.iter() {
+                        let Some(path) = source_root.path_for_file(&file_id).cloned() else {
+                            continue;
+                        };
+                        required_files.entry(path_key(&path)).or_insert((
+                            Some(file_id),
+                            source_root_id,
+                            path,
+                        ));
+                    }
                 }
             }
         }
 
         let mut prepared = Vec::new();
-        for (key, path) in required_files {
+        for (key, (base_file, base_source_root, path)) in required_files {
             if let Some((display_path, text, line_endings)) = open_files.get(&key) {
-                prepared.push((path, display_path.clone(), text.clone(), *line_endings));
+                prepared.push(PreparedOverlayFile {
+                    base_file,
+                    base_source_root,
+                    path,
+                    display_path: display_path.clone(),
+                    text: text.clone(),
+                    line_endings: *line_endings,
+                    is_open: true,
+                });
                 continue;
             }
 
-            let Some(base_file) = self.base_file(workspaces, &path) else {
+            let Some(base_file) = base_file else {
                 continue;
             };
             let text = db.file_text(base_file).text(db).to_string();
             let line_endings = self
-                .loaded_workspaces_in(workspaces)
-                .find_map(|workspace| workspace.line_endings.get(&base_file).copied())
+                .base_line_endings(workspaces, base_file)
                 .unwrap_or_else(|| {
-                    let (_, line_endings) =
-                        crate::line_index::LineEndings::normalize(text.clone());
+                    let (_, line_endings) = crate::line_index::LineEndings::normalize(text.clone());
                     line_endings
                 });
-            prepared.push((path.clone(), path, text, line_endings));
+            prepared.push(PreparedOverlayFile {
+                base_file: Some(base_file),
+                base_source_root,
+                path: path.clone(),
+                display_path: path,
+                text,
+                line_endings,
+                is_open: false,
+            });
         }
 
         Ok(prepared)
@@ -4922,11 +5164,10 @@ impl SharedWorld {
     fn populate_overlay_crates(
         &self,
         overlay: &mut ActiveSessionOverlay,
-        base_file: FileId,
     ) -> anyhow::Result<()> {
         let db = self.host.raw_database();
 
-        for krate in self.host.analysis().crates_for(base_file)? {
+        for &krate in &self.base_crates {
             let root_file = krate.data(db).root_file_id;
             let source_root_id = self.source_root_for_file(root_file)?;
             let source_root = db.source_root(source_root_id).source_root(db);
@@ -4973,66 +5214,33 @@ impl SharedWorld {
         Ok(())
     }
 
-    fn recone_session_overlays(&mut self) -> anyhow::Result<Vec<FileId>> {
-        let session_ids = self.session_overlays.keys().copied().collect::<Vec<_>>();
-        let mut removed_files = Vec::new();
+    fn recone_session_overlays(&mut self) -> anyhow::Result<()> {
+        let overlays = self
+            .session_overlays
+            .iter()
+            .map(|(&session_id, overlay)| {
+                let files = overlay
+                    .open_files
+                    .iter()
+                    .filter_map(|(key, open)| {
+                        let file = overlay.files_by_path.get(key)?;
+                        Some((
+                            file.display_path.clone(),
+                            open.text.clone(),
+                            file.line_endings,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                (session_id, overlay.workspaces.clone(), files)
+            })
+            .collect::<Vec<_>>();
 
-        for session_id in session_ids {
-            let old_overlay = self
-                .session_overlays
-                .remove(&session_id)
-                .unwrap_or_default();
-            let mut overlay = ActiveSessionOverlay {
-                workspaces: old_overlay.workspaces.clone(),
-                ..ActiveSessionOverlay::default()
-            };
-
-            for (key, file) in &old_overlay.files_by_path {
-                let base_file = self.base_file(
-                    &old_overlay.workspaces,
-                    &normalize_vfs_path(&file.path),
-                );
-                let Some(base_file) = base_file else {
-                    removed_files.push(file.overlay_file);
-                    continue;
-                };
-                let base_text = {
-                    let db = self.host.raw_database();
-                    db.file_text(base_file).text(db)
-                };
-                if base_text.as_ref() == file.text.as_str() {
-                    removed_files.push(file.overlay_file);
-                    continue;
-                }
-
-                if let Some(open) = old_overlay.open_files.get(key) {
-                    overlay.open_files.insert(
-                        key.clone(),
-                        OpenOverlayFile {
-                            overlay_file: open.overlay_file,
-                            text: open.text.clone(),
-                        },
-                    );
-                }
-                overlay.path_by_file.insert(file.overlay_file, key.clone());
-                overlay.files_by_path.insert(
-                    key.clone(),
-                    ActiveOverlayFile {
-                        overlay_file: file.overlay_file,
-                        base_source_root: self.source_root_for_file(base_file)?,
-                        path: file.path.clone(),
-                        display_path: file.display_path.clone(),
-                        text: file.text.clone(),
-                        line_endings: file.line_endings,
-                    },
-                );
-                self.populate_overlay_crates(&mut overlay, base_file)?;
-            }
-
-            self.session_overlays.insert(session_id, overlay);
+        for (session_id, workspaces, files) in overlays {
+            let files = self.prepare_session_overlay_files(&workspaces, files)?;
+            self.sync_session_overlay(session_id, &workspaces, files, true)?;
         }
 
-        Ok(removed_files)
+        Ok(())
     }
 
     fn overlay_source_roots(&self) -> anyhow::Result<Vec<SourceRoot>> {
@@ -5250,6 +5458,25 @@ impl SharedWorld {
     fn base_file(&self, workspaces: &[usize], path: &VfsPath) -> Option<FileId> {
         self.loaded_workspaces_in(workspaces)
             .find_map(|workspace| workspace._vfs.file_id(path).map(|(file_id, _)| file_id))
+    }
+
+    fn base_file_exists(&self, workspaces: &[usize], file_id: FileId) -> bool {
+        self.loaded_workspaces_in(workspaces)
+            .any(|workspace| workspace._vfs.exists(file_id))
+    }
+
+    fn base_line_endings(
+        &self,
+        workspaces: &[usize],
+        file_id: FileId,
+    ) -> Option<crate::line_index::LineEndings> {
+        self.loaded_workspaces_in(workspaces).find_map(|workspace| {
+            workspace
+                ._vfs
+                .exists(file_id)
+                .then(|| workspace.line_endings.get(&file_id).copied())
+                .flatten()
+        })
     }
 
     fn source_root_for_file(&self, file_id: FileId) -> anyhow::Result<SourceRootId> {

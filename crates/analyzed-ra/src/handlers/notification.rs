@@ -9,102 +9,48 @@ use lsp_types::DidSaveTextDocumentParams;
 use paths::AbsPathBuf;
 use rustc_hash::FxHashSet;
 use triomphe::Arc;
-use vfs::{ChangeKind, VfsPath};
+use vfs::VfsPath;
 
 use crate::{
     flycheck::{FlycheckHandle, InvocationStrategy, PackageSpecifier, Target},
-    global_state::{FetchWorkspaceRequest, GlobalState, GlobalStateSnapshot},
+    global_state::{GlobalState, GlobalStateSnapshot},
     line_index::LineEndings,
     lsp::from_proto,
-    reload,
     shared_analyzer::SharedBaseFileChange,
     shared_global_state::PendingGlobalStateSnapshot,
-    try_default,
 };
+
+pub(crate) fn clear_native_diagnostics_for_closed_file(
+    state: &mut GlobalState,
+    path: VfsPath,
+) {
+    if let Ok(Some(file_id)) = state.shared.vfs_path_to_file_id(&path) {
+        state.diagnostics.clear_native_for(file_id);
+    }
+}
 
 pub(crate) fn handle_did_save_text_document(
     state: &mut GlobalState,
     params: DidSaveTextDocumentParams,
 ) -> anyhow::Result<()> {
-    if let Ok(vfs_path) = from_proto::vfs_path(&params.text_document.uri) {
-        if state.source_root_config.path_is_library(&vfs_path) {
-            if let Some(path) = vfs_path.as_path() {
-                state.loader.handle.invalidate(path.to_path_buf());
-            }
-        } else {
-            let saved = state
-                .mem_docs
-                .get(&vfs_path)
-                .and_then(|document| std::str::from_utf8(&document.data).ok())
-                .map(|text| LineEndings::normalize(text.to_owned()));
-            if let Some((text, line_endings)) = saved {
-                state
-                    .shared
-                    .apply_base_file_changes(vec![SharedBaseFileChange {
-                        path: vfs_path.clone(),
-                        text,
-                        line_endings,
-                    }])?;
-            }
-        }
-
-        let snap = state.snapshot();
-        let file_id = try_default!(snap.vfs_path_to_file_id(&vfs_path)?);
-        let sr = snap.analysis.source_root_id(file_id)?;
-        drop(snap);
-
-        if state.config.script_rebuild_on_save(Some(sr)) && state.build_deps_changed {
-            state.build_deps_changed = false;
-            state
-                .fetch_build_data_queue
-                .request_op("build_deps_changed - save notification".to_owned(), ());
-        }
-
-        // Re-fetch workspaces if a workspace related file has changed
-        if let Some(path) = vfs_path.as_path() {
-            let additional_files = &state
-                .config
-                .discover_workspace_config()
-                .map(|cfg| cfg.files_to_watch.iter().map(String::as_str).collect::<Vec<&str>>())
-                .unwrap_or_default();
-
-            // FIXME: We should move this check into a QueuedTask and do semantic resolution of
-            // the files. There is only so much we can tell syntactically from the path.
-            if reload::should_refresh_for_change(path, ChangeKind::Modify, additional_files) {
-                state.fetch_workspaces_queue.request_op(
-                    format!("workspace vfs file change saved {path}"),
-                    FetchWorkspaceRequest {
-                        path: Some(path.to_owned()),
-                        force_crate_graph_reload: false,
-                    },
-                );
-            } else if state.detached_files.contains(path) {
-                state.fetch_workspaces_queue.request_op(
-                    format!("detached file saved {path}"),
-                    FetchWorkspaceRequest {
-                        path: Some(path.to_owned()),
-                        force_crate_graph_reload: false,
-                    },
-                );
-            }
-        }
-
-        if !state.config.check_on_save(Some(sr)) {
-            return Ok(());
-        }
-
-        if run_flycheck(state, vfs_path) {
-            return Ok(());
-        }
-    } else if state.config.check_on_save(None) && state.config.flycheck_workspace(None) {
-        // No specific flycheck was triggered, so let's trigger all of them.
-        state.diagnostics.clear_check_all();
-        for flycheck in state.flycheck.iter() {
-            flycheck.restart_workspace(None);
-        }
+    if let Ok(vfs_path) = from_proto::vfs_path(&params.text_document.uri)
+        && !state.source_root_config.path_is_library(&vfs_path)
+        && let Some((text, line_endings)) = state
+            .mem_docs
+            .get(&vfs_path)
+            .and_then(|document| std::str::from_utf8(&document.data).ok())
+            .map(|text| LineEndings::normalize(text.to_owned()))
+    {
+        state
+            .shared
+            .apply_base_file_changes(vec![SharedBaseFileChange {
+                path: vfs_path,
+                exists: true,
+                text: Some(text),
+                line_endings: Some(line_endings),
+            }])?;
     }
-
-    Ok(())
+    crate::handlers::notification::_handle_did_save_text_document(state, params)
 }
 
 pub(crate) fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {

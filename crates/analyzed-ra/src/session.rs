@@ -155,27 +155,22 @@ impl crate::global_state::GlobalState {
                         file_kind,
                         &additional_files,
                     ) {
-                        workspace_structure_change
-                            .get_or_insert((path.to_path_buf(), false));
+                        workspace_structure_change.get_or_insert((path.to_path_buf(), false));
                     }
                 }
 
-                if !file_exists
-                    && let Ok(Some(file_id)) = shared.vfs_path_to_file_id(&vfs_path)
-                {
+                if !file_exists && let Ok(Some(file_id)) = shared.vfs_path_to_file_id(&vfs_path) {
                     self.diagnostics.clear_native_for(file_id);
                 }
 
-                if !file_is_created_or_deleted
-                    && (!self.mem_docs.contains(&vfs_path)
-                        || self.source_root_config.path_is_library(&vfs_path))
-                    && let Some(text) = text
-                    && let Some(&line_endings) = line_endings_map.get(&file.file_id)
+                if !self.mem_docs.contains(&vfs_path)
+                    || self.source_root_config.path_is_library(&vfs_path)
                 {
                     base_file_changes.push(SharedBaseFileChange {
                         path: vfs_path,
+                        line_endings: line_endings_map.get(&file.file_id).copied(),
+                        exists: file_exists,
                         text,
-                        line_endings,
                     });
                 }
             }
@@ -185,6 +180,8 @@ impl crate::global_state::GlobalState {
             tracing::error!("failed to apply shared analyzer base file changes: {error}");
             return (false, None);
         }
+        let generation_changed_after_changes = shared.config_generation_changed();
+        let force_overlay_rebuild = generation_changed || generation_changed_after_changes;
 
         if changed || generation_changed {
             let open_files = self
@@ -199,39 +196,21 @@ impl crate::global_state::GlobalState {
                 })
                 .collect::<Vec<_>>();
 
-            let overlay_needed = match shared.overlay_needed(&open_files) {
-                Ok(needed) => needed,
+            let sync_start = Instant::now();
+            let sync = match shared.sync_open_files(open_files, force_overlay_rebuild) {
+                Ok(sync) => sync,
                 Err(error) => {
-                    tracing::error!("failed to check shared analyzer overlay: {error}");
+                    tracing::error!("failed to sync shared analyzer overlay: {error}");
                     return (false, None);
                 }
             };
-            if overlay_needed {
-                let overlay_files = match shared.prepare_overlay_files(open_files) {
-                    Ok(files) => files,
-                    Err(error) => {
-                        tracing::error!(
-                            "failed to prepare shared analyzer overlay: {error}"
-                        );
-                        return (false, None);
-                    }
-                };
-                let sync_start = Instant::now();
-                let sync = match shared.sync_open_files(overlay_files) {
-                    Ok(sync) => sync,
-                    Err(error) => {
-                        tracing::error!("failed to sync shared analyzer overlay: {error}");
-                        return (false, None);
-                    }
-                };
-                cancellation_time = Some(sync_start.elapsed());
+            cancellation_time = Some(sync_start.elapsed());
 
-                if sync.changed {
-                    changed = true;
-                }
-                for file_id in sync.removed_files {
-                    self.diagnostics.clear_native_for(file_id);
-                }
+            if sync.changed {
+                changed = true;
+            }
+            for file_id in sync.removed_files {
+                self.diagnostics.clear_native_for(file_id);
             }
         }
 

@@ -916,21 +916,26 @@ pub fn extract(
     let function_node: ast::Fn = named(&root, function)?;
     let function_level = IndentLevel::from_node(function_node.syntax());
     let selection = select(&function_node)?;
-    let call = make::expr_method_call(
-        make::ext::expr_self(),
-        make::name_ref(method.name),
-        make::arg_list(
-            method
-                .args
-                .iter()
-                .map(|arg| expr_node(arg))
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
+    let arguments = make::arg_list(
+        method
+            .args
+            .iter()
+            .map(|arg| expr_node(arg))
+            .collect::<Result<Vec<_>, _>>()?,
     );
+    let call: ast::Expr = match method.receiver {
+        Some(_) => make::expr_method_call(
+            make::ext::expr_self(),
+            make::name_ref(method.name),
+            arguments,
+        )
+        .into(),
+        None => make::expr_call(path_expr(method.name)?, arguments).into(),
+    };
     let mut body = match selection.kind {
         SelectionKind::Statement { statement } => {
             let region = vec![SyntaxElement::from(statement.clone())];
-            editor.replace(&statement, make::expr_stmt(call.into()).syntax().clone());
+            editor.replace(&statement, make::expr_stmt(call).syntax().clone());
             region
         }
         SelectionKind::LoopBody { list } => {
@@ -949,7 +954,7 @@ pub fn extract(
                 inner.clone(),
                 vec![
                     make::tokens::whitespace(&format!("\n{call_indent}")).into(),
-                    make::expr_stmt(call.into()).syntax().clone().into(),
+                    make::expr_stmt(call).syntax().clone().into(),
                     make::tokens::whitespace(&format!("\n{close_indent}")).into(),
                 ],
             )?;
@@ -1021,7 +1026,7 @@ pub fn extract(
                 range.clone(),
                 vec![
                     make::tokens::whitespace(&format!("\n{call_indent}")).into(),
-                    make::expr_stmt(call.into()).syntax().clone().into(),
+                    make::expr_stmt(call).syntax().clone().into(),
                     make::tokens::whitespace(&format!("\n{function_level}")).into(),
                 ],
             )?;

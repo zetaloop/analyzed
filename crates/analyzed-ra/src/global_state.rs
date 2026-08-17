@@ -165,10 +165,16 @@ impl GlobalStateSnapshot {
     }
 
     pub(crate) fn file_line_index(&self, id: FileId) -> Cancellable<LineIndex> {
-        let endings = self.shared.line_endings(id).expect("shared line endings");
         let index = self.analysis.file_line_index(id)?;
+        let Some(endings) = self.shared.line_endings(id) else {
+            return Err(ide_db::base_db::salsa::Cancelled::Local);
+        };
         let encoding = self.config.caps().negotiated_encoding();
-        Ok(LineIndex { index, endings, encoding })
+        Ok(LineIndex {
+            index,
+            endings,
+            encoding,
+        })
     }
 
     pub(crate) fn file_version(&self, id: FileId) -> Option<i32> {
