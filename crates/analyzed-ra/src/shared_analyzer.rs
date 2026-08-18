@@ -188,6 +188,7 @@ struct SharedAnalyzerGcState {
 struct SharedWorldAccess {
     state: Mutex<SharedWorldAccessState>,
     ready: Condvar,
+    overlay_update: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -993,7 +994,6 @@ impl SharedAnalyzerRegistry {
                             anyhow::format_err!("shared world mutex is poisoned: {error}")
                         })?
                         .access();
-                    let _read = access.read(0);
                     world
                         .lock()
                         .map_err(|error| {
@@ -2980,6 +2980,12 @@ impl SharedAnalyzerRuntime {
         files: Vec<(VfsPath, String, crate::line_index::LineEndings)>,
         force_rebuild: bool,
     ) -> anyhow::Result<SharedOverlaySync> {
+        let _overlay_update = self
+            .session
+            .access
+            .overlay_update
+            .lock()
+            .expect("shared overlay update mutex poisoned");
         let _read = self.session.access.read(self.session_id());
         let files = {
             let world = self
