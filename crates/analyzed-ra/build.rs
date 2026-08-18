@@ -645,6 +645,7 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         "pub(crate)",
     )?;
     for name in [
+        "compute_priming_scope",
         "process_changes",
         "url_to_file_id",
         "file_id_to_url",

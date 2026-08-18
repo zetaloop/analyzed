@@ -103,6 +103,10 @@ impl GlobalState {
         self.process_shared_changes()
     }
 
+    pub(crate) fn compute_priming_scope(&self) -> triomphe::Arc<[Crate]> {
+        self.shared.priming_scope()
+    }
+
     pub(crate) fn pending_snapshot(&self) -> PendingGlobalStateSnapshot {
         let analysis = self.shared.pending_analysis();
         let config = self.config.clone();
