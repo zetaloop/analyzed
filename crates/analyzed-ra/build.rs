@@ -28,19 +28,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let release = if offline_build() {
         pinned
     } else {
-        match rust_analyzer_release(revision) {
-            Ok((release, tag)) => {
+        match rust_analyzer_release(revision, &pinned_tag) {
+            Ok(release) => {
                 if release != pinned {
                     return Err(format!(
                         "[package.metadata.upstream] release is {pinned}, but the rust-analyzer \
                          release for commit {revision} is {release}"
-                    )
-                    .into());
-                }
-                if tag != pinned_tag {
-                    return Err(format!(
-                        "[package.metadata.upstream] tag is {pinned_tag}, but the rust-analyzer \
-                         release tag for commit {revision} is {tag}"
                     )
                     .into());
                 }
@@ -116,13 +109,13 @@ impl fmt::Display for GithubUnavailable {
 
 impl Error for GithubUnavailable {}
 
-fn rust_analyzer_release(revision: &str) -> Result<(String, String), Box<dyn Error>> {
+fn rust_analyzer_release(revision: &str, tag: &str) -> Result<String, Box<dyn Error>> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(30)))
         .build()
         .new_agent();
 
-    let tag = rust_analyzer_release_tag(&agent, revision)?;
+    verify_rust_analyzer_release_tag(&agent, revision, tag)?;
     let runs = github_get(
         &agent,
         &format!(
@@ -139,7 +132,7 @@ fn rust_analyzer_release(revision: &str) -> Result<(String, String), Box<dyn Err
         .collect::<Vec<_>>();
 
     match numbers.as_slice() {
-        [number] => Ok((format!("v0.3.{number}"), tag)),
+        [number] => Ok(format!("v0.3.{number}")),
         [] => Err(GithubUnavailable(format!(
             "no release workflow run records commit {revision}; GitHub retains run history \
              for about 400 days"
@@ -157,42 +150,29 @@ fn rust_analyzer_release(revision: &str) -> Result<(String, String), Box<dyn Err
     }
 }
 
-fn rust_analyzer_release_tag(
+fn verify_rust_analyzer_release_tag(
     agent: &ureq::Agent,
     revision: &str,
-) -> Result<String, Box<dyn Error>> {
-    let refs = github_get(
-        agent,
-        &format!("/repos/{RA_REPOSITORY}/git/matching-refs/tags/"),
-    )?;
-    let refs = refs
-        .as_array()
-        .ok_or("GitHub matching refs response is not an array")?;
-    let mut tags = refs
-        .iter()
-        .filter_map(|reference| {
-            let object = reference.get("object")?;
-            if object.get("type")?.as_str()? != "commit" {
-                return None;
-            }
-            if object.get("sha")?.as_str()? != revision {
-                return None;
-            }
-            reference.get("ref")?.as_str()?.strip_prefix("refs/tags/")
-        })
-        .filter(|tag| *tag != "nightly")
-        .collect::<Vec<_>>();
-    tags.sort();
-
-    match tags.as_slice() {
-        [tag] => Ok((*tag).to_owned()),
-        [] => Err(format!("no rust-analyzer release tag points to commit {revision}").into()),
-        tags => Err(format!(
-            "multiple rust-analyzer release tags point to commit {revision}: {}",
-            tags.join(", ")
-        )
-        .into()),
+    tag: &str,
+) -> Result<(), Box<dyn Error>> {
+    let reference = github_get(agent, &format!("/repos/{RA_REPOSITORY}/git/ref/tags/{tag}"))?;
+    let object = reference
+        .get("object")
+        .ok_or("GitHub tag response has no object")?;
+    if object.get("type").and_then(serde_json::Value::as_str) != Some("commit") {
+        return Err(format!("rust-analyzer release tag {tag} is not a commit ref").into());
     }
+    let tag_revision = object
+        .get("sha")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("GitHub tag response has no commit SHA")?;
+    if tag_revision != revision {
+        return Err(format!(
+            "rust-analyzer release tag {tag} points to commit {tag_revision}, not {revision}"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn github_get(agent: &ureq::Agent, path: &str) -> Result<serde_json::Value, Box<dyn Error>> {
