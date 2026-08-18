@@ -15,6 +15,7 @@ crossbeam-channel.workspace = true
 lsp-server.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+stdx = { version = "=0.0.348", package = "ra_ap_stdx" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

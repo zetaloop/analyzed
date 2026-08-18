@@ -797,6 +797,7 @@ fn initialize_rayon() {
     RAYON.call_once(|| {
         _ = rayon::ThreadPoolBuilder::new()
             .thread_name(|index| format!("RayonWorker{index}"))
+            .stack_size(stdx::thread::DEFAULT_STACK_SIZE)
             .build_global();
     });
 }

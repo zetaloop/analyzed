@@ -57,6 +57,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "lsp-server",
+ "ra_ap_stdx",
  "serde",
  "serde_json",
  "windows-sys 0.61.2",

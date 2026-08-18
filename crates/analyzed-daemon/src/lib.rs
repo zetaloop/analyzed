@@ -240,16 +240,19 @@ pub fn run_foreground(paths: RuntimePaths, startup_lock_owned: bool) -> anyhow::
     loop {
         let stream = accept_client(&mut listener)?;
         let state = Arc::clone(&state);
-        thread::spawn(move || {
-            state.client_sessions.fetch_add(1, Ordering::SeqCst);
-            let session_id = state.next_session_id.fetch_add(1, Ordering::SeqCst);
-            let result = handle_client(stream, state.clone(), session_id);
-            state.client_sessions.fetch_sub(1, Ordering::SeqCst);
+        stdx::thread::Builder::new(stdx::thread::ThreadIntent::LatencySensitive, "LspServer")
+            .allow_leak(true)
+            .spawn(move || {
+                state.client_sessions.fetch_add(1, Ordering::SeqCst);
+                let session_id = state.next_session_id.fetch_add(1, Ordering::SeqCst);
+                let result = handle_client(stream, state.clone(), session_id);
+                state.client_sessions.fetch_sub(1, Ordering::SeqCst);
 
-            if let Err(error) = result {
-                eprintln!("{error}");
-            }
-        });
+                if let Err(error) = result {
+                    eprintln!("{error}");
+                }
+            })
+            .expect("failed to spawn LSP session");
     }
 }
 
