@@ -16,7 +16,6 @@ struct TargetSpec {
     triple: &'static str,
     runner: &'static str,
     container: Option<&'static str>,
-    zig_glibc: Option<&'static str>,
     features: &'static [&'static str],
     rustflags: &'static [&'static str],
     pgo: bool,
@@ -27,7 +26,6 @@ const TARGETS: &[TargetSpec] = &[
         triple: "x86_64-pc-windows-msvc",
         runner: "windows-latest",
         container: None,
-        zig_glibc: None,
         features: &["mimalloc"],
         rustflags: &["-Ctarget-feature=+crt-static"],
         pgo: true,
@@ -36,7 +34,6 @@ const TARGETS: &[TargetSpec] = &[
         triple: "i686-pc-windows-msvc",
         runner: "windows-latest",
         container: None,
-        zig_glibc: None,
         features: &["mimalloc"],
         rustflags: &["-Ctarget-feature=+crt-static"],
         pgo: true,
@@ -45,7 +42,6 @@ const TARGETS: &[TargetSpec] = &[
         triple: "aarch64-pc-windows-msvc",
         runner: "windows-11-arm",
         container: None,
-        zig_glibc: None,
         features: &["mimalloc"],
         rustflags: &["-Ctarget-feature=+crt-static"],
         pgo: true,
@@ -54,7 +50,6 @@ const TARGETS: &[TargetSpec] = &[
         triple: "x86_64-unknown-linux-gnu",
         runner: "ubuntu-latest",
         container: Some("quay.io/pypa/manylinux_2_28_x86_64"),
-        zig_glibc: None,
         features: &[],
         rustflags: &[],
         pgo: true,
@@ -63,7 +58,6 @@ const TARGETS: &[TargetSpec] = &[
         triple: "aarch64-unknown-linux-gnu",
         runner: "ubuntu-24.04-arm",
         container: Some("quay.io/pypa/manylinux_2_28_aarch64"),
-        zig_glibc: None,
         features: &[],
         rustflags: &[],
         pgo: true,
@@ -71,8 +65,7 @@ const TARGETS: &[TargetSpec] = &[
     TargetSpec {
         triple: "arm-unknown-linux-gnueabihf",
         runner: "ubuntu-latest",
-        container: None,
-        zig_glibc: Some("2.28"),
+        container: Some("debian:10"),
         features: &[],
         rustflags: &[],
         pgo: false,
@@ -81,7 +74,6 @@ const TARGETS: &[TargetSpec] = &[
         triple: "x86_64-apple-darwin",
         runner: "macos-14",
         container: None,
-        zig_glibc: None,
         features: &[],
         rustflags: &[],
         pgo: true,
@@ -90,7 +82,6 @@ const TARGETS: &[TargetSpec] = &[
         triple: "aarch64-apple-darwin",
         runner: "macos-14",
         container: None,
-        zig_glibc: None,
         features: &[],
         rustflags: &[],
         pgo: true,
@@ -99,7 +90,6 @@ const TARGETS: &[TargetSpec] = &[
         triple: "x86_64-unknown-linux-musl",
         runner: "ubuntu-latest",
         container: Some("rust:alpine"),
-        zig_glibc: None,
         features: &[],
         // the dynamic musl link needs lld under the alpine clang toolchain
         rustflags: &["-Clink-arg=-fuse-ld=lld", "-Ctarget-feature=-crt-static"],
@@ -133,7 +123,6 @@ pub(crate) fn matrix() {
                 "target": spec.triple,
                 "os": spec.runner,
                 "container": spec.container,
-                "zig": spec.zig_glibc.is_some(),
                 "pgo": spec.pgo,
             })
         })
@@ -142,11 +131,6 @@ pub(crate) fn matrix() {
 }
 
 fn build(sh: &Shell, target: &Target, training_dir: Option<PathBuf>) -> anyhow::Result<()> {
-    let command = if target.spec.zig_glibc.is_some() {
-        "zigbuild"
-    } else {
-        "build"
-    };
     let cargo_target = &target.cargo_target;
     let features: Vec<&str> = target
         .spec
@@ -161,7 +145,7 @@ fn build(sh: &Shell, target: &Target, training_dir: Option<PathBuf>) -> anyhow::
         with_rustflags(
             cmd!(
                 sh,
-                "cargo {command} -p analyzed --target {cargo_target} {features...} --release"
+                "cargo build -p analyzed --target {cargo_target} {features...} --release"
             ),
             &rustflags,
         )
@@ -284,10 +268,7 @@ impl Target {
             .iter()
             .find(|spec| spec.triple == triple)
             .with_context(|| format!("{triple} is not a release target"))?;
-        let cargo_target = match spec.zig_glibc {
-            Some(glibc) => format!("{}.{glibc}", spec.triple),
-            None => spec.triple.to_owned(),
-        };
+        let cargo_target = spec.triple.to_owned();
         let out_dir = project_root()
             .join("target")
             .join(spec.triple)

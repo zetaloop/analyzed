@@ -19,8 +19,6 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
-  ZIG_VERSION: 0.13.0
-  ZIGBUILD_VERSION: 0.19.8
   PGO_TRAINING_REPO: clap-rs/clap
   PGO_TRAINING_REF: v4.5.36
 
@@ -83,6 +81,14 @@ jobs:
         if: matrix.container == 'rust:alpine'
         run: apk add --no-cache git clang lld musl-dev
 
+      - name: Install target dependencies
+        if: matrix.target == 'arm-unknown-linux-gnueabihf'
+        run: |
+          sed -i -e 's/deb.debian.org/archive.debian.org/g' -e 's/security.debian.org/archive.debian.org/g' -e '/buster-updates/d' /etc/apt/sources.list
+          apt-get update
+          apt-get dist-upgrade -y
+          apt-get install -y curl gcc gcc-8-arm-linux-gnueabihf
+
       - name: Checkout repository
         uses: actions/checkout@v7
 
@@ -98,13 +104,6 @@ jobs:
           rustup update --no-self-update stable
           rustup component add rust-src ${{ matrix.pgo && 'llvm-tools' || '' }}
           rustup target add ${{ matrix.target }}
-
-      - name: Install Zig toolchain
-        if: matrix.zig
-        run: |
-          curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-$(uname -m)-${ZIG_VERSION}.tar.xz" | sudo tar JxC /usr/local
-          sudo ln -s "/usr/local/zig-linux-$(uname -m)-${ZIG_VERSION}/zig" /usr/local/bin/zig
-          curl -L "https://github.com/rust-cross/cargo-zigbuild/releases/download/v${ZIGBUILD_VERSION}/cargo-zigbuild-v${ZIGBUILD_VERSION}.x86_64-unknown-linux-musl.tar.gz" | tar zxC ~/.cargo/bin
 
       - name: Install cargo-pgo
         if: matrix.pgo
