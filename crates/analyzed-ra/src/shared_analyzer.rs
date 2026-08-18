@@ -27,8 +27,7 @@ use load_cargo::{
 use lsp_types::Uri;
 use proc_macro_api::ProcMacroClient;
 use project_model::{
-    CargoConfig, ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, TargetKind,
-    WorkspaceBuildScripts,
+    CargoConfig, ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, WorkspaceBuildScripts,
 };
 use vfs::{AbsPathBuf, Vfs, VfsPath};
 
@@ -1941,12 +1940,20 @@ impl SharedAnalyzerRuntimeWeak {
 }
 
 impl SharedAnalyzerRuntime {
-    pub(crate) fn priming_scope(&self) -> triomphe::Arc<[ide::Crate]> {
+    pub(crate) fn priming_scope(
+        &self,
+        state: &crate::global_state::GlobalState,
+    ) -> triomphe::Arc<[ide::Crate]> {
         self.session
             .world
             .lock()
             .expect("shared world mutex poisoned")
-            .priming_scope(&self.session.workspace_indexes)
+            .priming_scope(
+                self.session_id(),
+                &self.session.workspace_indexes,
+                &self.session.excluded_paths,
+                state,
+            )
     }
 
     fn new(
@@ -4730,23 +4737,33 @@ impl SharedWorld {
             .collect()
     }
 
-    fn priming_scope(&self, workspaces: &[usize]) -> triomphe::Arc<[ide::Crate]> {
+    fn priming_scope(
+        &self,
+        session_id: u64,
+        workspaces: &[usize],
+        excluded_paths: &[String],
+        state: &crate::global_state::GlobalState,
+    ) -> triomphe::Arc<[ide::Crate]> {
         let db = self.host.raw_database();
-        let view_workspaces = self.loaded_workspaces_in(workspaces).collect::<Vec<_>>();
+        let visible_roots =
+            self.session_visible_crate_roots(session_id, workspaces, excluded_paths);
+        let mappings = self.session_file_mappings(session_id, workspaces);
         let root_to_crates: FxHashMap<AbsPathBuf, Vec<ide::Crate>> = {
             let mut root_to_crates: FxHashMap<AbsPathBuf, Vec<ide::Crate>> =
                 FxHashMap::default();
-            for &krate in &self.base_crates {
+            for &krate in &*all_crates(db) {
                 let root_file = krate.data(db).root_file_id;
-                let Some(path) = view_workspaces
-                    .iter()
-                    .find_map(|workspace| workspace._vfs.path(root_file))
-                    .and_then(|path| path.as_path())
+                if !visible_roots.contains(&root_file) {
+                    continue;
+                }
+                let Some(path) = mappings
+                    .path(root_file)
+                    .and_then(|path| path.as_path().map(ToOwned::to_owned))
                 else {
                     continue;
                 };
                 root_to_crates
-                    .entry(path.to_path_buf())
+                    .entry(path)
                     .or_default()
                     .push(krate);
             }
@@ -4754,41 +4771,7 @@ impl SharedWorld {
         };
 
         let mut seed: FxHashSet<ide::Crate> = FxHashSet::default();
-        for workspace in view_workspaces {
-            match &workspace.workspace.kind {
-                ProjectWorkspaceKind::Cargo { cargo, .. }
-                | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, ..)), .. } => {
-                    for pkg in cargo.packages() {
-                        if !cargo[pkg].is_local {
-                            continue;
-                        }
-                        for &target in &cargo[pkg].targets {
-                            if !matches!(
-                                cargo[target].kind,
-                                TargetKind::Lib { .. } | TargetKind::Bin
-                            ) {
-                                continue;
-                            }
-                            if let Some(krates) = root_to_crates.get(&*cargo[target].root) {
-                                seed.extend(krates.iter().copied());
-                            }
-                        }
-                    }
-                }
-                ProjectWorkspaceKind::Json(project_json) => seed.extend(
-                    project_json
-                        .crates()
-                        .filter(|(_, krate)| krate.is_workspace_member)
-                        .filter_map(|(_, krate)| root_to_crates.get(&krate.root_module))
-                        .flat_map(|it| it.iter().copied()),
-                ),
-                ProjectWorkspaceKind::DetachedFile { file, cargo: None } => {
-                    if let Some(krates) = root_to_crates.get(&**file) {
-                        seed.extend(krates.iter().copied());
-                    }
-                }
-            }
-        }
+        state.extend_priming_scope(&root_to_crates, &mut seed);
 
         crate::priming_scope::compute(db, seed)
     }

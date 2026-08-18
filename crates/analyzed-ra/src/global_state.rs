@@ -104,7 +104,7 @@ impl GlobalState {
     }
 
     pub(crate) fn compute_priming_scope(&self) -> triomphe::Arc<[Crate]> {
-        self.shared.priming_scope()
+        self.shared.priming_scope(self)
     }
 
     pub(crate) fn pending_snapshot(&self) -> PendingGlobalStateSnapshot {

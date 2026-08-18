@@ -644,6 +644,38 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
         "target_spec_from_workspaces",
         "pub(crate)",
     )?;
+    build_support::extract(
+        &mut source,
+        "compute_priming_scope",
+        |function| {
+            let loop_expr = build_support::one(
+                build_support::for_loops(function).filter(|loop_expr| {
+                    build_support::arms(loop_expr, "ProjectWorkspaceKind", "Cargo")
+                        .next()
+                        .is_some()
+                }),
+                "workspace loop in `compute_priming_scope`",
+            )?;
+            build_support::stmt(&loop_expr)
+        },
+        build_support::Method {
+            name: "extend_priming_scope",
+            receiver: Some("&self"),
+            params: &[
+                build_support::Param {
+                    name: "root_to_crate",
+                    ty: "&FxHashMap<AbsPathBuf, Vec<Crate>>",
+                },
+                build_support::Param {
+                    name: "seed",
+                    ty: "&mut FxHashSet<Crate>",
+                },
+            ],
+            args: &["&root_to_crate", "&mut seed"],
+            return_ty: None,
+        },
+    )?;
+    build_support::set_visibility::<ast::Fn>(&mut source, "extend_priming_scope", "pub(crate)")?;
     for name in [
         "compute_priming_scope",
         "process_changes",
