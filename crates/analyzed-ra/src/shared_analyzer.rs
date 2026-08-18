@@ -5059,7 +5059,6 @@ impl SharedWorld {
         let mut required_files =
             BTreeMap::<String, (Option<FileId>, SourceRootId, VfsPath)>::new();
         let db = self.host.raw_database();
-        let analysis = self.host.analysis();
         let view_workspaces = self.loaded_workspaces_in(workspaces).collect::<Vec<_>>();
 
         for (path, _, _) in open_files.values() {
@@ -5084,20 +5083,12 @@ impl SharedWorld {
                 source_path,
             ));
 
-            let seed_crates = match base_file {
-                Some(base_file) => analysis.crates_for(base_file)?,
-                None => self
-                    .base_crates
-                    .iter()
-                    .copied()
-                    .filter(|krate| {
-                        self.source_root_for_file(krate.data(db).root_file_id).ok()
-                            == Some(base_source_root)
-                    })
-                    .collect(),
-            };
+            let seed_crates = self.base_crates.iter().copied().filter(|krate| {
+                self.source_root_for_file(krate.data(db).root_file_id).ok()
+                    == Some(base_source_root)
+            });
             for krate in seed_crates {
-                for krate in analysis.transitive_rev_deps(krate)? {
+                for krate in krate.transitive_rev_deps(db) {
                     let root_file = krate.data(db).root_file_id;
                     if !view_workspaces
                         .iter()

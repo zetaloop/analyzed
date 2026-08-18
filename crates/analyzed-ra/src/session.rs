@@ -30,6 +30,7 @@ struct ActiveSession(SharedAnalyzerRuntime);
 impl Drop for ActiveSession {
     fn drop(&mut self) {
         self.0.retire();
+        self.0.cancel_operations("shared analyzer session exited");
     }
 }
 
