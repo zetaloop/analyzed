@@ -14,6 +14,7 @@ use crate::{
 
 pub(crate) struct PendingGlobalStateSnapshot {
     pub(crate) analysis: crate::shared_analyzer::SharedAnalyzerPendingAnalysis,
+    task_receiver: crossbeam_channel::Receiver<crate::main_loop::Task>,
     snapshot: std::panic::AssertUnwindSafe<
         StdArc<dyn Fn(ide::Analysis) -> GlobalStateSnapshot + Send + Sync>,
     >,
@@ -23,6 +24,7 @@ impl Clone for PendingGlobalStateSnapshot {
     fn clone(&self) -> Self {
         Self {
             analysis: self.analysis.clone(),
+            task_receiver: self.task_receiver.clone(),
             snapshot: std::panic::AssertUnwindSafe(StdArc::clone(&self.snapshot.0)),
         }
     }
@@ -109,6 +111,7 @@ impl GlobalState {
 
     pub(crate) fn pending_snapshot(&self) -> PendingGlobalStateSnapshot {
         let analysis = self.shared.pending_analysis();
+        let task_receiver = self.task_pool.receiver.clone();
         let config = self.config.clone();
         let check_fixes = self.diagnostics.check_fixes.clone();
         let mem_docs = self.mem_docs.clone();
@@ -137,7 +140,11 @@ impl GlobalState {
             minicore: minicore.clone(),
             shared: shared.clone(),
         }) as StdArc<dyn Fn(ide::Analysis) -> GlobalStateSnapshot + Send + Sync>);
-        PendingGlobalStateSnapshot { analysis, snapshot }
+        PendingGlobalStateSnapshot {
+            analysis,
+            task_receiver,
+            snapshot,
+        }
     }
 }
 
