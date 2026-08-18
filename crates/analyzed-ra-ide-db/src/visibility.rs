@@ -1,8 +1,7 @@
-use std::sync::Arc;
+use std::{ops::ControlFlow, sync::Arc};
 
-use base_db::{Crate as BaseCrate, LocalRoots, source_root_crates};
-use hir::{Crate as HirCrate, Module, symbols::FileSymbol};
-use itertools::Itertools;
+use base_db::{Crate as BaseCrate, SourceRootId};
+use hir::{Crate as HirCrate, symbols::FileSymbol};
 use rustc_hash::FxHashSet;
 use vfs::FileId;
 
@@ -46,9 +45,18 @@ impl RootDatabase {
     }
 }
 
-pub(crate) fn is_symbol_visible(db: &RootDatabase, symbol: &FileSymbol<'_>) -> bool {
-    let file_id = symbol.loc.hir_file_id.original_file(db).file_id(db);
-    db.is_file_visible(file_id)
+pub(crate) trait CrateVisibility {
+    fn visible_reverse_dependencies(self, db: &RootDatabase) -> Vec<HirCrate>;
+}
+
+impl CrateVisibility for HirCrate {
+    fn visible_reverse_dependencies(self, db: &RootDatabase) -> Vec<HirCrate> {
+        db.visible_hir_crates(self.transitive_reverse_dependencies(db))
+    }
+}
+
+pub(crate) fn source_root_crates(db: &RootDatabase, root: SourceRootId) -> Vec<BaseCrate> {
+    db.visible_base_crates(base_db::source_root_crates(db, root).iter().copied())
 }
 
 pub(crate) fn all_crates(db: &RootDatabase) -> Vec<BaseCrate> {
@@ -59,60 +67,16 @@ pub(crate) fn all_hir_crates(db: &RootDatabase) -> Vec<HirCrate> {
     db.visible_hir_crates(HirCrate::all(db))
 }
 
-pub(crate) fn resolve_path_to_modules(
-    db: &RootDatabase,
-    path_filter: &[String],
-    anchor_to_crate: bool,
-    case_sensitive: bool,
-) -> Vec<Module> {
-    let [first_segment, rest_segments @ ..] = path_filter else {
-        return Vec::new();
-    };
-
-    let names_match = |actual: &str, expected: &str| {
-        if case_sensitive { actual == expected } else { actual.eq_ignore_ascii_case(expected) }
-    };
-
-    let mut candidates = all_hir_crates(db)
-        .into_iter()
-        .filter(|krate| {
-            krate
-                .display_name(db)
-                .is_some_and(|name| names_match(name.crate_name().as_str(), first_segment))
-        })
-        .map(|krate| (krate.root_module(db), krate.origin(db).is_local()))
-        .collect::<Vec<_>>();
-
-    if !anchor_to_crate {
-        for &root in LocalRoots::get(db).roots(db) {
-            for krate in db.visible_base_crates(source_root_crates(db, root).iter().copied()) {
-                let root_module = HirCrate::from(krate).root_module(db);
-                candidates.extend(root_module.children(db).filter_map(|child| {
-                    let name = child.name(db)?;
-                    names_match(name.as_str(), first_segment).then_some((child, true))
-                }));
-            }
+pub(crate) fn visible_symbols<'db, T>(
+    db: &'db RootDatabase,
+    mut callback: impl FnMut(&'db FileSymbol<'db>) -> ControlFlow<T>,
+) -> impl FnMut(&'db FileSymbol<'db>) -> ControlFlow<T> {
+    move |symbol| {
+        if db.is_file_visible(symbol.loc.hir_file_id.original_file(db).file_id(db)) {
+            callback(symbol)
+        } else {
+            ControlFlow::Continue(())
         }
     }
-
-    for segment in rest_segments {
-        candidates = candidates
-            .into_iter()
-            .flat_map(|(module, local)| {
-                module
-                    .modules_in_scope(db, !local)
-                    .into_iter()
-                    .filter(|(name, _)| names_match(name.as_str(), segment))
-                    .map(move |(_, module)| (module, local))
-            })
-            .unique()
-            .collect();
-
-        if candidates.is_empty() {
-            break;
-        }
-    }
-
-    candidates.into_iter().map(|(module, _)| module).collect()
 }
 
