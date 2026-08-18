@@ -25,15 +25,6 @@ pub(crate) struct Session {
     state: crate::global_state::GlobalState,
 }
 
-struct ActiveSession(SharedAnalyzerRuntime);
-
-impl Drop for ActiveSession {
-    fn drop(&mut self) {
-        self.0.retire();
-        self.0.cancel_operations("shared analyzer session exited");
-    }
-}
-
 impl Session {
     pub(crate) fn new(
         sender: Sender<Message>,
@@ -48,7 +39,6 @@ impl Session {
     }
 
     pub(crate) fn run_shared(self, receiver: Receiver<Message>) -> anyhow::Result<()> {
-        let _active = ActiveSession(self.state.shared.clone());
         self.state.run(receiver)
     }
 }

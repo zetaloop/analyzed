@@ -697,7 +697,30 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     build_support::rename::<ast::Fn>(&mut source, "main_loop", "_main_loop")?;
     build_support::add_attr::<ast::Fn>(&mut source, "_main_loop", "#[allow(dead_code)]")?;
     build_support::set_visibility::<ast::Fn>(&mut source, "_main_loop", "pub(crate)")?;
-    build_support::set_visibility::<ast::Fn>(&mut source, "run", "pub(crate)")?;
+    build_support::extract(
+        &mut source,
+        "run",
+        |function| {
+            let start = build_support::one(
+                build_support::calls(function, "update_status_or_notify"),
+                "`update_status_or_notify` call in `run`",
+            )?;
+            build_support::through_tail(&start, function)
+        },
+        build_support::Method {
+            name: "run_loop",
+            receiver: Some("&mut self"),
+            params: &[build_support::Param {
+                name: "inbox",
+                ty: "Receiver<lsp_server::Message>",
+            }],
+            args: &["inbox"],
+            return_ty: Some("anyhow::Result<()>"),
+        },
+    )?;
+    build_support::set_visibility::<ast::Fn>(&mut source, "run_loop", "pub(crate)")?;
+    build_support::rename::<ast::Fn>(&mut source, "run", "_run")?;
+    build_support::add_attr::<ast::Fn>(&mut source, "_run", "#[allow(dead_code)]")?;
     build_support::set_visibility::<ast::Enum>(&mut source, "Event", "pub(crate)")?;
     build_support::append::<ast::Enum>(
         &mut source,

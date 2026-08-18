@@ -40,6 +40,26 @@ pub(crate) struct SnapshotReplay {
     token: crate::shared_analyzer::SharedAnalyzerSnapshotToken,
 }
 
+struct ActiveSession<'a>(&'a mut GlobalState);
+
+impl ActiveSession<'_> {
+    fn run(
+        &mut self,
+        inbox: crossbeam_channel::Receiver<lsp_server::Message>,
+    ) -> anyhow::Result<()> {
+        self.0.run_loop(inbox)
+    }
+}
+
+impl Drop for ActiveSession<'_> {
+    fn drop(&mut self) {
+        self.0.shared.retire();
+        self.0
+            .shared
+            .cancel_operations("shared analyzer session exited");
+    }
+}
+
 impl SnapshotReplay {
     pub(crate) fn replayable(&self) -> bool {
         self.token.replayable()
@@ -56,6 +76,13 @@ impl SnapshotReplay {
 }
 
 impl GlobalState {
+    pub(crate) fn run(
+        mut self,
+        inbox: crossbeam_channel::Receiver<lsp_server::Message>,
+    ) -> anyhow::Result<()> {
+        ActiveSession(&mut self).run(inbox)
+    }
+
     pub(crate) fn new(
         sender: crossbeam_channel::Sender<lsp_server::Message>,
         config: crate::config::Config,
