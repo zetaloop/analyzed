@@ -125,6 +125,13 @@ struct SharedAnalyzerWorkspaceLoad {
     ready: Condvar,
 }
 
+struct SharedAnalyzerWorkspaceLoadGuard<'a> {
+    registry: &'a SharedAnalyzerRegistry,
+    key: &'a SharedAnalyzerWorkspaceLoadKey,
+    load: &'a SharedAnalyzerWorkspaceLoad,
+    completed: bool,
+}
+
 pub(crate) struct SharedAnalyzerReload {
     pending_loads: Vec<Arc<SharedAnalyzerWorkspaceLoad>>,
     pending_normal_operations: Vec<Arc<SharedAnalyzerReload>>,
@@ -979,6 +986,12 @@ impl SharedAnalyzerRegistry {
             let load = load.expect("shared analyzer load was registered");
             let listener = if leader { None } else { load.subscribe()? };
             if leader {
+                let guard = SharedAnalyzerWorkspaceLoadGuard {
+                    registry: self,
+                    key: &registry_load_key,
+                    load: &load,
+                    completed: false,
+                };
                 let existing = world
                     .lock()
                     .map_err(|error| {
@@ -1020,8 +1033,7 @@ impl SharedAnalyzerRegistry {
                         })
                         .and_then(|loaded| self.commit_workspace_load(&world, &access, loaded))
                 };
-                load.finish(result);
-                self.state()?.loads.remove(&registry_load_key);
+                guard.complete(result);
             }
             let result = match listener {
                 Some(listener) => load.wait_with_progress(listener, progress),
@@ -1331,6 +1343,31 @@ impl SharedAnalyzerReload {
                 anyhow::format_err!("shared analyzer reload mutex is poisoned: {error}")
             })?;
         }
+    }
+}
+
+impl SharedAnalyzerWorkspaceLoadGuard<'_> {
+    fn complete(mut self, result: anyhow::Result<usize>) {
+        self.remove();
+        self.load.finish(result);
+        self.completed = true;
+    }
+
+    fn remove(&self) {
+        if let Ok(mut state) = self.registry.state.lock() {
+            state.loads.remove(self.key);
+        }
+    }
+}
+
+impl Drop for SharedAnalyzerWorkspaceLoadGuard<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.remove();
+        self.load
+            .finish(Err(anyhow::format_err!("workspace load was abandoned")));
     }
 }
 
