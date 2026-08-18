@@ -152,6 +152,9 @@ fn run_daemon(foreground: bool, startup_lock_owned: bool) -> anyhow::Result<()> 
     let paths = RuntimePaths::discover()?;
 
     if foreground {
+        if let Err(error) = driver::setup_logging(None) {
+            eprintln!("Failed to setup logging: {error:#}");
+        }
         analyzed_daemon::run_foreground(paths, startup_lock_owned)?;
     } else {
         println!(
