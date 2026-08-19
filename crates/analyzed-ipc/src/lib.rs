@@ -52,6 +52,9 @@ use windows_sys::Win32::{
 
 pub type Result<T> = std::result::Result<T, IpcError>;
 
+/// Marks a successfully completed LSP session after its final frame.
+pub const LSP_SESSION_FINISHED: u8 = 0;
+
 #[cfg(unix)]
 pub type IpcListener = UnixListener;
 

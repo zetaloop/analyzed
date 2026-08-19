@@ -1,12 +1,12 @@
 use std::{
     env,
     ffi::OsString,
-    io::{self, Read, Write},
+    io::{self, BufRead, Read, Write},
     process::{self, ExitCode},
     thread,
 };
 
-use analyzed_ipc::RuntimePaths;
+use analyzed_ipc::{LSP_SESSION_FINISHED, RuntimePaths};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use ra_ap_rust_analyzer::{cli::flags, config::Config, driver};
 
@@ -116,11 +116,22 @@ fn run_stdio() -> anyhow::Result<()> {
     let paths = RuntimePaths::discover()?;
     let mut daemon_reader = analyzed_daemon::connect_lsp_session(paths)?;
     let mut daemon_writer = daemon_reader.try_clone()?;
-    thread::spawn(move || {
+    _ = thread::spawn(move || {
         let stdin = io::stdin();
         let mut stdin = stdin.lock();
-        _ = io::copy(&mut stdin, &mut daemon_writer);
-        process::exit(0);
+        loop {
+            match forward_lsp_frame(&mut stdin, &mut daemon_writer) {
+                Ok(true) => {}
+                Ok(false) => {
+                    _ = daemon_writer.write_all(&[LSP_SESSION_FINISHED, b'\n']);
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("analyzed: {error}");
+                    process::exit(1);
+                }
+            }
+        }
     });
 
     let stdout = io::stdout();
@@ -129,14 +140,46 @@ fn run_stdio() -> anyhow::Result<()> {
     loop {
         let count = daemon_reader.read(&mut buffer)?;
         if count == 0 {
-            break;
+            anyhow::bail!("shared daemon disconnected while the LSP session was active");
         }
 
-        stdout.write_all(&buffer[..count])?;
+        let finished = buffer[count - 1] == LSP_SESSION_FINISHED;
+        stdout.write_all(&buffer[..count - usize::from(finished)])?;
         stdout.flush()?;
+        if finished {
+            return Ok(());
+        }
+    }
+}
+
+fn forward_lsp_frame(reader: &mut impl BufRead, writer: &mut impl Write) -> anyhow::Result<bool> {
+    let mut header = Vec::new();
+    loop {
+        let start = header.len();
+        if reader.read_until(b'\n', &mut header)? == 0 {
+            anyhow::ensure!(header.is_empty(), "LSP header ended unexpectedly");
+            return Ok(false);
+        }
+        anyhow::ensure!(header[start..].ends_with(b"\r\n"), "malformed LSP header");
+        if header[start..] == *b"\r\n" {
+            break;
+        }
     }
 
-    Ok(())
+    let content_length = std::str::from_utf8(&header)?
+        .split("\r\n")
+        .filter_map(|line| {
+            let (name, value) = line.split_once(": ")?;
+            name.eq_ignore_ascii_case("Content-Length").then_some(value)
+        })
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("missing Content-Length"))?
+        .parse::<u64>()?;
+    writer.write_all(&header)?;
+    let copied = io::copy(&mut (&mut *reader).take(content_length), writer)?;
+    anyhow::ensure!(copied == content_length, "LSP body ended unexpectedly");
+    writer.flush()?;
+    Ok(true)
 }
 
 fn print_status() -> anyhow::Result<()> {

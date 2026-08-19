@@ -1,6 +1,6 @@
 use std::{
     env,
-    io::{self, BufReader},
+    io::{self, BufReader, Write},
     path::PathBuf,
     process::{self, Child, Command, Stdio},
     sync::{
@@ -13,9 +13,9 @@ use std::{
 
 use analyzed_ipc::{
     BackendKey, BackendSnapshot, CargoConfigKey, DaemonRequest, DaemonResponse, DaemonSnapshot,
-    DatabaseConfigKey, Hello, IpcStream, LspSession, ProcMacroServerKey, RuntimePaths,
-    SharedWorldKey, SharedWorldLoadKey, StartupLock, Stop, WorkspaceSnapshot, WorkspaceViewKey,
-    accept_client, bind_listener, read_json_line, write_json_line,
+    DatabaseConfigKey, Hello, IpcStream, LSP_SESSION_FINISHED, LspSession, ProcMacroServerKey,
+    RuntimePaths, SharedWorldKey, SharedWorldLoadKey, StartupLock, Stop, WorkspaceSnapshot,
+    WorkspaceViewKey, accept_client, bind_listener, read_json_line, write_json_line,
 };
 use crossbeam_channel::unbounded;
 use lsp_server::{Connection, Message};
@@ -322,9 +322,10 @@ fn handle_client(
                     pid: state.pid,
                 }),
             )?;
-            handle_lsp_session(stream, state, session_id).map_err(|error| {
+            handle_lsp_session(stream.try_clone()?, state, session_id).map_err(|error| {
                 analyzed_ipc::IpcError::Protocol(format!("lsp session failed: {error}"))
             })?;
+            stream.write_all(&[LSP_SESSION_FINISHED])?;
         }
         DaemonRequest::Stop => {
             write_json_line(
@@ -386,7 +387,11 @@ fn lsp_stream_connection(stream: IpcStream) -> anyhow::Result<(Connection, LspSt
 
     let reader = thread::spawn(move || {
         while let Some(message) = Message::read(&mut reader)? {
+            let exit = matches!(&message, Message::Notification(notification) if notification.method == "exit");
             if reader_sender.send(message).is_err() {
+                break;
+            }
+            if exit {
                 break;
             }
         }
