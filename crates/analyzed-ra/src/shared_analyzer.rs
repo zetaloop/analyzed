@@ -58,13 +58,21 @@ pub fn shared_analyzer_registry() -> Arc<SharedAnalyzerRegistry> {
     Arc::clone(REGISTRY.get_or_init(|| Arc::new(SharedAnalyzerRegistry::new())))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendSnapshotState {
+    Ready,
+    Busy,
+    Poisoned,
+}
+
 #[derive(Debug)]
 pub struct SharedAnalyzerBackendSnapshot {
     pub key: SharedAnalyzerBackendKey,
+    pub state: BackendSnapshotState,
     pub client_sessions: usize,
-    pub overlay_sessions: usize,
-    pub overlay_files: usize,
-    pub workspace_loads: Vec<WorkspaceSummary>,
+    pub overlay_sessions: Option<usize>,
+    pub overlay_files: Option<usize>,
+    pub workspace_loads: Option<Vec<WorkspaceSummary>>,
 }
 
 pub struct SharedAnalyzerRegistry {
@@ -1083,19 +1091,25 @@ impl SharedAnalyzerRegistry {
         entries
             .into_iter()
             .map(|(key, client_sessions, world, view)| {
-                let (overlay_sessions, overlay_files, workspace_loads) = world
-                    .lock()
-                    .map(|world| {
-                        (
-                            world.active_overlay_sessions(),
-                            world.overlay_files(),
-                            world.workspace_summaries(&view),
-                        )
-                    })
-                    .unwrap_or_default();
+                let (state, overlay_sessions, overlay_files, workspace_loads) =
+                    match world.try_lock() {
+                        Ok(world) => (
+                            BackendSnapshotState::Ready,
+                            Some(world.active_overlay_sessions()),
+                            Some(world.overlay_files()),
+                            Some(world.workspace_summaries(&view)),
+                        ),
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            (BackendSnapshotState::Busy, None, None, None)
+                        }
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            (BackendSnapshotState::Poisoned, None, None, None)
+                        }
+                    };
 
                 SharedAnalyzerBackendSnapshot {
                     key,
+                    state,
                     client_sessions,
                     overlay_sessions,
                     overlay_files,

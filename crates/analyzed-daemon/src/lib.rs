@@ -12,10 +12,11 @@ use std::{
 };
 
 use analyzed_ipc::{
-    BackendKey, BackendSnapshot, CargoConfigKey, DaemonRequest, DaemonResponse, DaemonSnapshot,
-    DatabaseConfigKey, Hello, IpcStream, LSP_SESSION_FINISHED, LspSession, ProcMacroServerKey,
-    RuntimePaths, SharedWorldKey, SharedWorldLoadKey, StartupLock, Stop, WorkspaceSnapshot,
-    WorkspaceViewKey, accept_client, bind_listener, read_json_line, write_json_line,
+    BackendKey, BackendSnapshot, BackendSnapshotState, CargoConfigKey, DaemonRequest,
+    DaemonResponse, DaemonSnapshot, DatabaseConfigKey, Hello, IpcStream, LSP_SESSION_FINISHED,
+    LspSession, ProcMacroServerKey, RuntimePaths, SharedWorldKey, SharedWorldLoadKey, StartupLock,
+    Stop, WorkspaceSnapshot, WorkspaceViewKey, accept_client, bind_listener, read_json_line,
+    write_json_line,
 };
 use crossbeam_channel::unbounded;
 use lsp_server::{Connection, Message};
@@ -37,7 +38,7 @@ pub struct DaemonStatus {
     started_at_unix_seconds: Option<u64>,
     client_sessions: usize,
     backend_sessions: Vec<BackendSnapshot>,
-    workspaces: usize,
+    workspaces: Option<usize>,
     paths: RuntimePaths,
     hello: Option<Hello>,
     connection_error: Option<String>,
@@ -50,7 +51,7 @@ pub fn offline_status(paths: RuntimePaths) -> DaemonStatus {
         started_at_unix_seconds: None,
         client_sessions: 0,
         backend_sessions: Vec::new(),
-        workspaces: 0,
+        workspaces: Some(0),
         paths,
         hello: None,
         connection_error: None,
@@ -76,7 +77,7 @@ pub fn online_status(paths: RuntimePaths, hello: Hello) -> DaemonStatus {
         started_at_unix_seconds: snapshot.map(|state| state.started_at_unix_seconds),
         client_sessions: snapshot.map_or(0, |state| state.client_sessions),
         backend_sessions: snapshot.map_or_else(Vec::new, |state| state.backend_sessions.clone()),
-        workspaces: snapshot.map_or(0, |state| state.workspaces),
+        workspaces: snapshot.and_then(|state| state.workspaces),
         paths,
         hello: Some(hello),
         connection_error: None,
@@ -284,13 +285,16 @@ impl ServiceState {
             .collect::<Vec<_>>();
         let workspaces = backend_sessions
             .iter()
-            .map(|backend| backend.workspace_loads.len())
+            .map(|backend| backend.workspace_loads.as_ref().map(Vec::len))
             .sum();
 
         DaemonSnapshot {
             pid: self.pid,
             started_at_unix_seconds: self.started_at_unix_seconds,
-            client_sessions: self.client_sessions.load(Ordering::SeqCst),
+            client_sessions: self
+                .client_sessions
+                .load(Ordering::SeqCst)
+                .saturating_sub(1),
             backend_sessions,
             workspaces,
         }
@@ -435,14 +439,26 @@ fn backend_snapshot_from_shared(
 ) -> BackendSnapshot {
     BackendSnapshot {
         key: backend_key_from_shared(snapshot.key),
+        state: match snapshot.state {
+            ra_ap_rust_analyzer::shared_analyzer::BackendSnapshotState::Ready => {
+                BackendSnapshotState::Ready
+            }
+            ra_ap_rust_analyzer::shared_analyzer::BackendSnapshotState::Busy => {
+                BackendSnapshotState::Busy
+            }
+            ra_ap_rust_analyzer::shared_analyzer::BackendSnapshotState::Poisoned => {
+                BackendSnapshotState::Poisoned
+            }
+        },
         client_sessions: snapshot.client_sessions,
         overlay_sessions: snapshot.overlay_sessions,
         overlay_files: snapshot.overlay_files,
-        workspace_loads: snapshot
-            .workspace_loads
-            .into_iter()
-            .map(workspace_snapshot_from_shared)
-            .collect(),
+        workspace_loads: snapshot.workspace_loads.map(|workspaces| {
+            workspaces
+                .into_iter()
+                .map(workspace_snapshot_from_shared)
+                .collect()
+        }),
     }
 }
 

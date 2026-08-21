@@ -318,13 +318,22 @@ pub struct WorkspaceViewKey {
     pub excluded_paths: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendSnapshotState {
+    Ready,
+    Busy,
+    Poisoned,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackendSnapshot {
     pub key: BackendKey,
+    pub state: BackendSnapshotState,
     pub client_sessions: usize,
-    pub overlay_sessions: usize,
-    pub overlay_files: usize,
-    pub workspace_loads: Vec<WorkspaceSnapshot>,
+    pub overlay_sessions: Option<usize>,
+    pub overlay_files: Option<usize>,
+    pub workspace_loads: Option<Vec<WorkspaceSnapshot>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -342,7 +351,7 @@ pub struct DaemonSnapshot {
     pub started_at_unix_seconds: u64,
     pub client_sessions: usize,
     pub backend_sessions: Vec<BackendSnapshot>,
-    pub workspaces: usize,
+    pub workspaces: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
