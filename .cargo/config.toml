@@ -7,3 +7,6 @@ linker = "rust-lld"
 
 [target.aarch64-pc-windows-msvc]
 linker = "rust-lld"
+
+[target.arm-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc-8"
