@@ -515,17 +515,21 @@ impl SharedAnalyzerRegistry {
             .iter()
             .map(|(load_key, _)| load_key.clone())
             .collect::<Vec<_>>();
-        let (mut keys, mut clients, base_file_ids) = {
+        let (mut keys, clients, base_file_ids) = {
             let world = world
                 .lock()
                 .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
             (
                 world.proc_macro_reload_keys(&load_keys, config),
-                world.proc_macro_clients(None),
+                world.proc_macro_clients(),
                 Arc::clone(&world.base_file_ids),
             )
         };
-        clients.retain(|(key, _)| !keys.iter().any(|reload| reload == key));
+        let mut rejected = clients
+            .iter()
+            .filter(|(key, _)| keys.iter().any(|reload| reload == key))
+            .map(|(_, client)| Arc::clone(client))
+            .collect::<Vec<_>>();
         let mut loaded = Vec::new();
         for (_, source) in sources {
             let (load_key, workspace) = SharedWorld::load_workspace(source, config, progress)?;
@@ -535,14 +539,19 @@ impl SharedAnalyzerRegistry {
                 &config.load.to_load_cargo_config(),
             ) && !keys.iter().any(|old| old == &key)
             {
-                clients.retain(|(client, _)| client != &key);
+                rejected.extend(
+                    clients
+                        .iter()
+                        .filter(|(client_key, _)| client_key == &key)
+                        .map(|(_, client)| Arc::clone(client)),
+                );
                 keys.push(key);
             }
             loaded.push(SharedWorld::prepare_loaded_workspace(
                 load_key,
                 workspace,
                 config,
-                &mut clients,
+                &rejected,
                 metadata_proc_macro_state(config),
                 &base_file_ids,
             )?);
@@ -1020,13 +1029,8 @@ impl SharedAnalyzerRegistry {
                         .map_err(|error| {
                             anyhow::format_err!("shared world mutex is poisoned: {error}")
                         })
-                        .map(|world| {
-                            (
-                                world.proc_macro_clients(None),
-                                Arc::clone(&world.base_file_ids),
-                            )
-                        })
-                        .and_then(|(proc_macro_clients, base_file_ids)| {
+                        .map(|world| Arc::clone(&world.base_file_ids))
+                        .and_then(|base_file_ids| {
                             let report = |message: String| {
                                 progress(message.clone());
                                 load.report(message);
@@ -1034,7 +1038,6 @@ impl SharedAnalyzerRegistry {
                             SharedWorld::prepare_workspace_load(
                                 source.clone(),
                                 config,
-                                &proc_macro_clients,
                                 &base_file_ids,
                                 &report,
                             )
@@ -3497,6 +3500,43 @@ type ProcMacroSpawnKey = (
     Option<semver::Version>,
     FxHashMap<String, Option<String>>,
 );
+type SharedProcMacroClient = (ProcMacroSpawnKey, Arc<ProcMacroClient>);
+type ProcMacroPoolKey = (ProcMacroSpawnKey, usize);
+
+#[derive(Default)]
+struct SharedProcMacroPools(Mutex<Vec<(ProcMacroPoolKey, Weak<ProcMacroClient>)>>);
+
+impl SharedProcMacroPools {
+    fn client(
+        &self,
+        key: ProcMacroSpawnKey,
+        processes: usize,
+        rejected: &[Arc<ProcMacroClient>],
+    ) -> Result<Arc<ProcMacroClient>, ProcMacroLoadingError> {
+        let pool_key = (key.clone(), processes);
+        let mut pools = self.0.lock().map_err(proc_macro_loading_error)?;
+        pools.retain(|(_, client)| client.strong_count() != 0);
+
+        if let Some(client) = pools
+            .iter()
+            .find(|(candidate, _)| candidate == &pool_key)
+            .and_then(|(_, client)| client.upgrade())
+            .filter(|client| client.exited().is_none())
+            .filter(|client| !rejected.iter().any(|old| Arc::ptr_eq(old, client)))
+        {
+            return Ok(client);
+        }
+
+        let (path, toolchain, env) = &key;
+        let client = Arc::new(
+            ProcMacroClient::spawn(path, env, toolchain.as_ref(), processes)
+                .map_err(proc_macro_loading_error)?,
+        );
+        pools.retain(|(candidate, _)| candidate != &pool_key);
+        pools.push((pool_key, Arc::downgrade(&client)));
+        Ok(client)
+    }
+}
 
 struct LoadedWorkspace {
     summary: WorkspaceSummary,
@@ -3505,7 +3545,7 @@ struct LoadedWorkspace {
     _vfs: Arc<LoadedWorkspaceFiles>,
     line_endings: Arc<BTreeMap<FileId, crate::line_index::LineEndings>>,
     source_root_parent_map: FxHashMap<SourceRootId, SourceRootId>,
-    proc_macro_client: Option<Result<(ProcMacroSpawnKey, ProcMacroClient), ProcMacroLoadingError>>,
+    proc_macro_client: Option<Result<SharedProcMacroClient, ProcMacroLoadingError>>,
 }
 
 impl LoadedWorkspace {
@@ -3520,7 +3560,7 @@ struct PreparedWorkspaceLoad {
     workspace: ProjectWorkspace,
     loaded: WorkspaceLoad,
     line_endings: BTreeMap<FileId, crate::line_index::LineEndings>,
-    proc_macro_spawn: Option<Result<ProcMacroSpawnKey, ProcMacroLoadingError>>,
+    proc_macro_client: Option<Result<SharedProcMacroClient, ProcMacroLoadingError>>,
     proc_macros_loaded: bool,
     build_data_loaded: bool,
 }
@@ -3530,13 +3570,12 @@ struct BuildDataWorkspace {
     workspace: ProjectWorkspace,
     files: Arc<LoadedWorkspaceFiles>,
     build_data_loaded: bool,
-    proc_macro_client: Option<Result<(ProcMacroSpawnKey, ProcMacroClient), ProcMacroLoadingError>>,
+    proc_macro_client: Option<Result<SharedProcMacroClient, ProcMacroLoadingError>>,
 }
 
 struct BuildDataSnapshot {
     generation: u64,
     workspaces: Vec<BuildDataWorkspace>,
-    proc_macro_clients: Vec<(ProcMacroSpawnKey, ProcMacroClient)>,
     operation_keys: Option<(bool, Vec<ProcMacroSpawnKey>)>,
 }
 
@@ -3550,7 +3589,7 @@ struct PreparedBuildDataWorkspace {
     proc_macros: Vec<ProcMacroLoad>,
     proc_macros_loaded: bool,
     build_data_loaded: bool,
-    proc_macro_client: Option<Result<(ProcMacroSpawnKey, ProcMacroClient), ProcMacroLoadingError>>,
+    proc_macro_client: Option<Result<SharedProcMacroClient, ProcMacroLoadingError>>,
 }
 
 struct PreparedBuildData {
@@ -3620,7 +3659,21 @@ impl BuildDataSnapshot {
             .operation_keys
             .as_ref()
             .is_some_and(|(rebuild, _)| *rebuild);
-        let mut clients = self.proc_macro_clients;
+        let rejected = if rebuild {
+            self.workspaces
+                .iter()
+                .filter_map(|workspace| {
+                    workspace
+                        .proc_macro_client
+                        .as_ref()?
+                        .as_ref()
+                        .ok()
+                        .map(|(_, client)| Arc::clone(client))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let workspaces = self
             .workspaces
             .into_iter()
@@ -3629,18 +3682,23 @@ impl BuildDataSnapshot {
                 let existing_client = (!rebuild).then_some(snapshot.proc_macro_client).flatten();
                 let (client_state, proc_macro_server) = match existing_client {
                     Some(Ok((key, client))) => {
-                        (Some(Ok((key, client.clone()))), Some(Ok(client)))
+                        (
+                            Some(Ok((key, Arc::clone(&client)))),
+                            Some(Ok(client.as_ref().clone())),
+                        )
                     }
                     Some(Err(error)) => (Some(Err(error.clone())), Some(Err(error))),
                     None => match spawn_proc_macro_server(
                         &snapshot.workspace,
                         &config.cargo_config.extra_env,
                         &load_config,
-                        &clients,
+                        &rejected,
                     ) {
                         Some(Ok((key, client))) => {
-                            clients.push((key.clone(), client.clone()));
-                            (Some(Ok((key, client.clone()))), Some(Ok(client)))
+                            (
+                                Some(Ok((key, Arc::clone(&client)))),
+                                Some(Ok(client.as_ref().clone())),
+                            )
                         }
                         Some(Err(error)) => (Some(Err(error.clone())), Some(Err(error))),
                         None => (None, None),
@@ -3744,27 +3802,24 @@ fn spawn_proc_macro_server(
     workspace: &ProjectWorkspace,
     extra_env: &FxHashMap<String, Option<String>>,
     load_config: &LoadCargoConfig,
-    clients: &[(ProcMacroSpawnKey, ProcMacroClient)],
-) -> Option<Result<(ProcMacroSpawnKey, ProcMacroClient), ProcMacroLoadingError>> {
+    rejected: &[Arc<ProcMacroClient>],
+) -> Option<Result<SharedProcMacroClient, ProcMacroLoadingError>> {
+    static POOLS: OnceLock<SharedProcMacroPools> = OnceLock::new();
+
     let key = match proc_macro_spawn_key(workspace, extra_env, load_config)? {
         Ok(key) => key,
         Err(error) => return Some(Err(error)),
     };
 
-    if let Some((_, client)) = clients.iter().find(|(k, _)| *k == key) {
-        return Some(Ok((key, client.clone())));
-    }
-
-    let (path, toolchain, env) = &key;
     Some(
-        ProcMacroClient::spawn(
-            path,
-            env,
-            toolchain.as_ref(),
-            load_config.proc_macro_processes,
-        )
-        .map(|client| (key.clone(), client))
-        .map_err(proc_macro_loading_error),
+        POOLS
+            .get_or_init(SharedProcMacroPools::default)
+            .client(
+                key.clone(),
+                load_config.proc_macro_processes,
+                rejected,
+            )
+            .map(|client| (key, client)),
     )
 }
 
@@ -3862,16 +3917,10 @@ impl SharedWorld {
         keys
     }
 
-    fn proc_macro_clients(
-        &self,
-        excluded_load_key: Option<&str>,
-    ) -> Vec<(ProcMacroSpawnKey, ProcMacroClient)> {
-        let excluded = excluded_load_key.and_then(|load_key| self.workspace_index(load_key));
+    fn proc_macro_clients(&self) -> Vec<SharedProcMacroClient> {
         self.loaded_workspaces
             .iter()
-            .enumerate()
-            .filter(|(index, _)| Some(*index) != excluded)
-            .filter_map(|(_, workspace)| {
+            .filter_map(|workspace| {
                 workspace.proc_macro_client.as_ref()?.as_ref().ok().cloned()
             })
             .collect()
@@ -3888,7 +3937,7 @@ impl SharedWorld {
                     .proc_macro_client
                     .as_ref()
                     .map(|result| match result {
-                        Ok((_, client)) => Ok(client.clone()),
+                        Ok((_, client)) => Ok(client.as_ref().clone()),
                         Err(error) => Err(anyhow::format_err!("{error}")),
                     })
             })
@@ -4001,10 +4050,6 @@ impl SharedWorld {
                 }
             })
             .collect();
-        let proc_macro_clients = match &scope {
-            BuildDataScope::Normal | BuildDataScope::Reload(_) => self.proc_macro_clients(None),
-            BuildDataScope::Rebuild => Vec::new(),
-        };
         let operation_keys = match scope {
             BuildDataScope::Normal => None,
             BuildDataScope::Reload(_) => Some((false, keys)),
@@ -4013,7 +4058,6 @@ impl SharedWorld {
         Ok(Some(BuildDataSnapshot {
             generation: self.workspace_generation,
             workspaces,
-            proc_macro_clients,
             operation_keys,
         }))
     }
@@ -4144,7 +4188,7 @@ impl SharedWorld {
                     client: workspace.proc_macro_client.as_ref().map(|client| {
                         client
                             .as_ref()
-                            .map(|(_, client)| client.clone())
+                            .map(|(_, client)| client.as_ref().clone())
                             .map_err(Clone::clone)
                     }),
                     paths: workspace.input.proc_macro_paths.clone(),
@@ -4237,17 +4281,15 @@ impl SharedWorld {
     fn prepare_workspace_load(
         source: SharedAnalyzerWorkspaceLoadSource,
         config: &SharedAnalyzerConfig,
-        proc_macro_clients: &[(ProcMacroSpawnKey, ProcMacroClient)],
         base_file_ids: &SharedBaseFileIds,
         progress: &(dyn Fn(String) + Sync),
     ) -> anyhow::Result<PreparedWorkspaceLoad> {
         let (load_key, workspace) = Self::load_workspace(source, config, progress)?;
-        let mut proc_macro_clients = proc_macro_clients.to_vec();
         Self::prepare_loaded_workspace(
             load_key,
             workspace,
             config,
-            &mut proc_macro_clients,
+            &[],
             metadata_proc_macro_state(config),
             base_file_ids,
         )
@@ -4257,7 +4299,7 @@ impl SharedWorld {
         load_key: String,
         workspace: ProjectWorkspace,
         config: &SharedAnalyzerConfig,
-        proc_macro_clients: &mut Vec<(ProcMacroSpawnKey, ProcMacroClient)>,
+        rejected_proc_macro_clients: &[Arc<ProcMacroClient>],
         proc_macro_state: ProcMacroLoadState,
         base_file_ids: &SharedBaseFileIds,
     ) -> anyhow::Result<PreparedWorkspaceLoad> {
@@ -4268,22 +4310,19 @@ impl SharedWorld {
         let summary_root = workspace.workspace_root().to_string();
         let packages = workspace.n_packages();
         let load_config = config.load.to_load_cargo_config();
-        let (proc_macro_spawn, proc_macro_server) =
+        let (proc_macro_client, proc_macro_server) =
             if proc_macro_state != ProcMacroLoadState::Disabled {
                 match spawn_proc_macro_server(
                     &workspace,
                     &config.cargo_config.extra_env,
                     &load_config,
-                    proc_macro_clients,
+                    rejected_proc_macro_clients,
                 ) {
                     Some(Ok((key, client))) => {
-                        if !proc_macro_clients
-                            .iter()
-                            .any(|(existing, _)| existing == &key)
-                        {
-                            proc_macro_clients.push((key.clone(), client.clone()));
-                        }
-                        (Some(Ok(key)), Some(Ok(client)))
+                        (
+                            Some(Ok((key, Arc::clone(&client)))),
+                            Some(Ok(client.as_ref().clone())),
+                        )
                     }
                     Some(Err(error)) => (Some(Err(error.clone())), Some(Err(error))),
                     None => (None, None),
@@ -4326,7 +4365,7 @@ impl SharedWorld {
             workspace: session_workspace,
             loaded,
             line_endings,
-            proc_macro_spawn,
+            proc_macro_client,
             proc_macros_loaded,
             build_data_loaded: !config.load.key.load_out_dirs_from_check,
         })
@@ -4466,12 +4505,7 @@ impl SharedWorld {
                 _vfs: Arc::new(files),
                 line_endings,
                 source_root_parent_map,
-                proc_macro_client: match (loaded.proc_macro_spawn, loaded.loaded.proc_macro_server)
-                {
-                    (Some(Ok(key)), Some(Ok(client))) => Some(Ok((key, client))),
-                    (Some(Err(error)), _) | (_, Some(Err(error))) => Some(Err(error)),
-                    _ => None,
-                },
+                proc_macro_client: loaded.proc_macro_client,
             },
             file_texts,
         )
