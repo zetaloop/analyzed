@@ -6,19 +6,21 @@ Each release pins one upstream version (the `ra_ap_*` crates) and must pass the 
 
 ## Architecture
 
-A SharedWorld is the sharing boundary. It holds one AnalysisHost, one RootDatabase, and the loaded workspaces for that world.
+A SharedWorld is the analysis database sharing boundary. It holds one AnalysisHost, one RootDatabase, and the loaded workspaces for that world.
 
 - The registry groups sessions by `SharedAnalyzerWorldKey`. Incompatible toolchains or Cargo/load settings get their own world.
+- Proc-macro server pools are process-global; pools are shared only when their process configuration matches, while workspace and view configuration remain world-local.
 - Workspace roots, linked projects, excluded paths, and client analysis settings belong to the view. A session is a view over a world, not another database, and may see only part of the merged crate graph.
 - When a workspace loads into a world, its source roots and crate graph merge into the shared database. Crate sharing relies on salsa interning: identical crate inputs re-intern to the same ID, so shared dependencies are analyzed once.
 - SharedWorld is the only path to the database. New write paths must go through its input application code instead of touching the host directly, otherwise other sessions see inconsistent state or miss coordination.
+- A thread must not hold a live `Analysis` while acquiring another world or GC permit.
 - Open files stay on the shared base while their contents match disk. Unsaved changes use session-local overlay file IDs and overlay crate cones. When the buffer converges back to the on-disk text, the overlay is removed and the session returns to the shared path.
 
 Do not add per-test or per-session world separation. The project only proves its value when real sharing works. Type interner GC is process-global: it runs only when no session in any world is busy.
 
 ## Patching
 
-The `analyzed-ra*` crates patch unpacked upstream sources in `build.rs`, then compile the result from `OUT_DIR`.
+The `analyzed-ra*` crates patch unpacked upstream sources in `build.rs`, then compile the result from `OUT_DIR`. Behavioral changes live in normal `src` files; `build.rs` mounts them and applies structural edits to upstream items.
 
 We keep our modifications to the upstream code minimal. Copying large blocks of upstream logic into our own files is the wrong approach. Instead:
 
@@ -46,10 +48,26 @@ The daemon leaves nothing in the user's home directory. On Unix, the runtime dir
 
 Upstream parity tests must pass under default parallel execution with shared state. This is the core guarantee: running under sharing and concurrency must not produce any inconsistencies compared to standalone rust-analyzer.
 
-- The suites are `lib_parity` and `lsp_parity` in `crates/analyzed-ra`. They run only with `RUN_SLOW_TESTS=1`; a 0-second finish means they were skipped. `lsp_parity` must finish within 60 seconds.
+- The suites are `lib_parity` and `lsp_parity` in `crates/analyzed-ra`. Local runs require `RUN_SLOW_TESTS=1`; a 0-second finish means they were skipped. `lsp_parity` must finish within 60 seconds.
 - Don't serialize test suites or isolate shared state to make tests pass. If a test only passes with `--test-threads=1`, there's a real sharing bug.
 - Static checks (`fmt`, `check`, `clippy`) at zero warnings. No lint bypass comments.
 - Don't add new tests for shared behavior unless asked.
+
+The complete local verification flow is:
+
+```sh
+cargo fmt --all --check
+cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+RUN_SLOW_TESTS=1 cargo test --workspace --locked
+```
+
+After an upstream bump or release workflow change, also run:
+
+```sh
+cargo xtask matrix
+actionlint -verbose
+```
 
 ## Crate Layout
 
@@ -70,6 +88,6 @@ Ship a version by bumping every crate to the same number (including the internal
 
 ## Workflow
 
-- Don't push, revert, switch branches, or clean the working tree without asking first.
+- Don't push, create tags, publish releases, revert, switch branches, or clean the working tree without asking first.
 - Finish one coherent change, verify it, commit it. Then start the next. Don't batch unrelated work.
 - Prefer minimal fixes. Avoid adding polling, caches, or compatibility branches unless the code proves they're needed.
