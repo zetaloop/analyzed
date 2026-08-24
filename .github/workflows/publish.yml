@@ -1,8 +1,5 @@
 name: publish
 
-env:
-  RUST_TOOLCHAIN: "1.97.1"
-
 on:
   release:
     types: [published]
@@ -27,7 +24,7 @@ jobs:
           ref: ${{ inputs.tag }}
 
       - name: Install Rust toolchain
-        run: rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal --no-self-update --override
+        run: rustup update --no-self-update stable
 
       - name: Fetch dependencies
         run: cargo fetch --locked

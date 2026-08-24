@@ -19,7 +19,6 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
-  RUST_TOOLCHAIN: "1.97.1"
   PGO_TRAINING_REPO: clap-rs/clap
   PGO_TRAINING_REF: v4.5.36
 
@@ -37,7 +36,9 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        run: rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal --component rust-src,rustfmt,clippy --no-self-update --override
+        run: |
+          rustup update --no-self-update stable
+          rustup component add rust-src rustfmt clippy
 
       - name: Format
         if: matrix.os == 'ubuntu-latest'
@@ -59,7 +60,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        run: rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal --no-self-update --override
+        run: rustup update --no-self-update stable
 
       - name: Compute the target matrix
         id: matrix
@@ -98,10 +99,11 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install Rust toolchain
+        if: matrix.container != 'rust:alpine'
         run: |
-          rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal --no-self-update --override
-          rustup component add rust-src ${{ matrix.pgo && 'llvm-tools' || '' }} --toolchain ${{ env.RUST_TOOLCHAIN }}
-          rustup target add ${{ matrix.target }} --toolchain ${{ env.RUST_TOOLCHAIN }}
+          rustup update --no-self-update stable
+          rustup component add rust-src ${{ matrix.pgo && 'llvm-tools' || '' }}
+          rustup target add ${{ matrix.target }}
 
       - name: Install cargo-pgo
         if: matrix.pgo
