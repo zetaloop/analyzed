@@ -29,12 +29,12 @@ analyzed-ipc = { path = "crates/analyzed-ipc", version = "=0.5.0" }
 ra_ap_rust-analyzer = { path = "crates/analyzed-ra", package = "analyzed-ra", version = "=0.5.0" }
 
 anyhow = "1.0.103"
-clap = { version = "4.6.1", features = ["derive", "string"] }
+clap = { version = "4.6.6", features = ["derive", "string"] }
 crossbeam-channel = "0.5.16"
 lsp-server = "0.7.9"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-thiserror = "2.0.18"
+thiserror = "2.0.20"
 windows-sys = "0.61"
 
 [profile.dev]
