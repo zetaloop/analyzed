@@ -25,7 +25,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "analyzed"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "analyzed-daemon",
  "analyzed-ipc",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-bridge"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "flate2",
  "ra_ap_syntax",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-daemon"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "analyzed-ipc",
  "analyzed-ra",
@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-ipc"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-ra"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "analyzed-bridge",
  "analyzed-ra-ide",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-ra-ide"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "analyzed-bridge",
  "analyzed-ra-ide-assists",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-ra-ide-assists"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "analyzed-bridge",
  "analyzed-ra-ide-db",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-ra-ide-completion"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "analyzed-bridge",
  "analyzed-ra-ide-db",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-ra-ide-db"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "analyzed-bridge",
  "arrayvec",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-ra-ide-diagnostics"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "analyzed-bridge",
  "analyzed-ra-ide-db",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-ra-ide-ssr"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "analyzed-bridge",
  "analyzed-ra-ide-db",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "analyzed-ra-load-cargo"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "analyzed-bridge",
  "analyzed-ra-ide-db",
@@ -3658,7 +3658,7 @@ checksum = "32ac00cd3f8ec9c1d33fb3e7958a82df6989c42d747bd326c822b1d625283547"
 
 [[package]]
 name = "xtask"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
