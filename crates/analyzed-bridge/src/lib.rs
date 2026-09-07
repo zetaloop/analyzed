@@ -7,7 +7,7 @@ use std::{
 };
 
 use flate2::read::GzDecoder;
-use ra_ap_syntax::{AstNode, AstToken, Edition, SourceFile, syntax_editor::SyntaxEditor};
+use ra_ap_syntax::{AstNode, Edition, SourceFile, syntax_editor::SyntaxEditor};
 use sha2::{Digest, Sha256};
 use toml::{Table, Value, map::Map};
 
@@ -352,18 +352,10 @@ fn rewrite_included_header(path: &Path) -> Result<(), Box<dyn Error>> {
     let (editor, root) = SyntaxEditor::new(tree.syntax().clone());
     for attr in root
         .children()
-        .filter_map(ast::Attr::cast)
+        .filter_map(ast::AnyAttr::cast)
         .filter(|attr| attr.kind() == ast::AttrKind::Inner)
     {
         editor.delete(attr.syntax().clone());
-    }
-    for comment in root
-        .children_with_tokens()
-        .filter_map(|element| element.into_token())
-        .filter_map(ast::Comment::cast)
-        .filter(ast::Comment::is_inner)
-    {
-        editor.delete(comment.syntax().clone());
     }
     fs::write(path, editor.finish().new_root().to_string())?;
     Ok(())
