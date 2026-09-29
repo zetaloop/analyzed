@@ -13,14 +13,14 @@ const RA_PACKAGE: &str = "ra_ap_rust-analyzer";
 const RA_REPOSITORY: &str = "rust-lang/rust-analyzer";
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let (generated, package) = build_support::prepare_bridge_package(
+    let (generated, revision) = build_support::prepare_bridge_package(
         RA_PACKAGE,
         "ra_ap_rust_analyzer_bridge",
         &["tests/slow-tests/main.rs"],
+        &["ide", "ide-completion", "ide-db", "ide-ssr", "load-cargo"],
     )?;
     build_support::restore_rust_analyzer_source(&generated)?;
-    let revision = package
-        .git_revision
+    let revision = revision
         .as_deref()
         .ok_or("ra_ap_rust-analyzer does not contain .cargo_vcs_info.json")?;
     let pinned = pinned_upstream("release")?;

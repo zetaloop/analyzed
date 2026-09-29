@@ -8,9 +8,6 @@ repository.workspace = true
 description = "Build-time patching support for analyzed rust-analyzer bridge crates"
 
 [dependencies]
-flate2 = "1.1.9"
+override = "0.1.0"
 ra_ap_syntax = "=0.0.352"
 serde_json.workspace = true
-sha2 = "0.11.0"
-tar = "0.4.46"
-toml = "1.1.2"
