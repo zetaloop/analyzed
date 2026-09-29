@@ -7,11 +7,6 @@ use std::{
 
 use r#override::{DependencyKind, Package, check_target};
 
-mod edit;
-
-pub use edit::*;
-pub use ra_ap_syntax::ast;
-
 pub fn prepare_bridge_package(
     package_name: &str,
     generated_dir: &str,

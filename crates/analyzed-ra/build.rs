@@ -7,7 +7,7 @@ use std::{
 };
 
 use analyzed_bridge as build_support;
-use analyzed_bridge::ast;
+use r#override::{Edition, Source, arm, item, root};
 
 const RA_PACKAGE: &str = "ra_ap_rust-analyzer";
 const RA_REPOSITORY: &str = "rust-lang/rust-analyzer";
@@ -114,7 +114,6 @@ fn rust_analyzer_release(revision: &str, tag: &str) -> Result<String, Box<dyn Er
         .timeout_global(Some(Duration::from_secs(30)))
         .build()
         .new_agent();
-
     verify_rust_analyzer_release_tag(&agent, revision, tag)?;
     let runs = github_get(
         &agent,
@@ -130,7 +129,6 @@ fn rust_analyzer_release(revision: &str, tag: &str) -> Result<String, Box<dyn Er
         .iter()
         .filter_map(|run| run.get("run_number")?.as_u64())
         .collect::<Vec<_>>();
-
     match numbers.as_slice() {
         [number] => Ok(format!("v0.3.{number}")),
         [] => Err(GithubUnavailable(format!(
@@ -258,7 +256,6 @@ pub use shared_analyzer::{{
     println!("cargo:rerun-if-changed={}", shared_global_state.display());
     println!("cargo:rerun-if-changed={}", shared_reload.display());
     println!("cargo:rerun-if-changed={}", shared_notification.display());
-
     Ok(())
 }
 
@@ -269,917 +266,437 @@ fn owned_source_path(file_name: &str) -> PathBuf {
 }
 
 fn patch_config_source(config_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(config_rs)?;
-
-    for guard in [
-        "fn generate_package_json_config() {",
-        "fn generate_config_documentation() {",
+    let mut source = Source::parse(&fs::read_to_string(config_rs)?, Edition::CURRENT)?;
+    for function in [
+        "generate_package_json_config",
+        "generate_config_documentation",
     ] {
-        let function = guard
-            .strip_prefix("fn ")
-            .and_then(|value| value.strip_suffix("() {"))
-            .ok_or("unexpected config test guard")?;
-        build_support::add_attr::<ast::Fn>(
-            &mut source,
-            function,
+        source.select(item(function))?.add_attribute(
             "#[ignore = \"regenerates files from the rust-analyzer source tree\"]",
         )?;
     }
-
-    fs::write(config_rs, source)?;
+    fs::write(config_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_discover_source(discover_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(discover_rs)?;
-    build_support::add_attr::<ast::Variant>(
-        &mut source,
-        "DiscoverArgument::Buildfile",
-        "#[allow(dead_code)]",
-    )?;
-    fs::write(discover_rs, source)?;
+    let mut source = Source::parse(&fs::read_to_string(discover_rs)?, Edition::CURRENT)?;
+    source
+        .select(item("DiscoverArgument").variant("Buildfile"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    fs::write(discover_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_diagnostics_source(diagnostics_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(diagnostics_rs)?;
-    build_support::rename::<ast::Fn>(
-        &mut source,
-        "fetch_native_diagnostics",
-        "_fetch_native_diagnostics",
-    )?;
-    build_support::add_use(
-        &mut source,
-        Some("pub(crate)"),
-        "crate::main_loop::session::fetch_native_diagnostics",
-    )?;
-    fs::write(diagnostics_rs, source)?;
+    let mut source = Source::parse(&fs::read_to_string(diagnostics_rs)?, Edition::CURRENT)?;
+    source
+        .select(item("fetch_native_diagnostics"))?
+        .rename("_fetch_native_diagnostics")?;
+    source
+        .select(root())?
+        .add_use("pub(crate) use crate::main_loop::session::fetch_native_diagnostics;")?;
+    fs::write(diagnostics_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(global_state_rs)?;
-
-    build_support::append::<ast::Struct>(
-        &mut source,
-        "FetchWorkspaceResponse",
-        &[
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "shared",
-                ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "reload_id",
-                ty: "Option<u64>",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "adopted",
-                ty: "bool",
-            },
-        ],
-    )?;
-    build_support::append::<ast::Struct>(
-        &mut source,
-        "FetchBuildDataResponse",
-        &[
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "rebuild_id",
-                ty: "Option<u64>",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "reload",
-                ty: "bool",
-            },
-        ],
-    )?;
-    build_support::add_attr::<ast::Struct>(
-        &mut source,
-        "FetchWorkspaceResponse",
-        "#[derive(Debug)]",
-    )?;
-    build_support::append::<ast::Struct>(
-        &mut source,
-        "GlobalState",
-        &[
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "shared",
-                ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "reload_workspace",
-                ty: "bool",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "rebuild_proc_macros",
-                ty: "bool",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "rebuild_queued",
-                ty: "bool",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "rebuilding_proc_macros",
-                ty: "Option<u64>",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "proc_macro_rebuild_id",
-                ty: "u64",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "rebuild_response_current",
-                ty: "Option<u64>",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "build_data_response_current",
-                ty: "bool",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "build_data_adoption",
-                ty: "bool",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "build_data_rebuild_id",
-                ty: "Option<u64>",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "build_data_reload",
-                ty: "bool",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "build_data_generation",
-                ty: "u64",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "build_data_operation",
-                ty: "Option<crate::shared_analyzer::SharedAnalyzerOperationToken>",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "proc_macro_operation",
-                ty: "Option<crate::shared_analyzer::SharedAnalyzerOperationToken>",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "reload_pending",
-                ty: "bool",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "proc_macro_clients_failed",
-                ty: "bool",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "workspace_reload_id",
-                ty: "u64",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "handled_workspace_reload",
-                ty: "Option<u64>",
-            },
-            build_support::Field {
-                vis: Some("pub(crate)"),
-                name: "workspace_adoption",
-                ty: "Option<Arc<Vec<ProjectWorkspace>>>",
-            },
-        ],
-    )?;
-    build_support::append::<ast::Struct>(
-        &mut source,
-        "GlobalStateSnapshot",
-        &[build_support::Field {
-            vis: Some("pub(crate)"),
-            name: "shared",
-            ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
-        }],
-    )?;
-    for field in ["mem_docs", "vfs", "minicore"] {
-        build_support::set_visibility::<ast::RecordField>(
-            &mut source,
-            &format!("GlobalStateSnapshot::{field}"),
-            "pub(crate)",
-        )?;
-    }
-    build_support::add_attr::<ast::RecordField>(
-        &mut source,
-        "GlobalState::last_gc_revision",
-        "#[allow(dead_code)]",
-    )?;
-
-    build_support::rename::<ast::Fn>(&mut source, "new", "new_with_shared")?;
-    build_support::append::<ast::Fn>(
-        &mut source,
-        "new_with_shared",
-        &[
-            build_support::Param {
-                name: "shared",
-                ty: "crate::shared_analyzer::SharedAnalyzerRuntime",
-            },
-            build_support::Param {
-                name: "workspaces",
-                ty: "Vec<ProjectWorkspace>",
-            },
-        ],
-    )?;
-    build_support::append_record_fields(
-        &mut source,
-        "new_with_shared",
-        "GlobalState",
-        &[
-            build_support::FieldInit {
-                name: "shared",
-                value: None,
-            },
-            build_support::FieldInit {
-                name: "reload_workspace",
-                value: Some("false"),
-            },
-            build_support::FieldInit {
-                name: "rebuild_proc_macros",
-                value: Some("false"),
-            },
-            build_support::FieldInit {
-                name: "rebuild_queued",
-                value: Some("false"),
-            },
-            build_support::FieldInit {
-                name: "rebuilding_proc_macros",
-                value: Some("None"),
-            },
-            build_support::FieldInit {
-                name: "proc_macro_rebuild_id",
-                value: Some("0"),
-            },
-            build_support::FieldInit {
-                name: "rebuild_response_current",
-                value: Some("None"),
-            },
-            build_support::FieldInit {
-                name: "build_data_response_current",
-                value: Some("false"),
-            },
-            build_support::FieldInit {
-                name: "build_data_adoption",
-                value: Some("false"),
-            },
-            build_support::FieldInit {
-                name: "build_data_rebuild_id",
-                value: Some("None"),
-            },
-            build_support::FieldInit {
-                name: "build_data_reload",
-                value: Some("false"),
-            },
-            build_support::FieldInit {
-                name: "build_data_generation",
-                value: Some("0"),
-            },
-            build_support::FieldInit {
-                name: "build_data_operation",
-                value: Some("None"),
-            },
-            build_support::FieldInit {
-                name: "proc_macro_operation",
-                value: Some("None"),
-            },
-            build_support::FieldInit {
-                name: "reload_pending",
-                value: Some("false"),
-            },
-            build_support::FieldInit {
-                name: "proc_macro_clients_failed",
-                value: Some("false"),
-            },
-            build_support::FieldInit {
-                name: "workspace_reload_id",
-                value: Some("0"),
-            },
-            build_support::FieldInit {
-                name: "handled_workspace_reload",
-                value: Some("None"),
-            },
-            build_support::FieldInit {
-                name: "workspace_adoption",
-                value: Some("None"),
-            },
-        ],
-    )?;
-    build_support::set_record_field(
-        &mut source,
-        "new_with_shared",
-        "GlobalState",
-        "workspaces",
-        "Arc::new(workspaces)",
-    )?;
-    build_support::set_record_field(
-        &mut source,
-        "snapshot",
-        "GlobalStateSnapshot",
-        "analysis",
-        "self.shared.analysis()",
-    )?;
-    build_support::append_record_fields(
-        &mut source,
-        "snapshot",
-        "GlobalStateSnapshot",
-        &[build_support::FieldInit {
-            name: "shared",
-            value: Some("self.shared.clone()"),
-        }],
-    )?;
-    build_support::rename::<ast::Fn>(&mut source, "target_spec_for_file", "_target_spec_for_file")?;
-    build_support::add_attr::<ast::Fn>(
-        &mut source,
-        "_target_spec_for_file",
-        "#[allow(dead_code)]",
-    )?;
-    build_support::extract(
-        &mut source,
-        "_target_spec_for_file",
-        |function| {
-            let workspace_loop = build_support::one(
-                build_support::for_loops(function),
-                "for loop in `_target_spec_for_file`",
-            )?;
-            build_support::through_tail(&workspace_loop, function)
-        },
-        build_support::Method {
-            name: "target_spec_from_workspaces",
-            receiver: Some("&self"),
-            params: &[
-                build_support::Param {
-                    name: "path",
-                    ty: "&paths::AbsPath",
-                },
-                build_support::Param {
-                    name: "crate_id",
-                    ty: "Crate",
-                },
-            ],
-            args: &["path", "crate_id"],
-            return_ty: Some("Option<TargetSpec>"),
-        },
-    )?;
-    build_support::set_visibility::<ast::Fn>(
-        &mut source,
-        "target_spec_from_workspaces",
-        "pub(crate)",
-    )?;
-    build_support::extract(
-        &mut source,
-        "compute_priming_scope",
-        |function| {
-            let loop_expr = build_support::one(
-                build_support::for_loops(function).filter(|loop_expr| {
-                    build_support::arms(loop_expr, "ProjectWorkspaceKind", "Cargo")
-                        .next()
-                        .is_some()
-                }),
-                "workspace loop in `compute_priming_scope`",
-            )?;
-            build_support::stmt(&loop_expr)
-        },
-        build_support::Method {
-            name: "extend_priming_scope",
-            receiver: Some("&self"),
-            params: &[
-                build_support::Param {
-                    name: "root_to_crate",
-                    ty: "&FxHashMap<AbsPathBuf, Vec<Crate>>",
-                },
-                build_support::Param {
-                    name: "seed",
-                    ty: "&mut FxHashSet<Crate>",
-                },
-            ],
-            args: &["&root_to_crate", "&mut seed"],
-            return_ty: None,
-        },
-    )?;
-    build_support::set_visibility::<ast::Fn>(&mut source, "extend_priming_scope", "pub(crate)")?;
-    for name in [
-        "compute_priming_scope",
-        "process_changes",
-        "url_to_file_id",
-        "file_id_to_url",
-        "vfs_path_to_file_id",
-        "file_line_index",
-        "file_version",
-        "anchored_path",
-        "file_id_to_file_path",
-        "file_exists",
+    let mut source = Source::parse(&fs::read_to_string(global_state_rs)?, Edition::CURRENT)?;
+    for field in [
+        "pub(crate) shared: crate::shared_analyzer::SharedAnalyzerRuntime",
+        "pub(crate) reload_id: Option<u64>",
+        "pub(crate) adopted: bool",
     ] {
-        let replacement = format!("_{name}");
-        build_support::rename::<ast::Fn>(&mut source, name, &replacement)?;
-        build_support::add_attr::<ast::Fn>(&mut source, &replacement, "#[allow(dead_code)]")?;
+        source
+            .select(item("FetchWorkspaceResponse"))?
+            .add_field(field)?;
     }
-    build_support::set_visibility::<ast::Fn>(&mut source, "enqueue_workspace_fetch", "pub(crate)")?;
-
-    fs::write(global_state_rs, source)?;
+    for field in [
+        "pub(crate) rebuild_id: Option<u64>",
+        "pub(crate) reload: bool",
+    ] {
+        source
+            .select(item("FetchBuildDataResponse"))?
+            .add_field(field)?;
+    }
+    source
+        .select(item("FetchWorkspaceResponse"))?
+        .add_attribute("#[derive(Debug)]")?;
+    source
+        .select(item("GlobalStateSnapshot"))?
+        .add_field("pub(crate) shared: crate::shared_analyzer::SharedAnalyzerRuntime")?;
+    for field in ["mem_docs", "vfs", "minicore"] {
+        source
+            .select(item("GlobalStateSnapshot").field(field))?
+            .set_visibility("pub(crate)")?;
+    }
+    source
+        .select(item("GlobalState").field("last_gc_revision"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    source
+        .select(item("GlobalState::new"))?
+        .rename("new_with_shared")?;
+    source
+        .select(item("GlobalState::new_with_shared"))?
+        .add_parameter("shared: crate::shared_analyzer::SharedAnalyzerRuntime")?;
+    source
+        .select(item("GlobalState::new_with_shared"))?
+        .add_parameter("workspaces: Vec<ProjectWorkspace>")?;
+    for (declaration, initializer) in [
+        (
+            "shared: crate::shared_analyzer::SharedAnalyzerRuntime",
+            "shared",
+        ),
+        ("reload_workspace: bool", "reload_workspace: false"),
+        ("rebuild_proc_macros: bool", "rebuild_proc_macros: false"),
+        ("rebuild_queued: bool", "rebuild_queued: false"),
+        (
+            "rebuilding_proc_macros: Option<u64>",
+            "rebuilding_proc_macros: None",
+        ),
+        ("proc_macro_rebuild_id: u64", "proc_macro_rebuild_id: 0"),
+        (
+            "rebuild_response_current: Option<u64>",
+            "rebuild_response_current: None",
+        ),
+        (
+            "build_data_response_current: bool",
+            "build_data_response_current: false",
+        ),
+        ("build_data_adoption: bool", "build_data_adoption: false"),
+        (
+            "build_data_rebuild_id: Option<u64>",
+            "build_data_rebuild_id: None",
+        ),
+        ("build_data_reload: bool", "build_data_reload: false"),
+        ("build_data_generation: u64", "build_data_generation: 0"),
+        (
+            "build_data_operation: Option<crate::shared_analyzer::SharedAnalyzerOperationToken>",
+            "build_data_operation: None",
+        ),
+        (
+            "proc_macro_operation: Option<crate::shared_analyzer::SharedAnalyzerOperationToken>",
+            "proc_macro_operation: None",
+        ),
+        ("reload_pending: bool", "reload_pending: false"),
+        (
+            "proc_macro_clients_failed: bool",
+            "proc_macro_clients_failed: false",
+        ),
+        ("workspace_reload_id: u64", "workspace_reload_id: 0"),
+        (
+            "handled_workspace_reload: Option<u64>",
+            "handled_workspace_reload: None",
+        ),
+        (
+            "workspace_adoption: Option<Arc<Vec<ProjectWorkspace>>>",
+            "workspace_adoption: None",
+        ),
+    ] {
+        source
+            .select(item("GlobalState"))?
+            .add_field(&format!("pub(crate) {declaration}"))?;
+        source
+            .select(item("GlobalState::new_with_shared").record("GlobalState"))?
+            .add_field(initializer)?;
+    }
+    source
+        .select(
+            item("GlobalState::new_with_shared")
+                .record("GlobalState")
+                .field("workspaces"),
+        )?
+        .set_value("Arc::new(workspaces)")?;
+    source
+        .select(
+            item("GlobalState::snapshot")
+                .record("GlobalStateSnapshot")
+                .field("analysis"),
+        )?
+        .set_value("self.shared.analysis()")?;
+    source
+        .select(item("GlobalState::snapshot").record("GlobalStateSnapshot"))?
+        .add_field("shared: self.shared.clone()")?;
+    source
+        .select(item("GlobalStateSnapshot::target_spec_for_file"))?
+        .rename("_target_spec_for_file")?;
+    source
+        .select(item("GlobalStateSnapshot::_target_spec_for_file"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    source.select(item("GlobalStateSnapshot::_target_spec_for_file").region(root().for_loop().before(), root().end()))?
+        .extract("pub(crate) fn target_spec_from_workspaces(&self, path: &paths::AbsPath, crate_id: Crate) -> Option<TargetSpec>", &["path", "crate_id"])?;
+    source.select(item("GlobalState::compute_priming_scope").for_loop().has(arm("ProjectWorkspaceKind::Cargo")))?
+        .extract("pub(crate) fn extend_priming_scope(&self, root_to_crate: &FxHashMap<AbsPathBuf, Vec<Crate>>, seed: &mut FxHashSet<Crate>)", &["&root_to_crate", "&mut seed"])?;
+    for (owner, name) in [
+        ("GlobalState", "compute_priming_scope"),
+        ("GlobalState", "process_changes"),
+        ("GlobalStateSnapshot", "url_to_file_id"),
+        ("GlobalStateSnapshot", "file_id_to_url"),
+        ("GlobalStateSnapshot", "vfs_path_to_file_id"),
+        ("GlobalStateSnapshot", "file_line_index"),
+        ("GlobalStateSnapshot", "file_version"),
+        ("GlobalStateSnapshot", "anchored_path"),
+        ("GlobalStateSnapshot", "file_id_to_file_path"),
+        ("GlobalStateSnapshot", "file_exists"),
+    ] {
+        source
+            .select(item(&format!("{owner}::{name}")))?
+            .rename(&format!("_{name}"))?;
+        source
+            .select(item(&format!("{owner}::_{name}")))?
+            .add_attribute("#[allow(dead_code)]")?;
+    }
+    source
+        .select(item("enqueue_workspace_fetch"))?
+        .set_visibility("pub(crate)")?;
+    fs::write(global_state_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(main_loop_rs)?;
-    build_support::add_use_alias(
-        &mut source,
-        Some("pub"),
-        "crate::shared_analyzer::run_shared_rust_analyzer_lsp_session_with_config",
-        "main_loop",
+    let mut source = Source::parse(&fs::read_to_string(main_loop_rs)?, Edition::CURRENT)?;
+    let pool = Source::parse(
+        &fs::read_to_string(main_loop_rs.with_file_name("task_pool.rs"))?,
+        Edition::CURRENT,
     )?;
-
-    build_support::rename::<ast::Fn>(&mut source, "main_loop", "_main_loop")?;
-    build_support::add_attr::<ast::Fn>(&mut source, "_main_loop", "#[allow(dead_code)]")?;
-    build_support::set_visibility::<ast::Fn>(&mut source, "_main_loop", "pub(crate)")?;
-    build_support::extract(
-        &mut source,
-        "run",
-        |function| {
-            let start = build_support::one(
-                build_support::calls(function, "update_status_or_notify"),
-                "`update_status_or_notify` call in `run`",
-            )?;
-            build_support::through_tail(&start, function)
-        },
-        build_support::Method {
-            name: "run_loop",
-            receiver: Some("&mut self"),
-            params: &[build_support::Param {
-                name: "inbox",
-                ty: "Receiver<lsp_server::Message>",
-            }],
-            args: &["inbox"],
-            return_ty: Some("anyhow::Result<()>"),
-        },
+    let spawn = pool.declaration(root().implementation("TaskPool<T>").item("spawn"))?;
+    let spawn_with_sender = pool.declaration(
+        root()
+            .implementation("TaskPool<T>")
+            .item("spawn_with_sender"),
     )?;
-    build_support::set_visibility::<ast::Fn>(&mut source, "run_loop", "pub(crate)")?;
-    build_support::rename::<ast::Fn>(&mut source, "run", "_run")?;
-    build_support::add_attr::<ast::Fn>(&mut source, "_run", "#[allow(dead_code)]")?;
-    build_support::set_visibility::<ast::Enum>(&mut source, "Event", "pub(crate)")?;
-    build_support::append::<ast::Enum>(
-        &mut source,
-        "Task",
-        &[
-            build_support::Variant {
-                name: "FetchedWorkspace",
-                tuple_fields: &["FetchWorkspaceResponse"],
-            },
-            build_support::Variant {
-                name: "FetchedProcMacros",
-                tuple_fields: &["crate::shared_analyzer::SharedProcMacroProgress"],
-            },
-            build_support::Variant {
-                name: "SharedReloadReady",
-                tuple_fields: &["crate::shared_analyzer::SharedAnalyzerOperationToken"],
-            },
-            build_support::Variant {
-                name: "SharedRebuildReady",
-                tuple_fields: &["crate::shared_analyzer::SharedAnalyzerOperationToken"],
-            },
-            build_support::Variant {
-                name: "SharedBuildDataReady",
-                tuple_fields: &[
-                    "String",
-                    "crate::shared_analyzer::SharedAnalyzerOperationToken",
-                ],
-            },
-            build_support::Variant {
-                name: "SharedProcMacrosReady",
-                tuple_fields: &[
-                    "String",
-                    "crate::shared_analyzer::SharedAnalyzerOperationToken",
-                ],
-            },
-            build_support::Variant {
-                name: "WorkspaceUpdated",
-                tuple_fields: &["crate::shared_analyzer::SharedAnalyzerRuntime"],
-            },
-            build_support::Variant {
-                name: "RetryDeferred",
-                tuple_fields: &["DeferredTask"],
-            },
-            build_support::Variant {
-                name: "RetryDiscoverTests",
-                tuple_fields: &["Vec<FileId>"],
-            },
-        ],
-    )?;
-    build_support::add_attr::<ast::Variant>(
-        &mut source,
-        "DiscoverProjectParam::Buildfile",
-        "#[allow(dead_code)]",
-    )?;
-
+    source.select(root())?.add_use("pub use crate::shared_analyzer::run_shared_rust_analyzer_lsp_session_with_config as main_loop;")?;
+    source.select(item("main_loop"))?.rename("_main_loop")?;
+    source
+        .select(item("_main_loop"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    source
+        .select(item("_main_loop"))?
+        .set_visibility("pub(crate)")?;
+    source.select(item("GlobalState::run"))?.extract("pub(crate) fn run_loop(&mut self, inbox: Receiver<lsp_server::Message>) -> anyhow::Result<()>", &["inbox"])?;
+    source.select(item("GlobalState::run"))?.rename("_run")?;
+    source
+        .select(item("GlobalState::_run"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    source.select(item("Event"))?.set_visibility("pub(crate)")?;
+    for variant in [
+        "FetchedWorkspace(FetchWorkspaceResponse)",
+        "FetchedProcMacros(crate::shared_analyzer::SharedProcMacroProgress)",
+        "SharedReloadReady(crate::shared_analyzer::SharedAnalyzerOperationToken)",
+        "SharedRebuildReady(crate::shared_analyzer::SharedAnalyzerOperationToken)",
+        "SharedBuildDataReady(String, crate::shared_analyzer::SharedAnalyzerOperationToken)",
+        "SharedProcMacrosReady(String, crate::shared_analyzer::SharedAnalyzerOperationToken)",
+        "WorkspaceUpdated(crate::shared_analyzer::SharedAnalyzerRuntime)",
+        "RetryDeferred(DeferredTask)",
+        "RetryDiscoverTests(Vec<FileId>)",
+    ] {
+        source.select(item("Task"))?.add_variant(variant)?;
+    }
+    source
+        .select(item("DiscoverProjectParam").variant("Buildfile"))?
+        .add_attribute("#[allow(dead_code)]")?;
     for name in [
         "handle_event",
         "update_diagnostics",
         "update_tests",
         "handle_task",
     ] {
-        let replacement = format!("_{name}");
-        build_support::rename::<ast::Fn>(&mut source, name, &replacement)?;
+        source.select(item(name))?.rename(&format!("_{name}"))?;
     }
+    source.select(item("GlobalState::_update_diagnostics").body().region(root().child(root().binding("subscriptions")).after(), root().end()))?
+        .extract("fn spawn_native_diagnostics(&mut self, generation: DiagnosticsGeneration, subscriptions: std::sync::Arc<[FileId]>)", &["generation", "subscriptions"])?;
+    source
+        .select(item("GlobalState::_update_diagnostics"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    source
+        .select(item("GlobalState::_update_tests").body().region(
+            root().child(root().binding("subscriptions")).after(),
+            root().end(),
+        ))?
+        .extract(
+            "fn spawn_discover_tests(&mut self, subscriptions: Vec<FileId>)",
+            &["subscriptions"],
+        )?;
+    source
+        .select(item("GlobalState::_update_tests"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    source
+        .select(
+            item("GlobalState::spawn_native_diagnostics")
+                .for_loop()
+                .call("snapshot"),
+        )?
+        .redirect("pending_snapshot")?;
 
-    build_support::extract(
-        &mut source,
-        "_update_diagnostics",
-        |_| Ok(build_support::params_tail()),
-        build_support::Method {
-            name: "spawn_native_diagnostics",
-            receiver: Some("&mut self"),
-            params: &[
-                build_support::Param {
-                    name: "generation",
-                    ty: "DiagnosticsGeneration",
-                },
-                build_support::Param {
-                    name: "subscriptions",
-                    ty: "std::sync::Arc<[FileId]>",
-                },
-            ],
-            args: &["generation", "subscriptions"],
-            return_ty: None,
-        },
-    )?;
-    build_support::add_attr::<ast::Fn>(&mut source, "_update_diagnostics", "#[allow(dead_code)]")?;
-    build_support::extract(
-        &mut source,
-        "_update_tests",
-        |_| Ok(build_support::params_tail()),
-        build_support::Method {
-            name: "spawn_discover_tests",
-            receiver: Some("&mut self"),
-            params: &[build_support::Param {
-                name: "subscriptions",
-                ty: "Vec<FileId>",
-            }],
-            args: &["subscriptions"],
-            return_ty: None,
-        },
-    )?;
-    build_support::add_attr::<ast::Fn>(&mut source, "_update_tests", "#[allow(dead_code)]")?;
-    build_support::redirect_call(
-        &mut source,
-        build_support::Scope::ForLoop {
-            function: "spawn_native_diagnostics",
-        },
-        "snapshot",
-        "pending_snapshot",
+    let task = item("GlobalState::spawn_discover_tests")
+        .call("spawn")
+        .declared_by(&spawn)
+        .argument("task");
+    source
+        .select(task.clone().call("snapshot"))?
+        .redirect("pending_snapshot")?;
+    let callback = task.child(root().closure());
+    source
+        .select(callback.clone())?
+        .add_parameter("snapshot: _")?;
+    source.select(callback)?.delegate(
+        "crate::main_loop::session::discover_tests",
+        &["snapshot", "subscriptions.clone()"],
     )?;
 
-    build_support::redirect_call(
-        &mut source,
-        build_support::Scope::MethodArgument {
-            function: "spawn_discover_tests",
-            method: "spawn",
-        },
-        "snapshot",
-        "pending_snapshot",
-    )?;
-    build_support::delegate_closure(
-        &mut source,
-        build_support::ClosureDelegate {
-            scope: build_support::Scope::Function("spawn_discover_tests"),
-            call: build_support::Call::Method("spawn"),
-            helper: "crate::main_loop::session::discover_tests",
-            context: &[
-                build_support::ClosureContext::Move("snapshot"),
-                build_support::ClosureContext::Clone("subscriptions"),
-            ],
-            params: &[build_support::Param {
-                name: "snapshot",
-                ty: "_",
-            }],
-        },
-    )?;
+    let task = item("GlobalState::prime_caches")
+        .call("spawn_with_sender")
+        .declared_by(&spawn_with_sender)
+        .argument("task");
+    source
+        .select(task.clone().call("snapshot"))?
+        .redirect("pending_snapshot")?;
+    let callback = task.child(root().closure());
+    source
+        .select(callback.clone())?
+        .at(root().parameter("sender").before())
+        .add_parameter("analysis: _")?;
+    source
+        .select(callback)?
+        .delegate("crate::main_loop::session::prime_caches", &["analysis"])?;
 
-    build_support::redirect_call(
-        &mut source,
-        build_support::Scope::MethodArgument {
-            function: "prime_caches",
-            method: "spawn_with_sender",
-        },
-        "snapshot",
-        "pending_snapshot",
-    )?;
-    build_support::delegate_closure(
-        &mut source,
-        build_support::ClosureDelegate {
-            scope: build_support::Scope::Function("prime_caches"),
-            call: build_support::Call::Method("spawn_with_sender"),
-            helper: "crate::main_loop::session::prime_caches",
-            context: &[build_support::ClosureContext::Move("analysis")],
-            params: &[
-                build_support::Param {
-                    name: "analysis",
-                    ty: "_",
-                },
-                build_support::Param {
-                    name: "sender",
-                    ty: "_",
-                },
-            ],
-        },
-    )?;
-
-    for (scope, method, helper, context, params) in [
+    for (variant, helper, context, parameter) in [
         (
-            build_support::Scope::MatchArm {
-                function: "handle_deferred_task",
-                type_name: "DeferredTask",
-                variant_name: "CheckIfIndexed",
-            },
-            "spawn_with_sender",
+            "DeferredTask::CheckIfIndexed",
             "crate::main_loop::session::check_if_indexed",
-            &[
-                build_support::ClosureContext::Move("snap"),
-                build_support::ClosureContext::Clone("uri"),
-            ][..],
-            &[
-                build_support::Param {
-                    name: "snap",
-                    ty: "_",
-                },
-                build_support::Param {
-                    name: "sender",
-                    ty: "_",
-                },
-            ][..],
+            &["snap", "uri.clone()"][..],
+            "snap: _",
         ),
         (
-            build_support::Scope::MatchArm {
-                function: "handle_deferred_task",
-                type_name: "DeferredTask",
-                variant_name: "CheckProcMacroSources",
-            },
-            "spawn_with_sender",
+            "DeferredTask::CheckProcMacroSources",
             "crate::main_loop::session::check_proc_macro_sources",
-            &[
-                build_support::ClosureContext::Move("analysis"),
-                build_support::ClosureContext::Clone("modified_rust_files"),
-            ][..],
-            &[
-                build_support::Param {
-                    name: "analysis",
-                    ty: "_",
-                },
-                build_support::Param {
-                    name: "sender",
-                    ty: "_",
-                },
-            ][..],
+            &["analysis", "modified_rust_files.clone()"][..],
+            "analysis: _",
         ),
     ] {
-        build_support::redirect_call(&mut source, scope, "snapshot", "pending_snapshot")?;
-        build_support::delegate_closure(
-            &mut source,
-            build_support::ClosureDelegate {
-                scope,
-                call: build_support::Call::Method(method),
-                helper,
-                context,
-                params,
-            },
-        )?;
+        let scope = item("GlobalState::handle_deferred_task").arm(variant);
+        source
+            .select(scope.clone().call("snapshot"))?
+            .redirect("pending_snapshot")?;
+        let callback = scope
+            .call("spawn_with_sender")
+            .declared_by(&spawn_with_sender)
+            .argument("task")
+            .closure()
+            .has(root().parameter("sender"));
+        source
+            .select(callback.clone())?
+            .at(root().parameter("sender").before())
+            .add_parameter(parameter)?;
+        source.select(callback)?.delegate(helper, context)?;
     }
 
-    build_support::extract(
-        &mut source,
-        "_handle_event",
-        |function| {
-            let arm = build_support::one(
-                build_support::arms(function, "PrimeCachesProgress", "End"),
-                "`PrimeCachesProgress::End` arm",
-            )?;
-            let call = build_support::one(
-                build_support::calls(&arm, "trigger_garbage_collection"),
-                "`trigger_garbage_collection` call in the arm",
-            )?;
-            build_support::stmt(&call)
-        },
-        build_support::Method {
-            name: "mark_prime_caches_gc",
-            receiver: Some("&mut self"),
-            params: &[],
-            args: &[],
-            return_ty: None,
-        },
-    )?;
-    build_support::rename::<ast::Fn>(&mut source, "mark_prime_caches_gc", "_mark_prime_caches_gc")?;
-    build_support::add_attr::<ast::Fn>(
-        &mut source,
-        "_mark_prime_caches_gc",
-        "#[allow(dead_code)]",
-    )?;
-
-    build_support::extract(
-        &mut source,
-        "_handle_event",
-        |function| {
-            let idle = build_support::one(
-                build_support::ifs_referencing(function, "last_gc_revision"),
-                "idle gc guard",
-            )?;
-            let call = build_support::one(
-                build_support::calls(&idle, "trigger_garbage_collection"),
-                "`trigger_garbage_collection` call in the guard",
-            )?;
-            build_support::stmt(&call)
-        },
-        build_support::Method {
-            name: "mark_idle_gc",
-            receiver: Some("&mut self"),
-            params: &[],
-            args: &[],
-            return_ty: None,
-        },
-    )?;
-    build_support::rename::<ast::Fn>(&mut source, "mark_idle_gc", "_mark_idle_gc")?;
-    build_support::add_attr::<ast::Fn>(&mut source, "_mark_idle_gc", "#[allow(dead_code)]")?;
-
-    build_support::extract(
-        &mut source,
-        "_handle_event",
-        |function| {
-            let guard = build_support::one(
-                build_support::ifs_calling(function, "take_changes"),
-                "diagnostics change guard",
-            )?;
-            let changes_loop =
-                build_support::one(build_support::for_loops(&guard), "for loop in the guard")?;
-            build_support::for_body(&changes_loop)
-        },
-        build_support::Method {
-            name: "publish_changed_diagnostics",
-            receiver: Some("&mut self"),
-            params: &[build_support::Param {
-                name: "file_id",
-                ty: "FileId",
-            }],
-            args: &["file_id"],
-            return_ty: None,
-        },
-    )?;
-    build_support::rename::<ast::Fn>(
-        &mut source,
-        "publish_changed_diagnostics",
-        "_publish_changed_diagnostics",
-    )?;
-    build_support::add_attr::<ast::Fn>(
-        &mut source,
-        "_publish_changed_diagnostics",
-        "#[allow(dead_code)]",
-    )?;
-
-    build_support::extract(
-        &mut source,
-        "handle_flycheck_msg",
-        |function| {
-            let arm = build_support::one(
-                build_support::arms(function, "FlycheckMessage", "AddDiagnostic"),
-                "`FlycheckMessage::AddDiagnostic` arm",
-            )?;
-            let diagnostics_loop =
-                build_support::one(build_support::for_loops(&arm), "for loop in the arm")?;
-            build_support::for_body(&diagnostics_loop)
-        },
-        build_support::Method {
-            name: "record_flycheck_diagnostic",
-            receiver: Some("&mut self"),
-            params: &[
-                build_support::Param {
-                    name: "id",
-                    ty: "usize",
-                },
-                build_support::Param {
-                    name: "generation",
-                    ty: "DiagnosticsGeneration",
-                },
-                build_support::Param {
-                    name: "package_id",
-                    ty: "Option<crate::flycheck::PackageSpecifier>",
-                },
-                build_support::Param {
-                    name: "diag",
-                    ty: "crate::diagnostics::flycheck_to_proto::MappedRustDiagnostic",
-                },
-            ],
-            args: &["id", "generation", "package_id.clone()", "diag"],
-            return_ty: None,
-        },
-    )?;
-    build_support::rename::<ast::Fn>(
-        &mut source,
-        "record_flycheck_diagnostic",
-        "_record_flycheck_diagnostic",
-    )?;
-    build_support::add_attr::<ast::Fn>(
-        &mut source,
-        "_record_flycheck_diagnostic",
-        "#[allow(dead_code)]",
-    )?;
-
-    build_support::append_record_fields(
-        &mut source,
-        "_handle_task",
-        "FetchWorkspaceResponse",
-        &[
-            build_support::FieldInit {
-                name: "shared",
-                value: Some("self.shared.clone()"),
-            },
-            build_support::FieldInit {
-                name: "reload_id",
-                value: Some("None"),
-            },
-            build_support::FieldInit {
-                name: "adopted",
-                value: Some("false"),
-            },
-        ],
-    )?;
-    build_support::append_record_fields(
-        &mut source,
-        "_handle_task",
-        "FetchBuildDataResponse",
-        &[
-            build_support::FieldInit {
-                name: "rebuild_id",
-                value: Some("self.build_data_rebuild_id"),
-            },
-            build_support::FieldInit {
-                name: "reload",
-                value: Some("self.build_data_reload"),
-            },
-        ],
-    )?;
-
-    build_support::rename_path_root(&mut source, "_handle_task", "Task", "UpstreamTask")?;
-    build_support::add_use(&mut source, None, "self::session::UpstreamTask")?;
-
+    source
+        .select(
+            item("GlobalState::_handle_event")
+                .arm("PrimeCachesProgress::End")
+                .call("trigger_garbage_collection"),
+        )?
+        .extract("fn mark_prime_caches_gc(&mut self)", &[])?;
+    source
+        .select(item("mark_prime_caches_gc"))?
+        .rename("_mark_prime_caches_gc")?;
+    source
+        .select(item("_mark_prime_caches_gc"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    source
+        .select(
+            item("GlobalState::_handle_event")
+                .if_expr()
+                .has(root().condition().references("self.last_gc_revision"))
+                .call("trigger_garbage_collection"),
+        )?
+        .extract("fn mark_idle_gc(&mut self)", &[])?;
+    source
+        .select(item("mark_idle_gc"))?
+        .rename("_mark_idle_gc")?;
+    source
+        .select(item("_mark_idle_gc"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    source
+        .select(
+            item("GlobalState::_handle_event")
+                .if_expr()
+                .has(root().condition().call("take_changes"))
+                .for_loop()
+                .body(),
+        )?
+        .extract(
+            "fn publish_changed_diagnostics(&mut self, file_id: FileId)",
+            &["file_id"],
+        )?;
+    source
+        .select(item("publish_changed_diagnostics"))?
+        .rename("_publish_changed_diagnostics")?;
+    source
+        .select(item("_publish_changed_diagnostics"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    source.select(item("GlobalState::handle_flycheck_msg").arm("FlycheckMessage::AddDiagnostic").for_loop().body())?
+        .extract("fn record_flycheck_diagnostic(&mut self, id: usize, generation: DiagnosticsGeneration, package_id: Option<crate::flycheck::PackageSpecifier>, diag: crate::diagnostics::flycheck_to_proto::MappedRustDiagnostic)", &["id", "generation", "package_id.clone()", "diag"])?;
+    source
+        .select(item("record_flycheck_diagnostic"))?
+        .rename("_record_flycheck_diagnostic")?;
+    source
+        .select(item("_record_flycheck_diagnostic"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    for field in [
+        "shared: self.shared.clone()",
+        "reload_id: None",
+        "adopted: false",
+    ] {
+        source
+            .select(item("GlobalState::_handle_task").record("FetchWorkspaceResponse"))?
+            .add_field(field)?;
+    }
+    for field in [
+        "rebuild_id: self.build_data_rebuild_id",
+        "reload: self.build_data_reload",
+    ] {
+        source
+            .select(item("GlobalState::_handle_task").record("FetchBuildDataResponse"))?
+            .add_field(field)?;
+    }
+    source
+        .select(item("GlobalState::_handle_task").symbol("Task"))?
+        .redirect("self::session::UpstreamTask")?;
     let session = owned_source_path("session.rs");
-    build_support::mount_module(&mut source, Some("pub(crate)"), "session", &session)?;
-
-    fs::write(main_loop_rs, source)?;
+    source
+        .select(root())?
+        .mount_module("pub(crate) mod session", &session)?;
+    fs::write(main_loop_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_session_source(session_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(session_rs)?;
-    build_support::append::<ast::Enum>(
-        &mut source,
-        "IoThreads",
-        &[build_support::Variant {
-            name: "External",
-            tuple_fields: &[],
-        }],
-    )?;
-    build_support::append_match_arms(
-        &mut source,
-        build_support::Scope::MatchArm {
-            function: "join",
-            type_name: "IoThreads",
-            variant_name: "Stdio",
-        },
-        &[build_support::MatchArm {
-            pattern: "IoThreads::External",
-            expression: "Ok(())",
-        }],
-    )?;
-
-    fs::write(session_rs, source)?;
+    let mut source = Source::parse(&fs::read_to_string(session_rs)?, Edition::CURRENT)?;
+    source.select(item("IoThreads"))?.add_variant("External")?;
+    source
+        .select(
+            item("IoThreads::join")
+                .match_expr()
+                .has(arm("IoThreads::Stdio")),
+        )?
+        .add_arm("IoThreads::External => Ok(())")?;
+    fs::write(session_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_op_queue_source(op_queue_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(op_queue_rs)?;
-    build_support::set_visibility::<ast::RecordField>(&mut source, "last_op_result", "pub(crate)")?;
-    fs::write(op_queue_rs, source)?;
+    let mut source = Source::parse(&fs::read_to_string(op_queue_rs)?, Edition::CURRENT)?;
+    source
+        .select(item("OpQueue").field("last_op_result"))?
+        .set_visibility("pub(crate)")?;
+    fs::write(op_queue_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(reload_rs)?;
-
+    let mut source = Source::parse(&fs::read_to_string(reload_rs)?, Edition::CURRENT)?;
     for name in [
         "update_configuration",
         "fetch_workspaces",
@@ -1187,353 +704,232 @@ fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
         "fetch_proc_macros",
         "recreate_crate_graph",
     ] {
-        let replacement = format!("_{name}");
-        build_support::rename::<ast::Fn>(&mut source, name, &replacement)?;
+        source.select(item(name))?.rename(&format!("_{name}"))?;
     }
     for name in [
-        "fetch_workspaces",
-        "fetch_proc_macros",
-        "recreate_crate_graph",
+        "_fetch_workspaces",
+        "_fetch_proc_macros",
+        "_recreate_crate_graph",
     ] {
-        let replacement = format!("_{name}");
-        build_support::add_attr::<ast::Fn>(&mut source, &replacement, "#[allow(dead_code)]")?;
+        source
+            .select(item(name))?
+            .add_attribute("#[allow(dead_code)]")?;
     }
-
-    build_support::set_visibility::<ast::Fn>(&mut source, "reload_flycheck", "pub(crate)")?;
-
-    build_support::add_rest_pattern(&mut source, "switch_workspaces", "FetchWorkspaceResponse")?;
-    build_support::add_rest_pattern(&mut source, "switch_workspaces", "FetchBuildDataResponse")?;
-    build_support::redirect_call(
-        &mut source,
-        build_support::Scope::Function("switch_workspaces"),
-        "recreate_crate_graph",
-        "recreate_crate_graph_from_shared",
-    )?;
-    build_support::rename::<ast::Fn>(&mut source, "switch_workspaces", "_switch_workspaces")?;
-    build_support::extract(
-        &mut source,
-        "_switch_workspaces",
-        |function| {
-            let branch = build_support::one(
-                build_support::ifs_calling(function, "expand_proc_macros"),
-                "proc-macro client branch",
-            )?;
-            build_support::stmt(&branch)
-        },
-        build_support::Method {
-            name: "set_proc_macro_clients",
-            receiver: Some("&mut self"),
-            params: &[build_support::Param {
-                name: "same_workspaces",
-                ty: "bool",
-            }],
-            args: &["same_workspaces"],
-            return_ty: None,
-        },
-    )?;
-    build_support::rename::<ast::Fn>(
-        &mut source,
-        "set_proc_macro_clients",
-        "_set_proc_macro_clients",
-    )?;
-    build_support::add_attr::<ast::Fn>(
-        &mut source,
-        "_set_proc_macro_clients",
-        "#[allow(dead_code)]",
-    )?;
-
-    fs::write(reload_rs, source)?;
+    source
+        .select(item("reload_flycheck"))?
+        .set_visibility("pub(crate)")?;
+    for response in ["FetchWorkspaceResponse", "FetchBuildDataResponse"] {
+        source
+            .select(item("GlobalState::switch_workspaces").pattern(response))?
+            .add_rest()?;
+    }
+    source
+        .select(
+            item("GlobalState::switch_workspaces")
+                .body()
+                .child(root().call("recreate_crate_graph")),
+        )?
+        .redirect("recreate_crate_graph_from_shared")?;
+    source
+        .select(item("GlobalState::switch_workspaces"))?
+        .rename("_switch_workspaces")?;
+    source
+        .select(
+            item("GlobalState::_switch_workspaces")
+                .if_expr()
+                .has(root().condition().call("expand_proc_macros")),
+        )?
+        .extract(
+            "fn set_proc_macro_clients(&mut self, same_workspaces: bool)",
+            &["same_workspaces"],
+        )?;
+    source
+        .select(item("set_proc_macro_clients"))?
+        .rename("_set_proc_macro_clients")?;
+    source
+        .select(item("_set_proc_macro_clients"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    fs::write(reload_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_dispatch_source(dispatch_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(dispatch_rs)?;
-
+    let mut source = Source::parse(&fs::read_to_string(dispatch_rs)?, Edition::CURRENT)?;
     let shared_dispatch = owned_source_path("shared_dispatch.rs");
-    build_support::mount_module(&mut source, None, "shared_dispatch", &shared_dispatch)?;
+    source
+        .select(root())?
+        .mount_module("mod shared_dispatch", &shared_dispatch)?;
     println!("cargo:rerun-if-changed={}", shared_dispatch.display());
-    build_support::redirect_call(
-        &mut source,
-        build_support::Scope::Function("on_with_thread_intent"),
-        "snapshot",
-        "pending_snapshot",
+    source
+        .select(item("on_with_thread_intent").call("snapshot"))?
+        .redirect("pending_snapshot")?;
+    let callback = item("on_with_thread_intent")
+        .call("spawn")
+        .child(root().closure());
+    source.select(callback.clone())?.add_parameter("world: _")?;
+    source.select(callback)?.delegate(
+        "crate::handlers::dispatch::shared_dispatch::on_with_thread_intent",
+        &["world", "req.clone()"],
     )?;
-    build_support::delegate_closure(
-        &mut source,
-        build_support::ClosureDelegate {
-            scope: build_support::Scope::Function("on_with_thread_intent"),
-            call: build_support::Call::Method("spawn"),
-            helper: "crate::handlers::dispatch::shared_dispatch::on_with_thread_intent",
-            context: &[
-                build_support::ClosureContext::Move("world"),
-                build_support::ClosureContext::Clone("req"),
-            ],
-            params: &[build_support::Param {
-                name: "world",
-                ty: "_",
-            }],
-        },
-    )?;
-
-    fs::write(dispatch_rs, source)?;
+    fs::write(dispatch_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_request_source(request_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(request_rs)?;
-
+    let mut source = Source::parse(&fs::read_to_string(request_rs)?, Edition::CURRENT)?;
     for name in ["handle_workspace_reload", "handle_proc_macros_rebuild"] {
         let replacement = format!("_{name}");
-        build_support::rename::<ast::Fn>(&mut source, name, &replacement)?;
-        build_support::add_attr::<ast::Fn>(&mut source, &replacement, "#[allow(dead_code)]")?;
-        build_support::add_use(
-            &mut source,
-            Some("pub(crate)"),
-            &format!("crate::shared_reload::{name}"),
-        )?;
+        source.select(item(name))?.rename(&replacement)?;
+        source
+            .select(item(&replacement))?
+            .add_attribute("#[allow(dead_code)]")?;
+        source
+            .select(root())?
+            .add_use(&format!("pub(crate) use crate::shared_reload::{name};"))?;
     }
-
-    fs::write(request_rs, source)?;
+    fs::write(request_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(flycheck_to_proto_rs)?;
-
-    build_support::rename::<ast::Fn>(&mut source, "location", "_location")?;
-    build_support::add_use(&mut source, None, "self::flycheck_location::location")?;
+    let mut source = Source::parse(&fs::read_to_string(flycheck_to_proto_rs)?, Edition::CURRENT)?;
+    source.select(item("location"))?.rename("_location")?;
+    source
+        .select(root())?
+        .add_use("use self::flycheck_location::location;")?;
     let flycheck_location = owned_source_path("diagnostics/flycheck_location.rs");
-    build_support::mount_module(&mut source, None, "flycheck_location", &flycheck_location)?;
+    source
+        .select(root())?
+        .mount_module("mod flycheck_location", &flycheck_location)?;
     println!("cargo:rerun-if-changed={}", flycheck_location.display());
-    fs::write(flycheck_to_proto_rs, source)?;
+    fs::write(flycheck_to_proto_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(notification_rs)?;
-
-    build_support::extract(
-        &mut source,
-        "handle_did_close_text_document",
-        |function| {
-            let branch = build_support::one(
-                build_support::ifs_referencing(function, "vfs"),
-                "native diagnostics cleanup branch",
-            )?;
-            build_support::stmt(&branch)
-        },
-        build_support::Method {
-            name: "clear_native_diagnostics_for_closed_file",
-            receiver: None,
-            params: &[
-                build_support::Param {
-                    name: "state",
-                    ty: "&mut GlobalState",
-                },
-                build_support::Param {
-                    name: "path",
-                    ty: "VfsPath",
-                },
-            ],
-            args: &["state", "path.clone()"],
-            return_ty: None,
-        },
+    let mut source = Source::parse(&fs::read_to_string(notification_rs)?, Edition::CURRENT)?;
+    source
+        .select(
+            item("handle_did_close_text_document")
+                .if_expr()
+                .has(root().condition().references("state.vfs")),
+        )?
+        .extract(
+            "fn clear_native_diagnostics_for_closed_file(state: &mut GlobalState, path: VfsPath)",
+            &["state", "path.clone()"],
+        )?;
+    source
+        .select(item("clear_native_diagnostics_for_closed_file"))?
+        .rename("_clear_native_diagnostics_for_closed_file")?;
+    source
+        .select(item("_clear_native_diagnostics_for_closed_file"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    source.select(root())?.add_use(
+        "pub(crate) use crate::shared_notification::clear_native_diagnostics_for_closed_file;",
     )?;
-    build_support::rename::<ast::Fn>(
-        &mut source,
-        "clear_native_diagnostics_for_closed_file",
-        "_clear_native_diagnostics_for_closed_file",
+    source
+        .select(
+            item("run_flycheck")
+                .if_expr()
+                .has(root().condition().pattern("FileExcluded::No"))
+                .call("snapshot"),
+        )?
+        .redirect("pending_snapshot")?;
+    source.select(item("run_flycheck").arm("InvocationStrategy::Once"))?
+        .extract("pub(crate) fn run_flycheck_once(world: crate::shared_global_state::PendingGlobalStateSnapshot, vfs_path: vfs::VfsPath) -> Box<dyn FnOnce() -> ide::Cancellable<()> + Send + UnwindSafe>", &["world", "vfs_path.clone()"])?;
+    let callback = item("run_flycheck_once")
+        .call("Box::new")
+        .child(root().closure());
+    source.select(callback.clone())?.add_parameter("world: _")?;
+    source
+        .select(callback)?
+        .delegate("crate::shared_notification::activate_flycheck", &["world"])?;
+    source.select(item("run_flycheck").arm("InvocationStrategy::PerWorkspace"))?
+        .extract("pub(crate) fn run_flycheck_per_workspace(world: crate::shared_global_state::PendingGlobalStateSnapshot, file_id: ide::FileId, vfs_path: vfs::VfsPath, may_flycheck_workspace: bool) -> Box<dyn FnOnce() -> ide::Cancellable<()> + Send + UnwindSafe>", &["world", "file_id", "vfs_path.clone()", "may_flycheck_workspace"])?;
+    let callback = item("run_flycheck_per_workspace")
+        .call("Box::new")
+        .child(root().closure());
+    source.select(callback.clone())?.add_parameter("world: _")?;
+    source.select(callback)?.delegate(
+        "crate::shared_notification::select_flycheck_per_workspace",
+        &["world"],
     )?;
-    build_support::add_attr::<ast::Fn>(
-        &mut source,
-        "_clear_native_diagnostics_for_closed_file",
-        "#[allow(dead_code)]",
-    )?;
-    build_support::add_use(
-        &mut source,
-        Some("pub(crate)"),
-        "crate::shared_notification::clear_native_diagnostics_for_closed_file",
-    )?;
-
-    build_support::redirect_call(
-        &mut source,
-        build_support::Scope::IfLet {
-            function: "run_flycheck",
-            type_name: "FileExcluded",
-            variant_name: "No",
-        },
-        "snapshot",
-        "pending_snapshot",
-    )?;
-    let once = build_support::Scope::MatchArm {
-        function: "run_flycheck",
-        type_name: "InvocationStrategy",
-        variant_name: "Once",
-    };
-    build_support::extract_match_arm(
-        &mut source,
-        once,
-        build_support::Function {
-            name: "run_flycheck_once",
-            params: &[
-                build_support::Param {
-                    name: "world",
-                    ty: "crate::shared_global_state::PendingGlobalStateSnapshot",
-                },
-                build_support::Param {
-                    name: "vfs_path",
-                    ty: "vfs::VfsPath",
-                },
-            ],
-            args: &["world", "vfs_path.clone()"],
-            return_ty: Some("Box<dyn FnOnce() -> ide::Cancellable<()> + Send + UnwindSafe>"),
-        },
-    )?;
-    build_support::delegate_closure(
-        &mut source,
-        build_support::ClosureDelegate {
-            scope: build_support::Scope::Function("run_flycheck_once"),
-            call: build_support::Call::Function("Box::new"),
-            helper: "crate::shared_notification::activate_flycheck",
-            context: &[build_support::ClosureContext::Move("world")],
-            params: &[build_support::Param {
-                name: "world",
-                ty: "_",
-            }],
-        },
-    )?;
-    let per_workspace = build_support::Scope::MatchArm {
-        function: "run_flycheck",
-        type_name: "InvocationStrategy",
-        variant_name: "PerWorkspace",
-    };
-    build_support::extract_match_arm(
-        &mut source,
-        per_workspace,
-        build_support::Function {
-            name: "run_flycheck_per_workspace",
-            params: &[
-                build_support::Param {
-                    name: "world",
-                    ty: "crate::shared_global_state::PendingGlobalStateSnapshot",
-                },
-                build_support::Param {
-                    name: "file_id",
-                    ty: "ide::FileId",
-                },
-                build_support::Param {
-                    name: "vfs_path",
-                    ty: "vfs::VfsPath",
-                },
-                build_support::Param {
-                    name: "may_flycheck_workspace",
-                    ty: "bool",
-                },
-            ],
-            args: &[
-                "world",
-                "file_id",
-                "vfs_path.clone()",
-                "may_flycheck_workspace",
-            ],
-            return_ty: Some("Box<dyn FnOnce() -> ide::Cancellable<()> + Send + UnwindSafe>"),
-        },
-    )?;
-    build_support::delegate_closure(
-        &mut source,
-        build_support::ClosureDelegate {
-            scope: build_support::Scope::Function("run_flycheck_per_workspace"),
-            call: build_support::Call::Function("Box::new"),
-            helper: "crate::shared_notification::select_flycheck_per_workspace",
-            context: &[build_support::ClosureContext::Move("world")],
-            params: &[build_support::Param {
-                name: "world",
-                ty: "_",
-            }],
-        },
-    )?;
-    for name in [
-        "run_flycheck",
-        "run_flycheck_once",
-        "run_flycheck_per_workspace",
-    ] {
-        build_support::set_visibility::<ast::Fn>(&mut source, name, "pub(crate)")?;
-    }
-    build_support::rename::<ast::Fn>(&mut source, "run_flycheck", "_run_flycheck")?;
-    build_support::add_attr::<ast::Fn>(&mut source, "_run_flycheck", "#[allow(dead_code)]")?;
-    build_support::add_use(
-        &mut source,
-        Some("pub(crate)"),
-        "crate::shared_notification::run_flycheck",
-    )?;
-    build_support::rename::<ast::Fn>(
-        &mut source,
-        "handle_did_save_text_document",
-        "_handle_did_save_text_document",
-    )?;
-    build_support::add_use(
-        &mut source,
-        Some("pub(crate)"),
-        "crate::shared_notification::handle_did_save_text_document",
-    )?;
-
-    fs::write(notification_rs, source)?;
+    source
+        .select(item("run_flycheck"))?
+        .set_visibility("pub(crate)")?;
+    source
+        .select(item("run_flycheck"))?
+        .rename("_run_flycheck")?;
+    source
+        .select(item("_run_flycheck"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    source
+        .select(root())?
+        .add_use("pub(crate) use crate::shared_notification::run_flycheck;")?;
+    source
+        .select(item("handle_did_save_text_document"))?
+        .rename("_handle_did_save_text_document")?;
+    source
+        .select(root())?
+        .add_use("pub(crate) use crate::shared_notification::handle_did_save_text_document;")?;
+    fs::write(notification_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_task_pool_source(task_pool_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(task_pool_rs)?;
-    build_support::set_visibility::<ast::RecordField>(
-        &mut source,
-        "TaskPool::sender",
-        "pub(crate)",
-    )?;
-    fs::write(task_pool_rs, source)?;
+    let mut source = Source::parse(&fs::read_to_string(task_pool_rs)?, Edition::CURRENT)?;
+    source
+        .select(item("TaskPool").field("sender"))?
+        .set_visibility("pub(crate)")?;
+    fs::write(task_pool_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_driver_source(main_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(main_rs)?;
-
-    build_support::set_visibility::<ast::Fn>(&mut source, "main", "pub")?;
-    build_support::set_visibility::<ast::Fn>(&mut source, "setup_logging", "pub")?;
-    build_support::set_visibility::<ast::Fn>(&mut source, "wait_for_debugger", "pub")?;
-    build_support::add_use_alias(&mut source, None, "crate", "rust_analyzer")?;
-
-    fs::write(main_rs, source)?;
+    let mut source = Source::parse(&fs::read_to_string(main_rs)?, Edition::CURRENT)?;
+    for name in ["main", "setup_logging", "wait_for_debugger"] {
+        source.select(item(name))?.set_visibility("pub")?;
+    }
+    source
+        .select(root())?
+        .add_use("use crate as rust_analyzer;")?;
+    fs::write(main_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_slow_tests(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
     for name in ["main.rs", "ratoml.rs", "cli.rs", "flycheck.rs"] {
         let path = slow_tests.join(name);
-        let mut source = fs::read_to_string(&path)?;
-        build_support::retarget_use(
-            &mut source,
-            "skip_slow_tests",
-            "crate::test_support::skip_slow_tests",
-        )?;
-        fs::write(path, source)?;
+        let mut source = Source::parse(&fs::read_to_string(&path)?, Edition::CURRENT)?;
+        source
+            .select(root().import("skip_slow_tests"))?
+            .redirect("crate::test_support::skip_slow_tests")?;
+        fs::write(path, source.to_string())?;
     }
-
     let support = slow_tests.join("support.rs");
-    let mut source = fs::read_to_string(&support)?;
-    build_support::rename::<ast::Fn>(&mut source, "lines_match", "_original_lines_match")?;
-    build_support::set_visibility::<ast::Fn>(&mut source, "_original_lines_match", "pub(crate)")?;
-    build_support::add_use(&mut source, None, "crate::test_support::lines_match")?;
-    fs::write(support, source)?;
-
+    let mut source = Source::parse(&fs::read_to_string(&support)?, Edition::CURRENT)?;
+    source
+        .select(item("lines_match"))?
+        .rename("_original_lines_match")?;
+    source
+        .select(item("_original_lines_match"))?
+        .set_visibility("pub(crate)")?;
+    source
+        .select(root())?
+        .add_use("use crate::test_support::lines_match;")?;
+    fs::write(support, source.to_string())?;
     let ratoml = slow_tests.join("ratoml.rs");
-    let mut source = fs::read_to_string(&ratoml)?;
-    build_support::rename::<ast::Fn>(&mut source, "fixture_path", "_original_fixture_path")?;
-    build_support::mount_module(
-        &mut source,
-        None,
-        "fixture_uri",
-        &owned_source_path("slow_tests_uri.rs"),
-    )?;
-    build_support::add_use(&mut source, None, "self::fixture_uri::FixturePath")?;
-    fs::write(ratoml, source)?;
+    let mut source = Source::parse(&fs::read_to_string(&ratoml)?, Edition::CURRENT)?;
+    source
+        .select(item("fixture_path"))?
+        .rename("_original_fixture_path")?;
+    source
+        .select(root())?
+        .mount_module("mod fixture_uri", owned_source_path("slow_tests_uri.rs"))?;
+    source
+        .select(root())?
+        .add_use("use self::fixture_uri::FixturePath;")?;
+    fs::write(ratoml, source.to_string())?;
     Ok(())
 }
 

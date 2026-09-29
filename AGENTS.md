@@ -24,7 +24,7 @@ The `analyzed-ra*` crates patch unpacked upstream sources in `build.rs`, then co
 
 We keep our modifications to the upstream code minimal. Copying large blocks of upstream logic into our own files is the wrong approach. Instead:
 
-- Patches are declared in `build.rs` with typed parameters and applied through the syntax editing helpers in `analyzed-bridge`. Anchor on symbols and structure only: no ordinal positions, no statement text, no textual search.
+- Patches are declared in `build.rs` through `override` selectors and editing methods. Anchor on symbols and structure only: no ordinal positions, no statement text, no textual search.
 - Work at the symbol level where possible: adjust visibility, rename a function, add a field or parameter.
 - When a function body must change: rename the upstream function to `_original_name`, inject a replacement with the original name that delegates to `_original_name` where possible. When delegation isn't feasible, mark `_original_name` as `#[allow(dead_code)]`.
 - For logic that's inlined inside a large function and can't be reached otherwise: extract the relevant region into a method, then follow the same rename-and-replace approach. Do this only when necessary.
@@ -76,7 +76,7 @@ The workspace has several crates under `crates/`. The ones relevant for most cha
 - `analyzed`: CLI binary: `analyzed status`, `stop`, `daemon`, and the stdio-to-daemon bridge.
 - `analyzed-daemon`: service: socket/named-pipe listener, session management, backend lifecycle.
 - `analyzed-ipc`: protocol types and transport for the daemon <> client channel.
-- `analyzed-bridge`: build-time helper crate: unpacks upstream crates from the local registry, verifies checksums, and provides source-manipulation primitives.
+- `analyzed-bridge`: build-time integration: prepares upstream sources with `override`, declares bridge dependency replacements, and restores rust-analyzer's published source names.
 
 The remaining `analyzed-ra*` crates are the bridge crates that mirror one `ra_ap_*` upstream crate each. Their `build.rs` patches the upstream source and re-exports the result. The crate name tells you which upstream layer it wraps (e.g., `analyzed-ra-ide-db` wraps `ra_ap_ide_db`).
 

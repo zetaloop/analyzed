@@ -41,7 +41,6 @@ name = "analyzed-bridge"
 version = "0.5.4"
 dependencies = [
  "override",
- "ra_ap_syntax",
  "serde_json",
 ]
 
@@ -96,6 +95,7 @@ dependencies = [
  "mimalloc",
  "num_cpus",
  "oorandom",
+ "override",
  "parking_lot",
  "process-wrap",
  "ra-ap-rustc_type_ir",

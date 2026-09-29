@@ -9,5 +9,4 @@ description = "Build-time patching support for analyzed rust-analyzer bridge cra
 
 [dependencies]
 override = "0.1.0"
-ra_ap_syntax = "=0.0.352"
 serde_json.workspace = true
