@@ -1,5 +1,5 @@
 use analyzed_bridge as build_support;
-use analyzed_bridge::ast;
+use r#override::{Edition, Source, item, root};
 
 use std::{
     env,
@@ -21,97 +21,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(lib_rs)?;
-
+    let mut source = Source::parse(&fs::read_to_string(lib_rs)?, Edition::CURRENT)?;
     let visibility = owned_source_path("visibility.rs");
-    build_support::mount_module(&mut source, None, "visibility", &visibility)?;
+    source
+        .select(root())?
+        .mount_module("mod visibility", &visibility)?;
     println!("cargo:rerun-if-changed={}", visibility.display());
-    build_support::append::<ast::Struct>(
-        &mut source,
-        "RootDatabase",
-        &[build_support::Field {
-            vis: None,
-            name: "visible_files",
-            ty: "Option<std::sync::Arc<rustc_hash::FxHashSet<vfs::FileId>>>",
-        }],
-    )?;
-    build_support::append_record_fields(
-        &mut source,
-        "clone",
-        "Self",
-        &[build_support::FieldInit {
-            name: "visible_files",
-            value: Some("self.visible_files.clone()"),
-        }],
-    )?;
-    build_support::append_record_fields(
-        &mut source,
-        "new",
-        "RootDatabase",
-        &[build_support::FieldInit {
-            name: "visible_files",
-            value: Some("None"),
-        }],
-    )?;
-    fs::write(lib_rs, source)?;
+    source
+        .select(item("RootDatabase"))?
+        .add_field("visible_files: Option<std::sync::Arc<rustc_hash::FxHashSet<vfs::FileId>>>")?;
+    source
+        .select(item("RootDatabase::clone").record("Self"))?
+        .add_field("visible_files: self.visible_files.clone()")?;
+    source
+        .select(item("RootDatabase::new").record("RootDatabase"))?
+        .add_field("visible_files: None")?;
+    fs::write(lib_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_search_source(search_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(search_rs)?;
-
-    build_support::retarget_use(&mut source, "all_crates", "crate::visibility::all_crates")?;
-    build_support::add_use(&mut source, None, "crate::visibility::CrateVisibility")?;
-    build_support::redirect_call(
-        &mut source,
-        build_support::Scope::Function("reverse_dependencies"),
-        "transitive_reverse_dependencies",
-        "visible_reverse_dependencies",
-    )?;
-
-    fs::write(search_rs, source)?;
+    let mut source = Source::parse(&fs::read_to_string(search_rs)?, Edition::CURRENT)?;
+    source
+        .select(root().import("all_crates"))?
+        .redirect("crate::visibility::all_crates")?;
+    source
+        .select(root())?
+        .add_use("use crate::visibility::CrateVisibility;")?;
+    source
+        .select(item("reverse_dependencies").call("transitive_reverse_dependencies"))?
+        .redirect("visible_reverse_dependencies")?;
+    fs::write(search_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_symbol_index_source(symbol_index_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(symbol_index_rs)?;
-
-    build_support::set_parameter_type(
-        &mut source,
-        "resolve_path_to_modules",
-        "db",
-        "&RootDatabase",
-    )?;
-    build_support::redirect_call(
-        &mut source,
-        build_support::Scope::Function("world_symbols"),
-        "source_root_crates",
-        "crate::visibility::source_root_crates",
-    )?;
-    build_support::redirect_call(
-        &mut source,
-        build_support::Scope::Function("resolve_path_to_modules"),
-        "Crate::all",
-        "crate::visibility::all_hir_crates",
-    )?;
-    build_support::redirect_call(
-        &mut source,
-        build_support::Scope::Function("resolve_path_to_modules"),
-        "source_root_crates",
-        "crate::visibility::source_root_crates",
-    )?;
-    build_support::delegate_closure(
-        &mut source,
-        build_support::ClosureDelegate {
-            scope: build_support::Scope::Function("world_symbols"),
-            call: build_support::Call::Method("search"),
-            helper: "crate::visibility::visible_symbols",
-            context: &[build_support::ClosureContext::Move("db")],
-            params: &[build_support::Param { name: "f", ty: "_" }],
-        },
-    )?;
-
-    fs::write(symbol_index_rs, source)?;
+    let mut source = Source::parse(&fs::read_to_string(symbol_index_rs)?, Edition::CURRENT)?;
+    source
+        .select(item("resolve_path_to_modules").parameter("db"))?
+        .set_type("&RootDatabase")?;
+    source
+        .select(item("world_symbols").call("source_root_crates"))?
+        .redirect("crate::visibility::source_root_crates")?;
+    source
+        .select(item("resolve_path_to_modules").call("Crate::all"))?
+        .redirect("crate::visibility::all_hir_crates")?;
+    source
+        .select(item("resolve_path_to_modules").call("source_root_crates"))?
+        .redirect("crate::visibility::source_root_crates")?;
+    source
+        .select(
+            item("world_symbols")
+                .call("search")
+                .argument("cb")
+                .closure(),
+        )?
+        .delegate("crate::visibility::visible_symbols", &["db"])?;
+    fs::write(symbol_index_rs, source.to_string())?;
     Ok(())
 }
 

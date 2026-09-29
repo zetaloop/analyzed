@@ -20,6 +20,7 @@ in-rust-tree = []
 
 [build-dependencies]
 analyzed-bridge = { path = "../analyzed-bridge", version = "=0.5.4" }
+override = "0.1.0"
 
 [dependencies]
 arrayvec = { version = "0.7.6" }

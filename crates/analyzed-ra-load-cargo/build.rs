@@ -1,5 +1,5 @@
 use analyzed_bridge as build_support;
-use analyzed_bridge::ast;
+use r#override::{Edition, Source, item, root};
 
 use std::{
     env,
@@ -20,14 +20,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn patch_load_cargo_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(lib_rs)?;
-
-    build_support::add_use(&mut source, None, "ide_db::base_db::CrateBuilderId")?;
-    build_support::add_use(&mut source, None, "ide_db::base_db::ProcMacroPaths")?;
-    build_support::add_use(&mut source, None, "vfs::file_set::FileSet")?;
-
+    let mut source = Source::parse(&fs::read_to_string(lib_rs)?, Edition::CURRENT)?;
+    for path in [
+        "ide_db::base_db::CrateBuilderId",
+        "ide_db::base_db::ProcMacroPaths",
+        "vfs::file_set::FileSet",
+    ] {
+        source.select(root())?.add_use(&format!("use {path};"))?;
+    }
     let workspace_load = owned_source_path("workspace_load.rs");
-    build_support::mount_module(&mut source, None, "workspace_load", &workspace_load)?;
+    source
+        .select(root())?
+        .mount_module("mod workspace_load", &workspace_load)?;
     for name in [
         "ProcMacroLoad",
         "ProcMacroLoadState",
@@ -38,27 +42,21 @@ fn patch_load_cargo_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
         "source_roots_for_files",
         "workspace_source_root_config",
     ] {
-        build_support::add_use(&mut source, Some("pub"), &format!("workspace_load::{name}"))?;
+        source
+            .select(root())?
+            .add_use(&format!("pub use workspace_load::{name};"))?;
     }
-    build_support::add_use(
-        &mut source,
-        None,
-        "workspace_load::load_crate_graph_into_db",
-    )?;
+    source
+        .select(root())?
+        .add_use("use workspace_load::load_crate_graph_into_db;")?;
     println!("cargo:rerun-if-changed={}", workspace_load.display());
-
-    build_support::rename::<ast::Fn>(
-        &mut source,
-        "load_crate_graph_into_db",
-        "_load_crate_graph_into_db",
-    )?;
-    build_support::add_attr::<ast::Fn>(
-        &mut source,
-        "_load_crate_graph_into_db",
-        "#[allow(dead_code)]",
-    )?;
-
-    fs::write(lib_rs, source)?;
+    source
+        .select(item("load_crate_graph_into_db"))?
+        .rename("_load_crate_graph_into_db")?;
+    source
+        .select(item("_load_crate_graph_into_db"))?
+        .add_attribute("#[allow(dead_code)]")?;
+    fs::write(lib_rs, source.to_string())?;
     Ok(())
 }
 

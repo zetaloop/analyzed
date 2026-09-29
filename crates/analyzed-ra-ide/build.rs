@@ -1,5 +1,5 @@
 use analyzed_bridge as build_support;
-use analyzed_bridge::ast;
+use r#override::{Edition, Source, item, root};
 
 use std::{
     env,
@@ -32,49 +32,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn patch_ide_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(lib_rs)?;
+    let mut source = Source::parse(&fs::read_to_string(lib_rs)?, Edition::CURRENT)?;
 
     let visibility = owned_source_path("visibility.rs");
-    build_support::mount_module(&mut source, None, "visibility", &visibility)?;
+    source
+        .select(root())?
+        .mount_module("mod visibility", &visibility)?;
     println!("cargo:rerun-if-changed={}", visibility.display());
-    build_support::append::<ast::Struct>(
-        &mut source,
-        "Analysis",
-        &[build_support::Field {
-            vis: None,
-            name: "guard",
-            ty: "Option<crate::visibility::AnalysisGuard>",
-        }],
-    )?;
-    build_support::append_record_fields(
-        &mut source,
-        "analysis",
-        "Analysis",
-        &[build_support::FieldInit {
-            name: "guard",
-            value: Some("None"),
-        }],
-    )?;
-    build_support::append_record_fields(
-        &mut source,
-        "from_ra_fixture_with_on_cursor",
-        "Analysis",
-        &[build_support::FieldInit {
-            name: "guard",
-            value: Some("None"),
-        }],
-    )?;
+    source
+        .select(item("Analysis"))?
+        .add_field("guard: Option<crate::visibility::AnalysisGuard>")?;
+    source
+        .select(item("AnalysisHost::analysis").record("Analysis"))?
+        .add_field("guard: None")?;
+    source
+        .select(item("Analysis::from_ra_fixture_with_on_cursor").record("Analysis"))?
+        .add_field("guard: None")?;
 
-    fs::write(lib_rs, source)?;
+    fs::write(lib_rs, source.to_string())?;
     Ok(())
 }
 
 fn patch_view_crate_graph_source(view_crate_graph_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(view_crate_graph_rs)?;
-
-    build_support::retarget_use(&mut source, "all_crates", "crate::visibility::all_crates")?;
-
-    fs::write(view_crate_graph_rs, source)?;
+    let mut source = Source::parse(&fs::read_to_string(view_crate_graph_rs)?, Edition::CURRENT)?;
+    source
+        .select(root().import("all_crates"))?
+        .redirect("crate::visibility::all_crates")?;
+    fs::write(view_crate_graph_rs, source.to_string())?;
     Ok(())
 }
 
@@ -83,21 +67,17 @@ fn patch_view_crate_graph_source(view_crate_graph_rs: &Path) -> Result<(), Box<d
 // cache for registry packages. The benchmark tests load bench_data from the
 // checkout, which the registry package does not contain.
 fn patch_syntax_highlighting_benches(tests_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::read_to_string(tests_rs)?;
-
+    let mut source = Source::parse(&fs::read_to_string(tests_rs)?, Edition::CURRENT)?;
     for benchmark in [
         "benchmark_syntax_highlighting_long_struct",
         "syntax_highlighting_not_quadratic",
         "benchmark_syntax_highlighting_parser",
     ] {
-        build_support::add_attr::<ast::Fn>(
-            &mut source,
-            benchmark,
-            "#[ignore = \"bench_data not available in registry packages\"]",
-        )?;
+        source
+            .select(item(benchmark))?
+            .add_attribute("#[ignore = \"bench_data not available in registry packages\"]")?;
     }
-
-    fs::write(tests_rs, source)?;
+    fs::write(tests_rs, source.to_string())?;
     Ok(())
 }
 
