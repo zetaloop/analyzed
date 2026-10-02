@@ -1422,9 +1422,9 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "override"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6f2d4f34165adfdd0fa4686ca9dd6ccceadf587373ce3137a0a2208e97e5981"
+checksum = "01f42b90f6ee3652eaeb3849c605f5270acd44c1d907409d4344395a54b05e66"
 dependencies = [
  "cargo_metadata",
  "ra_ap_syntax",
