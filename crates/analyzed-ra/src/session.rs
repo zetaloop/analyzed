@@ -493,11 +493,7 @@ impl crate::global_state::GlobalState {
         self.shared.set_busy(!idle);
     }
 
-    pub(crate) fn handle_task(
-        &mut self,
-        prime_caches_progress: &mut Vec<super::PrimeCachesProgress>,
-        task: super::Task,
-    ) -> Option<Duration> {
+    pub(crate) fn handle_shared_task(&mut self, task: super::Task) -> Option<Duration> {
         match task {
             super::Task::FetchedWorkspace(resp) => {
                 self.fetch_workspaces_queue.op_completed(resp);
@@ -554,11 +550,7 @@ impl crate::global_state::GlobalState {
                 self.spawn_discover_tests(subscriptions);
                 None
             }
-            _ => {
-                let upstream = UpstreamTask::try_from(task)
-                    .unwrap_or_else(|_| unreachable!("analyzed task variants handled above"));
-                self._handle_task(prime_caches_progress, upstream)
-            }
+            _ => unreachable!("upstream task handled by the main loop"),
         }
     }
 
@@ -745,40 +737,6 @@ pub(crate) fn fetch_native_diagnostics(
             return diagnostics;
         };
         snapshot = next;
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum UpstreamTask {
-    Response(lsp_server::Response),
-    DiscoverLinkedProjects(super::DiscoverProjectParam),
-    Retry(lsp_server::Request),
-    Diagnostics(super::DiagnosticsTaskKind),
-    DiscoverTest(crate::lsp_ext::DiscoverTestResults),
-    PrimeCaches(super::PrimeCachesProgress),
-    FetchWorkspace(crate::reload::ProjectWorkspaceProgress),
-    FetchBuildData(crate::reload::BuildDataProgress),
-    LoadProcMacros(crate::reload::ProcMacroProgress),
-    BuildDepsHaveChanged,
-}
-
-impl TryFrom<super::Task> for UpstreamTask {
-    type Error = super::Task;
-
-    fn try_from(task: super::Task) -> Result<Self, Self::Error> {
-        Ok(match task {
-            super::Task::Response(it) => UpstreamTask::Response(it),
-            super::Task::DiscoverLinkedProjects(it) => UpstreamTask::DiscoverLinkedProjects(it),
-            super::Task::Retry(it) => UpstreamTask::Retry(it),
-            super::Task::Diagnostics(it) => UpstreamTask::Diagnostics(it),
-            super::Task::DiscoverTest(it) => UpstreamTask::DiscoverTest(it),
-            super::Task::PrimeCaches(it) => UpstreamTask::PrimeCaches(it),
-            super::Task::FetchWorkspace(it) => UpstreamTask::FetchWorkspace(it),
-            super::Task::FetchBuildData(it) => UpstreamTask::FetchBuildData(it),
-            super::Task::LoadProcMacros(it) => UpstreamTask::LoadProcMacros(it),
-            super::Task::BuildDepsHaveChanged => UpstreamTask::BuildDepsHaveChanged,
-            other => return Err(other),
-        })
     }
 }
 

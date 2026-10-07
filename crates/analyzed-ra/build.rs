@@ -488,12 +488,7 @@ fn patch_main_loop_source(source: &mut Source, pool: &Source) -> Result<(), Box<
     source
         .select(item("DiscoverProjectParam").variant("Buildfile"))?
         .add_attribute("#[allow(dead_code)]")?;
-    for name in [
-        "handle_event",
-        "update_diagnostics",
-        "update_tests",
-        "handle_task",
-    ] {
+    for name in ["handle_event", "update_diagnostics", "update_tests"] {
         source.select(item(name))?.rename(&format!("_{name}"))?;
     }
     source.select(item("GlobalState::_update_diagnostics").body().region(root().child(root().binding("subscriptions")).after(), root().end()))?
@@ -643,7 +638,7 @@ fn patch_main_loop_source(source: &mut Source, pool: &Source) -> Result<(), Box<
         "adopted: false",
     ] {
         source
-            .select(item("GlobalState::_handle_task").record("FetchWorkspaceResponse"))?
+            .select(item("GlobalState::handle_task").record("FetchWorkspaceResponse"))?
             .add_field(field)?;
     }
     for field in [
@@ -651,12 +646,16 @@ fn patch_main_loop_source(source: &mut Source, pool: &Source) -> Result<(), Box<
         "reload: self.build_data_reload",
     ] {
         source
-            .select(item("GlobalState::_handle_task").record("FetchBuildDataResponse"))?
+            .select(item("GlobalState::handle_task").record("FetchBuildDataResponse"))?
             .add_field(field)?;
     }
     source
-        .select(item("GlobalState::_handle_task").symbol("Task"))?
-        .redirect("self::session::UpstreamTask")?;
+        .select(
+            item("GlobalState::handle_task")
+                .match_expr()
+                .has(arm("Task::Response")),
+        )?
+        .add_arm("task => return self.handle_shared_task(task)")?;
     let session = owned_source_path("session.rs");
     source
         .select(root())?
