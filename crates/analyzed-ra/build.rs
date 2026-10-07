@@ -68,7 +68,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     sources.edit("src/handlers/notification.rs", patch_notification_source)?;
     sources.edit("src/handlers/request.rs", patch_request_source)?;
     sources.edit("src/bin/main.rs", patch_driver_source)?;
-    write_root_module(&sources.path("src/root.rs")?, &sources.path("src/lib.rs")?)?;
+    let driver = sources.path("src/bin/main.rs")?;
+    sources.edit("src/lib.rs", |source| patch_root_source(source, &driver))?;
     patch_slow_tests(&mut sources)?;
     write_slow_tests_wrapper(&sources.path("tests/slow-tests")?)?;
     println!("cargo:rustc-env=ANALYZED_RA_RELEASE_VERSION={}", release);
@@ -208,32 +209,25 @@ fn github_get(agent: &ureq::Agent, path: &str) -> Result<serde_json::Value, Box<
     )?)
 }
 
-fn write_root_module(root_rs: &Path, lib_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let shared_analyzer = owned_source_path("shared_analyzer.rs");
-    let shared_global_state = owned_source_path("global_state.rs");
-    let shared_reload = owned_source_path("reload.rs");
-    let shared_notification = owned_source_path("handlers/notification.rs");
-    let upstream_root = fs::read_to_string(lib_rs)?;
-    let source = format!(
-        r#"
-#[path = {:?}]
-pub mod shared_analyzer;
-
-#[path = {:?}]
-pub(crate) mod shared_global_state;
-
-#[path = {:?}]
-pub(crate) mod shared_reload;
-
-#[path = {:?}]
-pub(crate) mod shared_notification;
-
-{upstream_root}
-
-#[path = {:?}]
-pub mod driver;
-
-pub use shared_analyzer::{{
+fn patch_root_source(source: &mut Source, driver: &Path) -> Result<(), Box<dyn Error>> {
+    for (declaration, file_name) in [
+        ("pub mod shared_analyzer", "shared_analyzer.rs"),
+        ("pub(crate) mod shared_global_state", "global_state.rs"),
+        ("pub(crate) mod shared_reload", "reload.rs"),
+        (
+            "pub(crate) mod shared_notification",
+            "handlers/notification.rs",
+        ),
+    ] {
+        let path = owned_source_path(file_name);
+        source.select(root())?.mount_module(declaration, &path)?;
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    source
+        .select(root())?
+        .mount_module("pub mod driver", driver)?;
+    source.select(root())?.add_use(
+        "pub use shared_analyzer::{
     RUST_ANALYZER_VERSION,
     SharedAnalyzerBackendKey, SharedAnalyzerCargoConfigKey, SharedAnalyzerDatabaseConfigKey,
     SharedAnalyzerBackendSnapshot, SharedAnalyzerLoadKey,
@@ -241,23 +235,8 @@ pub use shared_analyzer::{{
     SharedAnalyzerWorldKey, SharedAnalyzerViewKey, WorkspaceSummary,
     run_shared_rust_analyzer_lsp_session, run_shared_rust_analyzer_lsp_session_with_config,
     shared_analyzer_registry,
-}};
-"#,
-        shared_analyzer.to_string_lossy().into_owned(),
-        shared_global_state.to_string_lossy().into_owned(),
-        shared_reload.to_string_lossy().into_owned(),
-        shared_notification.to_string_lossy().into_owned(),
-        lib_rs
-            .with_file_name("bin/main.rs")
-            .to_string_lossy()
-            .into_owned()
-    );
-    fs::write(root_rs, source)?;
-    println!("cargo:rerun-if-changed={}", shared_analyzer.display());
-    println!("cargo:rerun-if-changed={}", shared_global_state.display());
-    println!("cargo:rerun-if-changed={}", shared_reload.display());
-    println!("cargo:rerun-if-changed={}", shared_notification.display());
-    Ok(())
+};",
+    )
 }
 
 fn owned_source_path(file_name: &str) -> PathBuf {
