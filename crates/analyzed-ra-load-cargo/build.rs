@@ -1,26 +1,20 @@
 use analyzed_bridge as build_support;
-use r#override::{Edition, Source, item, root};
+use r#override::{Source, item, root};
 
-use std::{
-    env,
-    error::Error,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{env, error::Error, path::PathBuf};
 
 const PACKAGE: &str = "ra_ap_load-cargo";
 const GENERATED_DIR: &str = "ra_ap_load_cargo_bridge";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (generated, _) =
+    let (mut sources, _) =
         build_support::prepare_bridge_package(PACKAGE, GENERATED_DIR, &[], &["ide-db"])?;
-    patch_load_cargo_source(&generated.join("src/lib.rs"))?;
+    sources.edit("src/lib.rs", patch_load_cargo_source)?;
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())
 }
 
-fn patch_load_cargo_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(lib_rs)?, Edition::CURRENT)?;
+fn patch_load_cargo_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     for path in [
         "ide_db::base_db::CrateBuilderId",
         "ide_db::base_db::ProcMacroPaths",
@@ -56,7 +50,6 @@ fn patch_load_cargo_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     source
         .select(item("_load_crate_graph_into_db"))?
         .add_attribute("#[allow(dead_code)]")?;
-    fs::write(lib_rs, source.to_string())?;
     Ok(())
 }
 

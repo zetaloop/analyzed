@@ -5,14 +5,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use r#override::{DependencyKind, Package, check_target};
+use r#override::{DependencyKind, Package, Sources, TargetKind, check_target};
 
 pub fn prepare_bridge_package(
     package_name: &str,
     generated_dir: &str,
-    included_roots: &[&str],
+    included_targets: &[(TargetKind, &str)],
     replacements: &[&str],
-) -> Result<(PathBuf, Option<String>), Box<dyn Error>> {
+) -> Result<(Sources, Option<String>), Box<dyn Error>> {
     let bridge = Package::current()?;
     let upstream = bridge.dependency(package_name)?;
     let replacements = replacements
@@ -27,23 +27,11 @@ pub fn prepare_bridge_package(
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     let mut sources = upstream.prepare(out.join(generated_dir))?;
     sources.include(upstream.library()?)?;
-    for root in included_roots {
-        let target = upstream
-            .data()
-            .targets
-            .iter()
-            .find(|target| {
-                target
-                    .src_path
-                    .as_std_path()
-                    .strip_prefix(upstream.directory())
-                    .is_ok_and(|path| path == Path::new(root))
-            })
-            .ok_or_else(|| format!("upstream has no target at {root}"))?;
-        sources.include(target)?;
+    for (kind, name) in included_targets {
+        sources.include(upstream.target(kind.clone(), name)?)?;
     }
     let revision = crate_git_revision(sources.directory())?;
-    Ok((sources.directory().to_owned(), revision))
+    Ok((sources, revision))
 }
 
 // rust-analyzer's crates.io workflow rewrites its crate name in every Rust source file.

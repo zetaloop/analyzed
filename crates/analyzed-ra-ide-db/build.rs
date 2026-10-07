@@ -1,27 +1,21 @@
 use analyzed_bridge as build_support;
-use r#override::{Edition, Source, item, root};
+use r#override::{Source, item, root};
 
-use std::{
-    env,
-    error::Error,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{env, error::Error, path::PathBuf};
 
 const PACKAGE: &str = "ra_ap_ide_db";
 const GENERATED_DIR: &str = "ra_ap_ide_db_bridge";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (generated, _) = build_support::prepare_bridge_package(PACKAGE, GENERATED_DIR, &[], &[])?;
-    patch_ide_db_source(&generated.join("src/lib.rs"))?;
-    patch_search_source(&generated.join("src/search.rs"))?;
-    patch_symbol_index_source(&generated.join("src/symbol_index.rs"))?;
+    let (mut sources, _) = build_support::prepare_bridge_package(PACKAGE, GENERATED_DIR, &[], &[])?;
+    sources.edit("src/lib.rs", patch_ide_db_source)?;
+    sources.edit("src/search.rs", patch_search_source)?;
+    sources.edit("src/symbol_index.rs", patch_symbol_index_source)?;
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())
 }
 
-fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(lib_rs)?, Edition::CURRENT)?;
+fn patch_ide_db_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     let visibility = owned_source_path("visibility.rs");
     source
         .select(root())?
@@ -36,12 +30,10 @@ fn patch_ide_db_source(lib_rs: &Path) -> Result<(), Box<dyn Error>> {
     source
         .select(item("RootDatabase::new").record("RootDatabase"))?
         .add_field("visible_files: None")?;
-    fs::write(lib_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_search_source(search_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(search_rs)?, Edition::CURRENT)?;
+fn patch_search_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     source
         .select(root().import("all_crates"))?
         .redirect("crate::visibility::all_crates")?;
@@ -51,12 +43,10 @@ fn patch_search_source(search_rs: &Path) -> Result<(), Box<dyn Error>> {
     source
         .select(item("reverse_dependencies").call("transitive_reverse_dependencies"))?
         .redirect("visible_reverse_dependencies")?;
-    fs::write(search_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_symbol_index_source(symbol_index_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(symbol_index_rs)?, Edition::CURRENT)?;
+fn patch_symbol_index_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     source
         .select(item("resolve_path_to_modules").parameter("db"))?
         .set_type("&RootDatabase")?;
@@ -77,7 +67,6 @@ fn patch_symbol_index_source(symbol_index_rs: &Path) -> Result<(), Box<dyn Error
                 .closure(),
         )?
         .delegate("crate::visibility::visible_symbols", &["db"])?;
-    fs::write(symbol_index_rs, source.to_string())?;
     Ok(())
 }
 

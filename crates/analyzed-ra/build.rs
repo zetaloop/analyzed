@@ -7,19 +7,19 @@ use std::{
 };
 
 use analyzed_bridge as build_support;
-use r#override::{Edition, Source, arm, item, root};
+use r#override::{Source, Sources, TargetKind, arm, item, root};
 
 const RA_PACKAGE: &str = "ra_ap_rust-analyzer";
 const RA_REPOSITORY: &str = "rust-lang/rust-analyzer";
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let (generated, revision) = build_support::prepare_bridge_package(
+    let (mut sources, revision) = build_support::prepare_bridge_package(
         RA_PACKAGE,
         "ra_ap_rust_analyzer_bridge",
-        &["tests/slow-tests/main.rs"],
+        &[(TargetKind::Test, "slow-tests")],
         &["ide", "ide-completion", "ide-db", "ide-ssr", "load-cargo"],
     )?;
-    build_support::restore_rust_analyzer_source(&generated)?;
+    build_support::restore_rust_analyzer_source(sources.directory())?;
     let revision = revision
         .as_deref()
         .ok_or("ra_ap_rust-analyzer does not contain .cargo_vcs_info.json")?;
@@ -48,28 +48,29 @@ fn main() -> Result<(), Box<dyn Error>> {
             Err(error) => return Err(error),
         }
     };
-    let generated_src = generated.join("src");
-    patch_config_source(&generated_src.join("config.rs"))?;
-    patch_discover_source(&generated_src.join("discover.rs"))?;
-    patch_diagnostics_source(&generated_src.join("diagnostics.rs"))?;
-    patch_global_state_source(&generated_src.join("global_state.rs"))?;
-    patch_main_loop_source(&generated_src.join("main_loop.rs"))?;
-    patch_op_queue_source(&generated_src.join("op_queue.rs"))?;
-    patch_reload_source(&generated_src.join("reload.rs"))?;
-    patch_session_source(&generated_src.join("session.rs"))?;
-    patch_task_pool_source(&generated_src.join("task_pool.rs"))?;
-    patch_flycheck_to_proto_source(&generated_src.join("diagnostics/flycheck_to_proto.rs"))?;
-    patch_dispatch_source(&generated_src.join("handlers/dispatch.rs"))?;
-    patch_notification_source(&generated_src.join("handlers/notification.rs"))?;
-    patch_request_source(&generated_src.join("handlers/request.rs"))?;
-    patch_driver_source(&generated_src.join("bin/main.rs"))?;
-    write_root_module(
-        &generated_src.join("root.rs"),
-        &generated_src.join("lib.rs"),
+    sources.edit("src/config.rs", patch_config_source)?;
+    sources.edit("src/discover.rs", patch_discover_source)?;
+    sources.edit("src/diagnostics.rs", patch_diagnostics_source)?;
+    sources.edit("src/global_state.rs", patch_global_state_source)?;
+    let pool = sources.read("src/task_pool.rs")?;
+    sources.edit("src/main_loop.rs", |source| {
+        patch_main_loop_source(source, &pool)
+    })?;
+    sources.edit("src/op_queue.rs", patch_op_queue_source)?;
+    sources.edit("src/reload.rs", patch_reload_source)?;
+    sources.edit("src/session.rs", patch_session_source)?;
+    sources.edit("src/task_pool.rs", patch_task_pool_source)?;
+    sources.edit(
+        "src/diagnostics/flycheck_to_proto.rs",
+        patch_flycheck_to_proto_source,
     )?;
-    let slow_tests = generated.join("tests/slow-tests");
-    patch_slow_tests(&slow_tests)?;
-    write_slow_tests_wrapper(&slow_tests)?;
+    sources.edit("src/handlers/dispatch.rs", patch_dispatch_source)?;
+    sources.edit("src/handlers/notification.rs", patch_notification_source)?;
+    sources.edit("src/handlers/request.rs", patch_request_source)?;
+    sources.edit("src/bin/main.rs", patch_driver_source)?;
+    write_root_module(&sources.path("src/root.rs")?, &sources.path("src/lib.rs")?)?;
+    patch_slow_tests(&mut sources)?;
+    write_slow_tests_wrapper(&sources.path("tests/slow-tests")?)?;
     println!("cargo:rustc-env=ANALYZED_RA_RELEASE_VERSION={}", release);
     println!("cargo:rustc-env=ANALYZED_RA_COMMIT_HASH={revision}");
     println!("cargo:rerun-if-env-changed=GITHUB_TOKEN");
@@ -265,8 +266,7 @@ fn owned_source_path(file_name: &str) -> PathBuf {
         .join(file_name)
 }
 
-fn patch_config_source(config_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(config_rs)?, Edition::CURRENT)?;
+fn patch_config_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     for function in [
         "generate_package_json_config",
         "generate_config_documentation",
@@ -275,33 +275,27 @@ fn patch_config_source(config_rs: &Path) -> Result<(), Box<dyn Error>> {
             "#[ignore = \"regenerates files from the rust-analyzer source tree\"]",
         )?;
     }
-    fs::write(config_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_discover_source(discover_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(discover_rs)?, Edition::CURRENT)?;
+fn patch_discover_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     source
         .select(item("DiscoverArgument").variant("Buildfile"))?
         .add_attribute("#[allow(dead_code)]")?;
-    fs::write(discover_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_diagnostics_source(diagnostics_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(diagnostics_rs)?, Edition::CURRENT)?;
+fn patch_diagnostics_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     source
         .select(item("fetch_native_diagnostics"))?
         .rename("_fetch_native_diagnostics")?;
     source
         .select(root())?
         .add_use("pub(crate) use crate::main_loop::session::fetch_native_diagnostics;")?;
-    fs::write(diagnostics_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(global_state_rs)?, Edition::CURRENT)?;
+fn patch_global_state_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     for field in [
         "pub(crate) shared: crate::shared_analyzer::SharedAnalyzerRuntime",
         "pub(crate) reload_id: Option<u64>",
@@ -449,16 +443,10 @@ fn patch_global_state_source(global_state_rs: &Path) -> Result<(), Box<dyn Error
     source
         .select(item("enqueue_workspace_fetch"))?
         .set_visibility("pub(crate)")?;
-    fs::write(global_state_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(main_loop_rs)?, Edition::CURRENT)?;
-    let pool = Source::parse(
-        &fs::read_to_string(main_loop_rs.with_file_name("task_pool.rs"))?,
-        Edition::CURRENT,
-    )?;
+fn patch_main_loop_source(source: &mut Source, pool: &Source) -> Result<(), Box<dyn Error>> {
     let spawn = pool.declaration(root().implementation("TaskPool<T>").item("spawn"))?;
     let spawn_with_sender = pool.declaration(
         root()
@@ -668,12 +656,10 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     source
         .select(root())?
         .mount_module("pub(crate) mod session", &session)?;
-    fs::write(main_loop_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_session_source(session_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(session_rs)?, Edition::CURRENT)?;
+fn patch_session_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     source.select(item("IoThreads"))?.add_variant("External")?;
     source
         .select(
@@ -682,21 +668,17 @@ fn patch_session_source(session_rs: &Path) -> Result<(), Box<dyn Error>> {
                 .has(arm("IoThreads::Stdio")),
         )?
         .add_arm("IoThreads::External => Ok(())")?;
-    fs::write(session_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_op_queue_source(op_queue_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(op_queue_rs)?, Edition::CURRENT)?;
+fn patch_op_queue_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     source
         .select(item("OpQueue").field("last_op_result"))?
         .set_visibility("pub(crate)")?;
-    fs::write(op_queue_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(reload_rs)?, Edition::CURRENT)?;
+fn patch_reload_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     for name in [
         "update_configuration",
         "fetch_workspaces",
@@ -749,12 +731,10 @@ fn patch_reload_source(reload_rs: &Path) -> Result<(), Box<dyn Error>> {
     source
         .select(item("_set_proc_macro_clients"))?
         .add_attribute("#[allow(dead_code)]")?;
-    fs::write(reload_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_dispatch_source(dispatch_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(dispatch_rs)?, Edition::CURRENT)?;
+fn patch_dispatch_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     let shared_dispatch = owned_source_path("shared_dispatch.rs");
     source
         .select(root())?
@@ -771,12 +751,10 @@ fn patch_dispatch_source(dispatch_rs: &Path) -> Result<(), Box<dyn Error>> {
         "crate::handlers::dispatch::shared_dispatch::on_with_thread_intent",
         &["world", "req.clone()"],
     )?;
-    fs::write(dispatch_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_request_source(request_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(request_rs)?, Edition::CURRENT)?;
+fn patch_request_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     for name in ["handle_workspace_reload", "handle_proc_macros_rebuild"] {
         let replacement = format!("_{name}");
         source.select(item(name))?.rename(&replacement)?;
@@ -787,12 +765,10 @@ fn patch_request_source(request_rs: &Path) -> Result<(), Box<dyn Error>> {
             .select(root())?
             .add_use(&format!("pub(crate) use crate::shared_reload::{name};"))?;
     }
-    fs::write(request_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(flycheck_to_proto_rs)?, Edition::CURRENT)?;
+fn patch_flycheck_to_proto_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     source.select(item("location"))?.rename("_location")?;
     source
         .select(root())?
@@ -802,12 +778,10 @@ fn patch_flycheck_to_proto_source(flycheck_to_proto_rs: &Path) -> Result<(), Box
         .select(root())?
         .mount_module("mod flycheck_location", &flycheck_location)?;
     println!("cargo:rerun-if-changed={}", flycheck_location.display());
-    fs::write(flycheck_to_proto_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(notification_rs)?, Edition::CURRENT)?;
+fn patch_notification_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     source
         .select(
             item("handle_did_close_text_document")
@@ -872,65 +846,57 @@ fn patch_notification_source(notification_rs: &Path) -> Result<(), Box<dyn Error
     source
         .select(root())?
         .add_use("pub(crate) use crate::shared_notification::handle_did_save_text_document;")?;
-    fs::write(notification_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_task_pool_source(task_pool_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(task_pool_rs)?, Edition::CURRENT)?;
+fn patch_task_pool_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     source
         .select(item("TaskPool").field("sender"))?
         .set_visibility("pub(crate)")?;
-    fs::write(task_pool_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_driver_source(main_rs: &Path) -> Result<(), Box<dyn Error>> {
-    let mut source = Source::parse(&fs::read_to_string(main_rs)?, Edition::CURRENT)?;
+fn patch_driver_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     for name in ["main", "setup_logging", "wait_for_debugger"] {
         source.select(item(name))?.set_visibility("pub")?;
     }
     source
         .select(root())?
         .add_use("use crate as rust_analyzer;")?;
-    fs::write(main_rs, source.to_string())?;
     Ok(())
 }
 
-fn patch_slow_tests(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
+fn patch_slow_tests(sources: &mut Sources) -> Result<(), Box<dyn Error>> {
+    let slow_tests = Path::new("tests/slow-tests");
     for name in ["main.rs", "ratoml.rs", "cli.rs", "flycheck.rs"] {
-        let path = slow_tests.join(name);
-        let mut source = Source::parse(&fs::read_to_string(&path)?, Edition::CURRENT)?;
-        source
-            .select(root().import("skip_slow_tests"))?
-            .redirect("crate::test_support::skip_slow_tests")?;
-        fs::write(path, source.to_string())?;
+        sources.edit(slow_tests.join(name), |source| {
+            source
+                .select(root().import("skip_slow_tests"))?
+                .redirect("crate::test_support::skip_slow_tests")
+        })?;
     }
-    let support = slow_tests.join("support.rs");
-    let mut source = Source::parse(&fs::read_to_string(&support)?, Edition::CURRENT)?;
-    source
-        .select(item("lines_match"))?
-        .rename("_original_lines_match")?;
-    source
-        .select(item("_original_lines_match"))?
-        .set_visibility("pub(crate)")?;
-    source
-        .select(root())?
-        .add_use("use crate::test_support::lines_match;")?;
-    fs::write(support, source.to_string())?;
-    let ratoml = slow_tests.join("ratoml.rs");
-    let mut source = Source::parse(&fs::read_to_string(&ratoml)?, Edition::CURRENT)?;
-    source
-        .select(item("fixture_path"))?
-        .rename("_original_fixture_path")?;
-    source
-        .select(root())?
-        .mount_module("mod fixture_uri", owned_source_path("slow_tests_uri.rs"))?;
-    source
-        .select(root())?
-        .add_use("use self::fixture_uri::FixturePath;")?;
-    fs::write(ratoml, source.to_string())?;
-    Ok(())
+    sources.edit(slow_tests.join("support.rs"), |source| {
+        source
+            .select(item("lines_match"))?
+            .rename("_original_lines_match")?;
+        source
+            .select(item("_original_lines_match"))?
+            .set_visibility("pub(crate)")?;
+        source
+            .select(root())?
+            .add_use("use crate::test_support::lines_match;")
+    })?;
+    sources.edit(slow_tests.join("ratoml.rs"), |source| {
+        source
+            .select(item("fixture_path"))?
+            .rename("_original_fixture_path")?;
+        source
+            .select(root())?
+            .mount_module("mod fixture_uri", owned_source_path("slow_tests_uri.rs"))?;
+        source
+            .select(root())?
+            .add_use("use self::fixture_uri::FixturePath;")
+    })
 }
 
 fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
