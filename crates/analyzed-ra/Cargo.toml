@@ -29,7 +29,7 @@ analyzed-bridge = { path = "../analyzed-bridge", version = "=0.5.4" }
 override = "0.3.0"
 serde_json = "1.0.150"
 toml = "1.1.2"
-ureq = "3.3.0"
+ureq = "3.4.2"
 
 [dependencies]
 anyhow = { version = "1.0.98" }

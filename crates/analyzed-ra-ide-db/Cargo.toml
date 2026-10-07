@@ -41,7 +41,6 @@ profile = { version = "=0.0.357", package = "ra_ap_profile" }
 rayon = { version = "1.10.0" }
 rustc-hash = { version = "2.1.1" }
 salsa = { version = "0.28.5", features = ["rayon", "salsa_unstable", "macros", "inventory", "triomphe"], default-features = false }
-salsa-macros = { version = "0.28.2" }
 smallvec = { version = "1.15.1", features = ["const_new", "union", "const_generics"] }
 span = { version = "=0.0.357", package = "ra_ap_span" }
 stdx = { version = "=0.0.357", package = "ra_ap_stdx" }
