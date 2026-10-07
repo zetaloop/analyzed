@@ -419,8 +419,13 @@ fn patch_global_state_source(source: &mut Source) -> Result<(), Box<dyn Error>> 
         .add_attribute("#[allow(dead_code)]")?;
     source.select(item("GlobalStateSnapshot::_target_spec_for_file").region(root().for_loop().before(), root().end()))?
         .extract("pub(crate) fn target_spec_from_workspaces(&self, path: &paths::AbsPath, crate_id: Crate) -> Option<TargetSpec>", &["path", "crate_id"])?;
-    source.select(item("GlobalState::compute_priming_scope").for_loop().has(arm("ProjectWorkspaceKind::Cargo")))?
-        .extract("pub(crate) fn extend_priming_scope(&self, root_to_crate: &FxHashMap<AbsPathBuf, Vec<Crate>>, seed: &mut FxHashSet<Crate>)", &["&root_to_crate", "&mut seed"])?;
+    source
+        .select(item("GlobalState::compute_priming_scope").body().region(
+            root().binding("seed").before(),
+            root().for_loop().has(arm("ProjectWorkspaceKind::Cargo")).after(),
+        ))?
+        .outputs(["seed"])
+        .extract("pub(crate) fn priming_seeds(&self, root_to_crate: &FxHashMap<AbsPathBuf, Vec<Crate>>) -> FxHashSet<Crate>", &["&root_to_crate"])?;
     for (owner, name) in [
         ("GlobalState", "compute_priming_scope"),
         ("GlobalState", "process_changes"),

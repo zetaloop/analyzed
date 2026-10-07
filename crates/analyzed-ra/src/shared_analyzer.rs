@@ -11,7 +11,7 @@ use std::{
 use hir::{ChangeWithProcMacros, ProcMacrosBuilder};
 use ide::{Analysis, AnalysisHost, FileId};
 use ide_db::{
-    FxHashMap, FxHashSet,
+    FxHashMap,
     base_db::{
         CrateGraphBuilder, DependencyBuilder, FileSet, LibraryRoots, LocalRoots,
         ProcMacroLoadingError, ProcMacroPaths, SourceDatabase, SourceRoot, SourceRootId,
@@ -4855,8 +4855,7 @@ impl SharedWorld {
             root_to_crates
         };
 
-        let mut seed: FxHashSet<ide::Crate> = FxHashSet::default();
-        state.extend_priming_scope(&root_to_crates, &mut seed);
+        let seed = state.priming_seeds(&root_to_crates);
 
         crate::priming_scope::compute(db, seed)
     }
