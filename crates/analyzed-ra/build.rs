@@ -219,9 +219,9 @@ fn patch_root_source(source: &mut Source, driver: &Path) -> Result<(), Box<dyn E
             "handlers/notification.rs",
         ),
     ] {
-        let path = owned_source_path(file_name);
-        source.select(root())?.mount_module(declaration, &path)?;
-        println!("cargo:rerun-if-changed={}", path.display());
+        source
+            .select(root())?
+            .mount_module(declaration, owned_source_path(file_name))?;
     }
     source
         .select(root())?
@@ -718,11 +718,10 @@ fn patch_reload_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
 }
 
 fn patch_dispatch_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
-    let shared_dispatch = owned_source_path("shared_dispatch.rs");
-    source
-        .select(root())?
-        .mount_module("mod shared_dispatch", &shared_dispatch)?;
-    println!("cargo:rerun-if-changed={}", shared_dispatch.display());
+    source.select(root())?.mount_module(
+        "mod shared_dispatch",
+        owned_source_path("shared_dispatch.rs"),
+    )?;
     source
         .select(item("on_with_thread_intent").call("snapshot"))?
         .redirect("pending_snapshot")?;
@@ -756,11 +755,10 @@ fn patch_flycheck_to_proto_source(source: &mut Source) -> Result<(), Box<dyn Err
     source
         .select(root())?
         .add_use("use self::flycheck_location::location;")?;
-    let flycheck_location = owned_source_path("diagnostics/flycheck_location.rs");
-    source
-        .select(root())?
-        .mount_module("mod flycheck_location", &flycheck_location)?;
-    println!("cargo:rerun-if-changed={}", flycheck_location.display());
+    source.select(root())?.mount_module(
+        "mod flycheck_location",
+        owned_source_path("diagnostics/flycheck_location.rs"),
+    )?;
     Ok(())
 }
 
@@ -894,6 +892,5 @@ fn write_slow_tests_wrapper(slow_tests: &Path) -> Result<(), Box<dyn Error>> {
             main_rs.to_string_lossy().into_owned(),
         ),
     )?;
-    println!("cargo:rerun-if-changed={}", test_support.display());
     Ok(())
 }

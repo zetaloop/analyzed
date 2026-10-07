@@ -22,10 +22,9 @@ fn patch_load_cargo_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     ] {
         source.select(root())?.add_use(&format!("use {path};"))?;
     }
-    let workspace_load = owned_source_path("workspace_load.rs");
     source
         .select(root())?
-        .mount_module("mod workspace_load", &workspace_load)?;
+        .mount_module("mod workspace_load", owned_source_path("workspace_load.rs"))?;
     for name in [
         "ProcMacroLoad",
         "ProcMacroLoadState",
@@ -43,7 +42,6 @@ fn patch_load_cargo_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
     source
         .select(root())?
         .add_use("use workspace_load::load_crate_graph_into_db;")?;
-    println!("cargo:rerun-if-changed={}", workspace_load.display());
     source
         .select(item("load_crate_graph_into_db"))?
         .rename("_load_crate_graph_into_db")?;

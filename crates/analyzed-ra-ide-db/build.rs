@@ -16,11 +16,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn patch_ide_db_source(source: &mut Source) -> Result<(), Box<dyn Error>> {
-    let visibility = owned_source_path("visibility.rs");
     source
         .select(root())?
-        .mount_module("mod visibility", &visibility)?;
-    println!("cargo:rerun-if-changed={}", visibility.display());
+        .mount_module("mod visibility", owned_source_path("visibility.rs"))?;
     source
         .select(item("RootDatabase"))?
         .add_field("visible_files: Option<std::sync::Arc<rustc_hash::FxHashSet<vfs::FileId>>>")?;
